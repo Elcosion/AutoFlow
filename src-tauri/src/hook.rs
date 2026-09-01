@@ -816,15 +816,22 @@ unsafe extern "system" fn mouse_hook(
     let Some(shared) = HOOK_SHARED.get() else {
         return CallNextHookEx(None, code, message, data);
     };
+    let message_id = message.0 as u32;
+    let x = info.pt.x;
+    let y = info.pt.y;
+    // Motion is meaningful even before the user has clicked into the target
+    // application. Capture it as soon as recording starts, while button and
+    // wheel events still exclude AutoFlow itself so the stop control is not
+    // replayed as part of the macro.
+    if message_id == WM_MOUSEMOVE && shared.is_recording() {
+        record_mouse_move(shared, x, y);
+        return CallNextHookEx(None, code, message, data);
+    }
     if !recording_input_is_allowed(shared) {
         return CallNextHookEx(None, code, message, data);
     }
 
-    let message_id = message.0 as u32;
-    let x = info.pt.x;
-    let y = info.pt.y;
     match message_id {
-        WM_MOUSEMOVE => record_mouse_move(shared, x, y),
         WM_LBUTTONDOWN => record_mouse_button(shared, MouseButton::Left, KeyAction::Down, x, y),
         WM_LBUTTONUP => record_mouse_button(shared, MouseButton::Left, KeyAction::Up, x, y),
         WM_RBUTTONDOWN => record_mouse_button(shared, MouseButton::Right, KeyAction::Down, x, y),
