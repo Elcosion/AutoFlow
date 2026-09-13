@@ -45,6 +45,19 @@ export type MacroTarget = {
   processName: string;
 };
 
+export type AutomationProgram =
+  | { kind: "macro"; steps: MacroStep[] }
+  | { kind: "rhai"; source: string; apiVersion: 1 };
+
+export type AutomationAsset = {
+  id: string;
+  name: string;
+  fileName: string;
+  width: number;
+  height: number;
+  sha256?: string;
+};
+
 export type MacroRule = {
   id: string;
   name: string;
@@ -53,9 +66,25 @@ export type MacroRule = {
   mode: MacroMode;
   repeatCount: number;
   speed: number;
+  recordMouseMove: boolean;
+  recordMouseClicks: boolean;
   target?: MacroTarget;
-  steps: MacroStep[];
+  program: AutomationProgram;
 };
+
+export function macroSteps(rule: MacroRule): MacroStep[] {
+  return rule.program.kind === "macro" ? rule.program.steps : [];
+}
+
+export function withMacroSteps(
+  rule: MacroRule,
+  steps: MacroStep[],
+): MacroRule {
+  return {
+    ...rule,
+    program: { kind: "macro", steps },
+  };
+}
 
 export type AppConfig = {
   schemaVersion: number;
@@ -66,10 +95,11 @@ export type AppConfig = {
   hotkeys: HotkeyRule[];
   textExpansions: TextExpansionRule[];
   macros: MacroRule[];
+  assets: AutomationAsset[];
 };
 
 export const defaultConfig: AppConfig = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   globalEnabled: true,
   emergencyStop: "F12",
   navigationAutoCollapse: false,
@@ -102,6 +132,7 @@ export const defaultConfig: AppConfig = {
     },
   ],
   macros: [],
+  assets: [],
 };
 
 export function newRuleId(prefix: string): string {

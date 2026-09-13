@@ -5027,3 +5027,722 @@ button:focus-visible {
     grid-template-columns: 1fr;
   }
 }
+
+/* Macro editor view switcher and JSON source editor. */
+.editor-view-switcher {
+  display: flex;
+  gap: 0;
+  margin-top: 18px;
+  border-bottom: 1px solid #111111;
+}
+
+.editor-view-switcher button {
+  min-width: 92px;
+  padding: 8px 14px;
+  color: #555555;
+  border: 1px solid #111111;
+  border-bottom: 0;
+  background: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.editor-view-switcher button + button {
+  margin-left: -1px;
+}
+
+.editor-view-switcher button:hover:not(:disabled),
+.editor-view-switcher button.is-active {
+  color: #ffffff;
+  background: #111111;
+}
+
+.editor-view-switcher button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.macro-source-editor {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.macro-source-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.macro-source-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.macro-source-heading strong {
+  color: #111111;
+  font-size: 13px;
+}
+
+.macro-source-heading span {
+  color: #777777;
+  font-size: 10px;
+}
+
+.macro-source-textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 500px;
+  padding: 14px 16px;
+  color: #111111;
+  border: 1px solid #111111;
+  border-radius: 0;
+  background: #fbfbfb;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  outline: none;
+  resize: vertical;
+  tab-size: 2;
+}
+
+.macro-source-textarea:focus {
+  box-shadow: 3px 3px 0 #bdbdbd;
+}
+
+.macro-source-error {
+  padding: 9px 11px;
+  color: #a32121;
+  border: 1px solid #cf7777;
+  background: #fff2f2;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.macro-source-rules {
+  padding: 13px 15px;
+  color: #555555;
+  border: 1px solid #cccccc;
+  background: #ffffff;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.macro-source-rules > strong {
+  color: #111111;
+  font-size: 12px;
+}
+
+.macro-source-rules ul {
+  margin: 8px 0 0 18px;
+  padding: 0;
+}
+
+.macro-source-rules li + li {
+  margin-top: 3px;
+}
+
+.macro-source-rules pre {
+  max-width: 100%;
+  margin: 11px 0 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  color: #333333;
+  border: 1px solid #dddddd;
+  background: #f7f7f7;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+@media (max-width: 760px) {
+  .macro-source-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .macro-source-textarea {
+    min-height: 420px;
+  }
+}
+
+/* Delay editors need the full row so both millisecond values remain readable. */
+.macro-step-row.is-delay-step {
+  grid-column: 1 / -1;
+}
+
+.delay-range-fields {
+  display: grid;
+  width: min(430px, 100%);
+  grid-template-columns: minmax(100px, 1fr) auto minmax(100px, 1fr);
+  gap: 9px;
+  align-items: center;
+  margin-top: 7px;
+}
+
+.delay-range-input {
+  position: relative;
+  min-width: 0;
+}
+
+.step-main .delay-range-input input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  margin-top: 0;
+  padding-right: 30px;
+}
+
+.delay-range-unit,
+.delay-range-separator {
+  color: #6a6a6a;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.delay-range-unit {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.delay-range-separator {
+  font-weight: 700;
+}
+
+.delay-range-help {
+  display: block;
+  width: min(520px, 100%);
+  margin-top: 8px;
+  color: #777777;
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
+@media (max-width: 760px) {
+  .delay-range-fields {
+    width: 100%;
+  }
+}
+
+/* Rhai source editor additions. */
+.macro-source-rules {
+  display: none;
+}
+
+.macro-source-editor > textarea.macro-source-textarea {
+  display: none;
+}
+
+.rhai-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.rhai-editor-toolbar button {
+  padding: 5px 9px;
+  border: 1px solid #d7e5df;
+  border-radius: 7px;
+  color: #41665b;
+  background: #f4faf7;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.rhai-editor-toolbar button:hover {
+  background: #e9f5ef;
+}
+
+.rhai-editor-toolbar span {
+  margin-left: auto;
+  color: #9aa9a5;
+  font-size: 10px;
+}
+
+.rhai-editor-shell {
+  display: flex;
+  min-height: 330px;
+  overflow: hidden;
+  border: 1px solid #dce9e4;
+  border-radius: 11px;
+  background: #fbfefd;
+}
+
+.rhai-line-numbers {
+  display: flex;
+  flex: 0 0 42px;
+  flex-direction: column;
+  align-items: flex-end;
+  padding: 16px 10px 16px 0;
+  border-right: 1px solid #e6efeb;
+  color: #a9b9b4;
+  background: #f5faf7;
+  font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  user-select: none;
+}
+
+.rhai-line-numbers span {
+  min-height: 1.65em;
+}
+
+.rhai-line-numbers .is-current {
+  color: #2d6d5d;
+  font-weight: 700;
+}
+
+.rhai-line-numbers .is-error {
+  color: #b34b45;
+  font-weight: 800;
+}
+
+.rhai-editor-code {
+  position: relative;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.rhai-highlight,
+.rhai-editor-textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 330px;
+  margin: 0;
+  padding: 16px;
+  border: 0;
+  font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.rhai-highlight {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  pointer-events: none;
+}
+
+.rhai-editor-textarea {
+  position: relative;
+  display: block;
+  resize: vertical;
+  outline: 0;
+  color: transparent;
+  caret-color: #244e43;
+  background: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+.rhai-editor-textarea::selection {
+  color: transparent;
+  background: rgba(89, 160, 132, 0.2);
+}
+
+.rhai-token-comment {
+  color: #8ea29b;
+}
+
+.rhai-token-string {
+  color: #a05e46;
+}
+
+.rhai-token-keyword {
+  color: #755aab;
+}
+
+.rhai-token-number {
+  color: #2a7691;
+}
+
+.rhai-token-api {
+  color: #2a745f;
+  font-weight: 700;
+}
+
+.rhai-autocomplete {
+  position: absolute;
+  z-index: 2;
+  top: 48px;
+  left: 14px;
+  display: grid;
+  min-width: 160px;
+  padding: 4px;
+  border: 1px solid #d6e4de;
+  border-radius: 8px;
+  background: white;
+  box-shadow: 0 8px 24px rgba(39, 77, 64, 0.12);
+}
+
+.rhai-autocomplete button {
+  padding: 6px 8px;
+  border: 0;
+  color: #3e6559;
+  background: transparent;
+  text-align: left;
+  font: 11px ui-monospace, SFMono-Regular, Consolas, monospace;
+  cursor: pointer;
+}
+
+.rhai-autocomplete button:hover {
+  background: #edf7f2;
+}
+
+.rhai-error-position {
+  margin-top: 7px;
+  color: #b34b45;
+  font-size: 11px;
+}
+
+.rhai-source-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 14px;
+}
+
+.rhai-source-heading > div {
+  display: grid;
+  gap: 5px;
+}
+
+.rhai-source-heading strong {
+  color: #193d36;
+  font-size: 15px;
+}
+
+.macro-program-badge {
+  display: inline-flex;
+  width: fit-content;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #426c60;
+  background: #e8f3ee;
+  font-size: 10px;
+}
+
+.rhai-source-heading span,
+.rhai-source-help {
+  color: #72847f;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.rhai-source-heading .button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.rhai-source-help {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid #e0ebe7;
+  border-radius: 10px;
+  background: #f8fcfa;
+}
+
+.rhai-source-help strong {
+  color: #2c5f53;
+}
+
+.rhai-source-help small {
+  color: #8a9b96;
+}
+
+@media (max-width: 700px) {
+  .rhai-source-heading {
+    display: grid;
+  }
+}
+
+.rhai-examples {
+  margin-top: 12px;
+  border: 1px solid rgba(100, 116, 139, 0.18);
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.72);
+}
+
+.rhai-examples summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.rhai-examples pre {
+  overflow: auto;
+  margin: 0;
+  padding: 0 12px 12px;
+  color: #475569;
+  font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+.asset-manager {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid rgba(79, 70, 229, 0.16);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(248, 250, 252, 0.88), rgba(238, 242, 255, 0.58));
+}
+
+.asset-manager-heading,
+.asset-manager-actions,
+.asset-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.asset-manager-heading {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.asset-manager-heading > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.asset-manager-heading strong {
+  color: #1e293b;
+  font-size: 14px;
+}
+
+.asset-manager-heading span,
+.asset-manager-actions > span,
+.asset-manager-notice {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.asset-card {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.asset-thumbnail {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  overflow: hidden;
+  border-radius: 9px;
+  background: repeating-conic-gradient(#e2e8f0 0 25%, #f8fafc 0 50%) 50% / 12px 12px;
+  color: #94a3b8;
+  font-size: 10px;
+  text-align: center;
+}
+
+.asset-thumbnail img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.asset-card-body {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  gap: 3px;
+}
+
+.asset-card-body strong,
+.asset-card-body small,
+.asset-card-body code,
+.asset-card-body em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-card-body strong {
+  color: #1e293b;
+  font-size: 12px;
+}
+
+.asset-card-body small,
+.asset-card-body em {
+  color: #64748b;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.asset-card-body em {
+  color: #b45309;
+}
+
+.asset-card-body code {
+  color: #4f46e5;
+  font-size: 10px;
+}
+
+.asset-card-actions {
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.asset-card-actions button {
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: #475569;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.asset-card-actions button:hover {
+  color: #4f46e5;
+}
+
+.asset-card-actions button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.asset-empty {
+  margin-top: 12px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.asset-manager-notice {
+  display: block;
+  margin-top: 10px;
+  color: #047857;
+}
+
+@media (max-width: 760px) {
+  .asset-manager-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+.macro-reference-panel {
+  margin-top: 14px;
+  border-top: 1px solid #d8d8d8;
+}
+
+.macro-reference-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 10px 8px;
+}
+
+.macro-reference-heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.macro-reference-heading strong {
+  color: #111111;
+  font-size: 12px;
+}
+
+.macro-reference-heading span {
+  color: #777777;
+  font-size: 10px;
+}
+
+.macro-reference-list {
+  display: grid;
+  gap: 8px;
+  padding: 0 8px 10px;
+}
+
+.macro-reference-card {
+  display: grid;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid #d5d5d5;
+  background: #ffffff;
+}
+
+.macro-reference-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.macro-reference-card-heading strong {
+  min-width: 0;
+  color: #222222;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.macro-reference-kind {
+  flex: 0 0 auto;
+  padding: 2px 4px;
+  color: #176a5d;
+  border: 1px solid #94cfc4;
+  background: #f0fbf8;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.macro-reference-kind.advanced {
+  color: #6746a5;
+  border-color: #c8b7e8;
+  background: #f8f4ff;
+}
+
+.macro-reference-card p {
+  margin: 0;
+  color: #666666;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.macro-reference-card code {
+  overflow: hidden;
+  color: #555555;
+  font: 10px/1.4 "Cascadia Mono", "Consolas", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macro-reference-add {
+  min-height: 26px;
+  padding: 0 7px;
+  color: #176a5d;
+  border: 1px solid #94cfc4;
+  background: #f7fffd;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.macro-reference-add:hover {
+  color: #ffffff;
+  background: #176a5d;
+}
