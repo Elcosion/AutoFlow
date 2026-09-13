@@ -221,21 +221,11 @@ struct DxgiSession {
 }
 
 #[cfg(windows)]
+#[derive(Default)]
 pub struct WindowsCaptureBackend {
     window_session: Option<WgcSession>,
     monitor_sessions: std::collections::HashMap<isize, WgcSession>,
     dxgi_session: Option<DxgiSession>,
-}
-
-#[cfg(windows)]
-impl Default for WindowsCaptureBackend {
-    fn default() -> Self {
-        Self {
-            window_session: None,
-            monitor_sessions: std::collections::HashMap::new(),
-            dxgi_session: None,
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -490,7 +480,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         window: WindowId,
         cancel: &AtomicBool,
     ) -> Result<CaptureFrame, VisionError> {
-        let rect = window_rect(window.clone())?;
+        let rect = window_rect(window)?;
         self.ensure_window_session(window, rect)?;
         let session = self
             .window_session

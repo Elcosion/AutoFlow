@@ -2,7 +2,7 @@
 
 use crate::automation::{
     ImageMatch, Point, RgbColor, ScreenRect, VisionApi, VisionError, VisionPollBudget,
-    WindowRectValue, MAX_WAIT_MS, MIN_POLL_MS,
+    VisionPollOptions, WindowRectValue, MAX_WAIT_MS, MIN_POLL_MS,
 };
 use crate::{MacroStep, MouseButton};
 use rhai::{Dynamic, Engine, EvalAltResult, Map, Position};
@@ -365,7 +365,10 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
                 vision
-                    .wait_window(&title_query, timeout, poll, &cancel, &budget)
+                    .wait_window(
+                        &title_query,
+                        VisionPollOptions::new(timeout, poll, &cancel, &budget),
+                    )
                     .map_err(vision_error_message)
             })
         },
@@ -411,7 +414,12 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
                 vision
-                    .wait_pixel(point, expected, tolerance, timeout, poll, &cancel, &budget)
+                    .wait_pixel(
+                        point,
+                        expected,
+                        tolerance,
+                        VisionPollOptions::new(timeout, poll, &cancel, &budget),
+                    )
                     .map_err(vision_error_message)
             })
         },
@@ -462,7 +470,10 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let budget = Arc::clone(&context.budget);
                 vision
                     .wait_image(
-                        &asset_id, region, threshold, timeout, poll, &cancel, &budget,
+                        &asset_id,
+                        region,
+                        threshold,
+                        VisionPollOptions::new(timeout, poll, &cancel, &budget),
                     )
                     .map(image_match_map)
                     .map_err(vision_error_message)

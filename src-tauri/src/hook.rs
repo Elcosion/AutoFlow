@@ -187,7 +187,7 @@ impl HookService {
     pub fn is_playback_running(&self) -> bool {
         #[cfg(windows)]
         {
-            return self.shared.is_playback_running();
+            self.shared.is_playback_running()
         }
         #[cfg(not(windows))]
         false
@@ -196,7 +196,7 @@ impl HookService {
     pub fn recording_status(&self) -> MacroRecordingStatus {
         #[cfg(windows)]
         {
-            return self.shared.recording_status();
+            self.shared.recording_status()
         }
         #[cfg(not(windows))]
         MacroRecordingStatus {
@@ -213,7 +213,7 @@ impl HookService {
     pub fn playback_status(&self) -> MacroPlaybackStatus {
         #[cfg(windows)]
         {
-            return self.shared.playback_status();
+            self.shared.playback_status()
         }
         #[cfg(not(windows))]
         MacroPlaybackStatus {
@@ -1017,10 +1017,8 @@ unsafe extern "system" fn mouse_hook(
     // under the pointer rather than the current foreground window so moving
     // back to AutoFlow cannot become part of the macro.
     if message_id == WM_MOUSEMOVE && shared.is_recording() {
-        if recording_mouse_input_is_allowed(shared, x, y) {
-            if recording_mouse_move_enabled(shared) {
-                record_mouse_move(shared, x, y);
-            }
+        if recording_mouse_input_is_allowed(shared, x, y) && recording_mouse_move_enabled(shared) {
+            record_mouse_move(shared, x, y);
         }
         return CallNextHookEx(None, code, message, data);
     }
@@ -2237,26 +2235,28 @@ mod tests {
         let pressed = HashSet::from([0x10_u32, 0x11_u32, 0x78_u32]);
         assert!(is_recording_shortcut_key(0x78, &pressed));
 
-        let mut recorder = RecorderState::default();
-        recorder.steps = vec![
-            MacroStep::Key {
-                key: "Ctrl".to_string(),
-                action: KeyAction::Down,
-            },
-            MacroStep::Delay {
-                duration_ms: 20,
-                duration_max_ms: None,
-            },
-            MacroStep::Key {
-                key: "Shift".to_string(),
-                action: KeyAction::Down,
-            },
-            MacroStep::Key {
-                key: "F9".to_string(),
-                action: KeyAction::Down,
-            },
-        ];
-        recorder.pressed_keys = pressed;
+        let mut recorder = RecorderState {
+            steps: vec![
+                MacroStep::Key {
+                    key: "Ctrl".to_string(),
+                    action: KeyAction::Down,
+                },
+                MacroStep::Delay {
+                    duration_ms: 20,
+                    duration_max_ms: None,
+                },
+                MacroStep::Key {
+                    key: "Shift".to_string(),
+                    action: KeyAction::Down,
+                },
+                MacroStep::Key {
+                    key: "F9".to_string(),
+                    action: KeyAction::Down,
+                },
+            ],
+            pressed_keys: pressed,
+            ..Default::default()
+        };
         discard_recording_shortcut_steps(&mut recorder);
         assert!(recorder.steps.is_empty());
         assert!(recorder.pressed_keys.is_empty());
@@ -2337,7 +2337,7 @@ mod tests {
         let recorder = shared.recorder.lock().expect("recorder should lock");
         assert_eq!(recorder.steps.len(), 4);
         assert!(matches!(
-            recorder.steps.get(0),
+            recorder.steps.first(),
             Some(MacroStep::Key { key, .. }) if key == "A"
         ));
         assert!(matches!(

@@ -381,10 +381,7 @@ pub trait VisionApi: Send + Sync {
     fn wait_window(
         &self,
         title_query: &str,
-        timeout: Duration,
-        poll: Duration,
-        cancel: &AtomicBool,
-        budget: &VisionPollBudget,
+        options: VisionPollOptions<'_>,
     ) -> Result<bool, VisionError>;
     fn pixel_matches(
         &self,
@@ -398,10 +395,7 @@ pub trait VisionApi: Send + Sync {
         point: Point,
         expected: RgbColor,
         tolerance: u8,
-        timeout: Duration,
-        poll: Duration,
-        cancel: &AtomicBool,
-        budget: &VisionPollBudget,
+        options: VisionPollOptions<'_>,
     ) -> Result<bool, VisionError>;
     fn find_image(
         &self,
@@ -415,10 +409,7 @@ pub trait VisionApi: Send + Sync {
         asset_id: &str,
         region: ScreenRect,
         threshold: f32,
-        timeout: Duration,
-        poll: Duration,
-        cancel: &AtomicBool,
-        budget: &VisionPollBudget,
+        options: VisionPollOptions<'_>,
     ) -> Result<Option<ImageMatch>, VisionError>;
 }
 
@@ -435,6 +426,56 @@ pub struct WindowInfo {
 pub struct VisionPollBudget {
     count: AtomicUsize,
     progress: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+}
+
+impl VisionPollBudget {
+    pub fn new(progress: Option<Arc<dyn Fn(usize) + Send + Sync>>) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            progress,
+        }
+    }
+
+    pub fn consume(&self) -> Result<usize, VisionError> {
+        let next = self.count.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        if next > MAX_VISION_OPERATIONS {
+            return Err(VisionError::new(
+                "vision_operation_limit",
+                "视觉轮询超过最大操作数，请增大轮询间隔或缩短等待时间",
+            ));
+        }
+        if let Some(progress) = &self.progress {
+            progress(next);
+        }
+        Ok(next)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+pub struct VisionPollOptions<'a> {
+    pub timeout: Duration,
+    pub poll: Duration,
+    pub cancel: &'a AtomicBool,
+    pub budget: &'a VisionPollBudget,
+}
+
+impl<'a> VisionPollOptions<'a> {
+    pub const fn new(
+        timeout: Duration,
+        poll: Duration,
+        cancel: &'a AtomicBool,
+        budget: &'a VisionPollBudget,
+    ) -> Self {
+        Self {
+            timeout,
+            poll,
+            cancel,
+            budget,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -463,32 +504,5 @@ mod tests {
                 .code,
             "capture_region_invalid"
         );
-    }
-}
-
-impl VisionPollBudget {
-    pub fn new(progress: Option<Arc<dyn Fn(usize) + Send + Sync>>) -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            progress,
-        }
-    }
-
-    pub fn consume(&self) -> Result<usize, VisionError> {
-        let next = self.count.fetch_add(1, Ordering::SeqCst).saturating_add(1);
-        if next > MAX_VISION_OPERATIONS {
-            return Err(VisionError::new(
-                "vision_operation_limit",
-                "视觉轮询超过最大操作数，请增大轮询间隔或缩短等待时间",
-            ));
-        }
-        if let Some(progress) = &self.progress {
-            progress(next);
-        }
-        Ok(next)
-    }
-
-    pub fn count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
     }
 }

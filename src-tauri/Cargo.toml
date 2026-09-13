@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "AutoFlow desktop shell and Rust core"
 authors = ["AutoFlow contributors"]
 edition = "2021"
+default-run = "autoflow"
 
 [lib]
 name = "autoflow_lib"

@@ -33,7 +33,7 @@ impl ImageProcVisionMatcher {
             ));
         }
         let mut gray = Vec::with_capacity(expected / 4);
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             // Integer BT.601 luminance keeps matching deterministic and avoids
             // allocating an RGBA image solely for grayscale conversion.
             let value = (u16::from(pixel[2]) * 77
@@ -107,7 +107,7 @@ impl VisionMatcher for ImageProcVisionMatcher {
             if !score.is_finite() {
                 continue;
             }
-            if best.map_or(true, |(_, _, current)| score > current) {
+            if best.is_none_or(|(_, _, current)| score > current) {
                 best = Some((x, y, score));
             }
         }
