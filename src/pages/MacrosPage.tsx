@@ -5,11 +5,15 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { BulkActions } from "../components/BulkActions";
+import { AssetManager } from "../components/AssetManager";
 import { PageHeader } from "../components/PageHeader";
+import { RhaiEditor } from "../components/RhaiEditor";
 import { useAppConfig, toErrorMessage } from "../lib/config";
 import { useAutoSave } from "../lib/useAutoSave";
 import {
   newRuleId,
+  macroSteps,
+  type AutomationProgram,
   type MacroMode,
   type MacroRule,
   type MacroStep,
@@ -19,14 +23,137 @@ import {
   getMacroRecordingStatus,
   playMacro,
   startMacroRecording,
+  setMacroRecordingOptions,
   stopMacro,
   stopMacroRecording,
+  validateRhaiSource,
 } from "../lib/tauri";
+import { nextCapturedKeys } from "../lib/triggerCapture";
+import {
+  classifyMacroSource,
+  MacroSourceError,
+  macroToSource,
+  parseMacroSource,
+} from "../lib/macroSource";
 
 const macroSignature = (keys: string[]) =>
   keys.map((key) => key.trim().toUpperCase()).join("+");
 
-const modifierOrder = ["Ctrl", "Alt", "Shift", "Win"];
+const RECORDING_SHORTCUT_LABEL = "Ctrl + Shift + F9";
+type MacroEditorView = "visual" | "source";
+
+type MacroReference = {
+  id: string;
+  name: string;
+  kind: "compatible" | "advanced";
+  description: string;
+  preview: string;
+  program: AutomationProgram;
+};
+
+const macroReferences: MacroReference[] = [
+  {
+    id: "copy-and-type",
+    name: "复制后输入文本",
+    kind: "compatible",
+    description: "模拟 Ctrl+C，等待片刻后输入一段示例文本。",
+    preview: "Ctrl+C → 等待 300 ms → 输入文本",
+    program: {
+      kind: "macro",
+      steps: [
+        { type: "key", key: "Ctrl", action: "down" },
+        { type: "key", key: "C", action: "down" },
+        { type: "key", key: "C", action: "up" },
+        { type: "key", key: "Ctrl", action: "up" },
+        { type: "delay", durationMs: 300 },
+        { type: "text", text: "AutoFlow 示例文本" },
+      ],
+    },
+  },
+  {
+    id: "click-and-wait",
+    name: "坐标点击并等待",
+    kind: "compatible",
+    description: "移动到示例坐标并点击一次，适合改成固定位置操作。",
+    preview: "移动到 (820, 430) → 左键点击 → 等待 300 ms",
+    program: {
+      kind: "macro",
+      steps: [
+        { type: "mouseMove", x: 820, y: 430 },
+        {
+          type: "mouseButton",
+          button: "left",
+          action: "down",
+          x: 820,
+          y: 430,
+        },
+        {
+          type: "mouseButton",
+          button: "left",
+          action: "up",
+          x: 820,
+          y: 430,
+        },
+        { type: "delay", durationMs: 300 },
+      ],
+    },
+  },
+  {
+    id: "random-scroll",
+    name: "随机间隔滚轮",
+    kind: "compatible",
+    description: "以 300–800 ms 的随机间隔向下滚动一格。",
+    preview: "随机等待 300–800 ms → 滚轮 (0, -120)",
+    program: {
+      kind: "macro",
+      steps: [
+        { type: "delay", durationMs: 300, durationMaxMs: 800 },
+        { type: "wheel", deltaX: 0, deltaY: -120 },
+      ],
+    },
+  },
+  {
+    id: "window-image-click",
+    name: "窗口内查找图片并点击",
+    kind: "advanced",
+    description: "在指定窗口内查找素材图片，找到后点击图片中心。",
+    preview: "window_rect → find_image → click",
+    program: {
+      kind: "rhai",
+      apiVersion: 1,
+      source: `let window = window_rect("记事本");
+if window.found {
+  let result = find_image("confirm_button", window.x, window.y, window.width, window.height, 0.90);
+  if result.found { click("left", result.center_x, result.center_y); }
+}`,
+    },
+  },
+  {
+    id: "wait-pixel",
+    name: "等待像素颜色出现",
+    kind: "advanced",
+    description: "等待指定坐标接近目标颜色，适合等待页面或窗口状态变化。",
+    preview: "wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200)",
+    program: {
+      kind: "rhai",
+      apiVersion: 1,
+      source: "wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);",
+    },
+  },
+];
+
+const cloneProgram = (program: AutomationProgram): AutomationProgram =>
+  program.kind === "macro"
+    ? { kind: "macro", steps: program.steps.map((step) => ({ ...step })) }
+    : { ...program };
+
+const usesRecordingShortcut = (keys: string[]) => {
+  const normalized = new Set(keys.map((key) => key.trim().toUpperCase()));
+  return (
+    normalized.size === 3 &&
+    ["CTRL", "SHIFT", "F9"].every((key) => normalized.has(key))
+  );
+};
 
 function normalizeCapturedKey(event: ReactKeyboardEvent<HTMLInputElement>) {
   const namedKeys: Record<string, string> = {
@@ -52,20 +179,6 @@ function normalizeCapturedKey(event: ReactKeyboardEvent<HTMLInputElement>) {
   return null;
 }
 
-function canonicalizeKeys(keys: string[]) {
-  return [...new Set(keys)].sort((left, right) => {
-    const leftIndex = modifierOrder.indexOf(left);
-    const rightIndex = modifierOrder.indexOf(right);
-    if (leftIndex >= 0 || rightIndex >= 0) {
-      return (
-        (leftIndex < 0 ? modifierOrder.length : leftIndex) -
-        (rightIndex < 0 ? modifierOrder.length : rightIndex)
-      );
-    }
-    return left.localeCompare(right);
-  });
-}
-
 const blankMacro = (existing: MacroRule[]): MacroRule => {
   const used = new Set(
     existing.map((macro) => macroSignature(macro.triggerKeys)),
@@ -83,14 +196,19 @@ const blankMacro = (existing: MacroRule[]): MacroRule => {
     mode: "once",
     repeatCount: 1,
     speed: 1,
-    steps: [],
+    recordMouseMove: true,
+    recordMouseClicks: true,
+    program: { kind: "macro", steps: [] },
   };
 };
 
 const copyMacro = (macro: MacroRule): MacroRule => ({
   ...macro,
   triggerKeys: [...macro.triggerKeys],
-  steps: macro.steps.map((step) => ({ ...step })),
+  program:
+    macro.program.kind === "macro"
+      ? { kind: "macro", steps: macroSteps(macro).map((step) => ({ ...step })) }
+      : { ...macro.program },
 });
 
 const modeLabels: Record<MacroMode, string> = {
@@ -110,7 +228,8 @@ const modeDescriptions: Record<MacroMode, string> = {
 function stepTitle(step: MacroStep): string {
   switch (step.type) {
     case "delay":
-      return step.durationMaxMs !== undefined && step.durationMaxMs > step.durationMs
+      return step.durationMaxMs !== undefined &&
+        step.durationMaxMs > step.durationMs
         ? `随机等待 ${step.durationMs}–${step.durationMaxMs} ms`
         : `等待 ${step.durationMs} ms`;
     case "key":
@@ -127,10 +246,16 @@ function stepTitle(step: MacroStep): string {
 }
 
 export function MacrosPage() {
-  const { config, loading, saving, error, setError, persist } = useAppConfig();
+  const { config, loading, saving, error, setError, persist, refresh } = useAppConfig();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<MacroRule | null>(null);
+  const [editorView, setEditorView] = useState<MacroEditorView>("visual");
+  const [sourceText, setSourceText] = useState("");
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [sourceErrorLine, setSourceErrorLine] = useState<number | null>(null);
+  const [sourceErrorColumn, setSourceErrorColumn] = useState<number | null>(null);
   const [recording, setRecording] = useState(false);
+  const [recordingCaptureStarted, setRecordingCaptureStarted] = useState(false);
   const [recordingStepCount, setRecordingStepCount] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playbackStep, setPlaybackStep] = useState<{
@@ -154,6 +279,7 @@ export function MacrosPage() {
   const playbackTimerRef = useRef<number | null>(null);
   const configRef = useRef(config);
   const recordingMacroIdRef = useRef<string | null>(null);
+  const finishingRecordingRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -182,6 +308,13 @@ export function MacrosPage() {
   }, [config.macros, selectedId]);
 
   useEffect(() => {
+    const next = config.macros.find((macro) => macro.id === selectedId);
+    setEditorView(next?.program.kind === "rhai" ? "source" : "visual");
+    setSourceText(next ? macroToSource(next) : "");
+    setSourceError(null);
+  }, [config.macros, selectedId]);
+
+  useEffect(() => {
     if (!playing) return;
     let active = true;
     const timer = window.setInterval(() => {
@@ -204,25 +337,6 @@ export function MacrosPage() {
       window.clearInterval(timer);
     };
   }, [playing]);
-
-  useEffect(() => {
-    if (!recording) return;
-    let active = true;
-    const refresh = () => {
-      void getMacroRecordingStatus()
-        .then((status) => {
-          if (!active) return;
-          setRecordingStepCount(status.stepCount);
-        })
-        .catch(() => undefined);
-    };
-    refresh();
-    const timer = window.setInterval(refresh, 180);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [recording]);
 
   useEffect(() => {
     if (draggingStepIndex === null) return;
@@ -262,9 +376,21 @@ export function MacrosPage() {
       window.removeEventListener("pointerup", finishPointerDrag);
       window.removeEventListener("pointercancel", finishPointerDrag);
     };
-  }, [draggingStepIndex, draft?.steps.length]);
+  }, [draggingStepIndex, draft ? macroSteps(draft).length : 0]);
 
   const selected = draft;
+  const selectedSteps = selected ? macroSteps(selected) : [];
+  const selectedSourceKind =
+    selected?.program.kind === "rhai" ? "advanced" : "compatible";
+
+  useEffect(() => {
+    if (!selected) return;
+    void setMacroRecordingOptions(
+      selected.recordMouseMove !== false,
+      selected.recordMouseClicks !== false,
+    ).catch(() => undefined);
+  }, [selected?.id, selected?.recordMouseMove, selected?.recordMouseClicks]);
+
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice(null), 1800);
@@ -279,8 +405,18 @@ export function MacrosPage() {
     }
   };
 
-  const updateDraft = (patch: Partial<MacroRule>) => {
-    setDraft((current) => (current ? { ...current, ...patch } : current));
+  type MacroDraftPatch = Partial<MacroRule> & { steps?: MacroStep[] };
+
+  const updateDraft = (patch: MacroDraftPatch) => {
+    setDraft((current) => {
+      if (!current) return current;
+      const { steps: legacySteps, ...metadata } = patch;
+      const next = { ...current, ...metadata };
+      if (legacySteps !== undefined) {
+        next.program = { kind: "macro", steps: legacySteps };
+      }
+      return next;
+    });
   };
 
   const captureTrigger = (event: ReactKeyboardEvent<HTMLInputElement>) => {
@@ -289,29 +425,155 @@ export function MacrosPage() {
     event.preventDefault();
     event.stopPropagation();
     const currentKeys = triggerCaptureActive.current
-      ? [...(selected?.triggerKeys ?? []), key]
-      : [key];
-    const nextKeys = modifierOrder.includes(key)
-      ? currentKeys
-      : [
-          ...currentKeys.filter((currentKey) =>
-            modifierOrder.includes(currentKey),
-          ),
-          key,
-        ];
+      ? (selected?.triggerKeys ?? [])
+      : [];
     triggerCaptureActive.current = true;
-    updateDraft({ triggerKeys: canonicalizeKeys(nextKeys) });
+    updateDraft({ triggerKeys: nextCapturedKeys(currentKeys, key) });
   };
 
   const validateDraft = (candidate: MacroRule) => {
+    const candidateSteps =
+      candidate.program.kind === "macro" ? candidate.program.steps : [];
+    if (candidate.program.kind === "rhai") {
+      if (!candidate.name.trim()) return "请输入宏名称";
+      if (usesRecordingShortcut(candidate.triggerKeys))
+        return `${RECORDING_SHORTCUT_LABEL} 保留为录制快捷键，请换一个宏触发组合`;
+      if (candidate.enabled && candidate.triggerKeys.length === 0)
+        return "启用宏前至少需要设置一个触发键";
+      if (!candidate.program.source.trim()) return "高级 Rhai 脚本不能为空";
+      return undefined;
+    }
     if (!candidate.name.trim()) return "请先填写宏名称";
+    if (usesRecordingShortcut(candidate.triggerKeys))
+      return `${RECORDING_SHORTCUT_LABEL} 保留为录制快捷键，请换一个宏触发组合`;
     if (candidate.enabled && candidate.triggerKeys.length === 0)
       return "启用宏前至少需要设置一个触发键";
-    if (candidate.enabled && candidate.steps.length === 0)
+    if (candidate.enabled && candidateSteps.length === 0)
       return "启用宏前请先录制或添加至少一个步骤";
-    if (candidate.steps.some((step) => step.type === "text" && !step.text))
+    if (candidateSteps.some((step) => step.type === "text" && !step.text))
       return "文本步骤不能为空，请填写内容或删除该步骤";
     return undefined;
+  };
+
+  const openSourceEditor = () => {
+    if (!selected) return;
+    setSourceText(macroToSource(selected));
+    setSourceError(null);
+    setEditorView("source");
+  };
+
+  const showSourceError = (reason: unknown) => {
+    if (reason instanceof MacroSourceError) {
+      setSourceErrorLine(reason.line);
+      setSourceErrorColumn(reason.column);
+    } else {
+      setSourceErrorLine(null);
+      setSourceErrorColumn(null);
+    }
+    setSourceError(toErrorMessage(reason));
+  };
+
+  const checkSource = async () => {
+    try {
+      if (classifyMacroSource(sourceText) === "advanced") {
+        await validateRhaiSource(sourceText);
+        setSourceError(null);
+        showNotice("高级 Rhai 语法检查通过");
+        setSourceErrorLine(null);
+        setSourceErrorColumn(null);
+        return;
+      }
+      if (!selected) return;
+      parseMacroSource(sourceText, selected);
+      setSourceError(null);
+      setSourceErrorLine(null);
+      setSourceErrorColumn(null);
+      showNotice("语法检查通过");
+    } catch (reason) {
+      showSourceError(reason);
+    }
+  };
+
+  const formatSource = () => {
+    if (!selected || classifyMacroSource(sourceText) === "advanced") {
+      setSourceError("高级脚本暂不自动格式化，请保留源码原样编辑。");
+      setSourceErrorLine(null);
+      setSourceErrorColumn(null);
+      return;
+    }
+    try {
+      const candidate = parseMacroSource(sourceText, selected);
+      setSourceText(macroToSource(candidate));
+      setSourceError(null);
+      setSourceErrorLine(null);
+      setSourceErrorColumn(null);
+      showNotice("源码已格式化");
+    } catch (reason) {
+      showSourceError(reason);
+    }
+  };
+
+  const applySourceAndSwitch = async () => {
+    if (!selected) return;
+    if (classifyMacroSource(sourceText) === "advanced") {
+      if (selected.program.kind !== "rhai") {
+        const confirmed = window.confirm(
+          "该源码包含循环、条件、变量或函数定义，无法转换为图形宏步骤。确认保存为高级 Rhai 脚本吗？保存后将保留源码，不能切回图形界面。",
+        );
+        if (!confirmed) {
+          setSourceError("高级脚本未保存；如需图形宏，请删除循环、条件、变量和函数定义。");
+          return;
+        }
+      }
+      const candidate: MacroRule = {
+        ...selected,
+        program: { kind: "rhai", source: sourceText, apiVersion: 1 },
+      };
+      const validationError = validateDraft(candidate);
+      if (validationError) {
+        setSourceError(validationError);
+        return;
+      }
+      try {
+        await validateRhaiSource(sourceText);
+        const currentConfig = configRef.current;
+        const next = currentConfig.macros.map((macro) =>
+          macro.id === candidate.id ? candidate : macro,
+        );
+        const savedConfig = await persist({ ...currentConfig, macros: next });
+        const savedMacro = savedConfig.macros.find(
+          (macro) => macro.id === candidate.id,
+        );
+        setDraft(copyMacro(savedMacro ?? candidate));
+        setSourceError(null);
+        showNotice("高级 Rhai 脚本已保存");
+      } catch (reason) {
+        showSourceError(reason);
+      }
+      return;
+    }
+    try {
+      const candidate = parseMacroSource(sourceText, selected);
+      const validationError = validateDraft(candidate);
+      if (validationError) {
+        setSourceError(validationError);
+        return;
+      }
+      const currentConfig = configRef.current;
+      const next = currentConfig.macros.map((macro) =>
+        macro.id === candidate.id ? candidate : macro,
+      );
+      const savedConfig = await persist({ ...currentConfig, macros: next });
+      const savedMacro = savedConfig.macros.find(
+        (macro) => macro.id === candidate.id,
+      );
+      setDraft(copyMacro(savedMacro ?? candidate));
+      setSourceError(null);
+      setEditorView("visual");
+      showNotice("源码已应用");
+    } catch (reason) {
+      showSourceError(reason);
+    }
   };
 
   const savedSelected = config.macros.find(
@@ -330,6 +592,20 @@ export function MacrosPage() {
     setSelectedId(macro.id);
     setDraft(macro);
     void save([...config.macros, macro], "已创建宏");
+  };
+
+  const addReferenceMacro = (reference: MacroReference) => {
+    const macro: MacroRule = {
+      ...blankMacro(config.macros),
+      name: `参考：${reference.name}`,
+      program: cloneProgram(reference.program),
+    };
+    setSelectedId(macro.id);
+    setSelectedIds(new Set());
+    setDraft(macro);
+    setEditorView(macro.program.kind === "rhai" ? "source" : "visual");
+    setSourceText(macroToSource(macro));
+    void save([...config.macros, macro], `已添加参考宏：${reference.name}`);
   };
 
   const removeSelected = () => {
@@ -375,7 +651,11 @@ export function MacrosPage() {
 
   const toggleMacro = (macro: MacroRule) => {
     const candidate = selected?.id === macro.id ? selected : macro;
-    if (!candidate.enabled && candidate.steps.length === 0) {
+    if (
+      !candidate.enabled &&
+      candidate.program.kind === "macro" &&
+      candidate.program.steps.length === 0
+    ) {
       setError("这个宏还没有步骤，录制或添加步骤后才能启用");
       return;
     }
@@ -393,12 +673,12 @@ export function MacrosPage() {
   };
 
   const addStep = (step: MacroStep) =>
-    updateDraft({ steps: [...(selected?.steps ?? []), step] });
+    updateDraft({ steps: [...(selected ? macroSteps(selected) : []), step] });
 
   const updateStep = (index: number, step: MacroStep) => {
     if (!selected) return;
     updateDraft({
-      steps: selected.steps.map((item, itemIndex) =>
+      steps: macroSteps(selected).map((item, itemIndex) =>
         itemIndex === index ? step : item,
       ),
     });
@@ -407,8 +687,8 @@ export function MacrosPage() {
   const moveStep = (index: number, direction: -1 | 1) => {
     if (!selected) return;
     const nextIndex = index + direction;
-    if (nextIndex < 0 || nextIndex >= selected.steps.length) return;
-    const steps = [...selected.steps];
+    if (nextIndex < 0 || nextIndex >= macroSteps(selected).length) return;
+    const steps = [...macroSteps(selected)];
     [steps[index], steps[nextIndex]] = [steps[nextIndex], steps[index]];
     updateDraft({ steps });
   };
@@ -418,12 +698,12 @@ export function MacrosPage() {
     if (
       fromIndex < 0 ||
       toIndex < 0 ||
-      fromIndex >= selected.steps.length ||
-      toIndex >= selected.steps.length
+      fromIndex >= macroSteps(selected).length ||
+      toIndex >= macroSteps(selected).length
     ) {
       return;
     }
-    const steps = [...selected.steps];
+    const steps = [...macroSteps(selected)];
     const [moved] = steps.splice(fromIndex, 1);
     steps.splice(toIndex, 0, moved);
     updateDraft({ steps });
@@ -432,13 +712,13 @@ export function MacrosPage() {
   const deleteStep = (index: number) => {
     if (selected)
       updateDraft({
-        steps: selected.steps.filter((_, itemIndex) => itemIndex !== index),
+        steps: macroSteps(selected).filter((_, itemIndex) => itemIndex !== index),
       });
   };
 
   const duplicateStep = (index: number) => {
     if (!selected) return;
-    const steps = [...selected.steps];
+    const steps = [...macroSteps(selected)];
     steps.splice(index + 1, 0, { ...steps[index] });
     updateDraft({ steps });
   };
@@ -455,22 +735,29 @@ export function MacrosPage() {
         setSelectedId(macro.id);
         setDraft(macro);
       }
-      await startMacroRecording();
+      await startMacroRecording(
+        macro?.recordMouseMove !== false,
+        macro?.recordMouseClicks !== false,
+      );
       recordingMacroIdRef.current = macro?.id ?? null;
+      setRecordingCaptureStarted(false);
       setRecordingStepCount(0);
       setRecording(true);
       showNotice(
-        `正在录制“${macro?.name ?? "新宏"}”：切到任意软件操作，完成后返回此处停止录制`,
+        `正在录制“${macro?.name ?? "新宏"}”：先切到目标软件，按 ${RECORDING_SHORTCUT_LABEL} 停止`,
       );
     } catch (reason) {
       setError(toErrorMessage(reason));
     }
   };
 
-  const finishRecording = async () => {
+  const finishRecording = async (discardTrailingMouseInput = false) => {
+    if (finishingRecordingRef.current) return;
+    finishingRecordingRef.current = true;
     try {
-      const recorded = await stopMacroRecording();
+      const recorded = await stopMacroRecording(discardTrailingMouseInput);
       setRecording(false);
+      setRecordingCaptureStarted(false);
       setRecordingStepCount(0);
       const currentConfig = configRef.current;
       const recordingMacroId = recordingMacroIdRef.current;
@@ -480,9 +767,14 @@ export function MacrosPage() {
       if (!recordedMacro) {
         throw new Error("找不到正在录制的宏，请重新开始录制");
       }
+      const recordedSteps =
+        recordedMacro.program.kind === "macro" ? recordedMacro.program.steps : [];
       const nextMacro = {
         ...recordedMacro,
-        steps: [...recordedMacro.steps, ...recorded.steps],
+        program: {
+          kind: "macro" as const,
+          steps: [...recordedSteps, ...recorded.steps],
+        },
         target: undefined,
       };
       const next = currentConfig.macros.map((macro) =>
@@ -495,13 +787,72 @@ export function MacrosPage() {
     } catch (reason) {
       setError(toErrorMessage(reason));
       setRecording(false);
+      setRecordingCaptureStarted(false);
       setRecordingStepCount(0);
       recordingMacroIdRef.current = null;
+    } finally {
+      finishingRecordingRef.current = false;
     }
   };
 
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void getMacroRecordingStatus()
+        .then((status) => {
+          if (!active) return;
+          setRecordingStepCount(status.stepCount);
+          setRecordingCaptureStarted(status.captureStarted);
+
+          if (status.active && !recording) {
+            const baseMacro = selected ?? blankMacro(configRef.current.macros);
+            const macro = {
+              ...baseMacro,
+              recordMouseMove: status.captureMouseMove,
+              recordMouseClicks: status.captureMouseClicks,
+            };
+            recordingMacroIdRef.current = macro.id;
+            if (!selected) {
+              const macros = [...configRef.current.macros, macro];
+              setSelectedId(macro.id);
+              setDraft(copyMacro(macro));
+              void persist({ ...configRef.current, macros }).catch((reason) =>
+                setError(toErrorMessage(reason)),
+              );
+            } else {
+              setDraft((current) =>
+                current?.id === macro.id ? { ...current, ...macro } : current,
+              );
+            }
+            setRecording(true);
+            showNotice(
+              `正在录制：请先切到目标窗口，再按 ${RECORDING_SHORTCUT_LABEL} 停止`,
+            );
+          } else if (
+            !status.active &&
+            recording &&
+            !finishingRecordingRef.current
+          ) {
+            void finishRecording(false);
+          }
+        })
+        .catch(() => undefined);
+    };
+
+    refresh();
+    const timer = window.setInterval(refresh, 180);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [recording, selected?.id]);
+
   const runSelected = async () => {
-    if (!selected || selected.steps.length === 0) {
+    if (
+      !selected ||
+      (selected.program.kind === "macro" && selectedSteps.length === 0) ||
+      (selected.program.kind === "rhai" && !selected.program.source.trim())
+    ) {
       setError("请先录制或添加至少一个宏步骤");
       return;
     }
@@ -562,7 +913,7 @@ export function MacrosPage() {
             {recording ? (
               <button
                 className="button button-danger"
-                onClick={() => void finishRecording()}
+                onClick={() => void finishRecording(true)}
                 type="button"
               >
                 ■ 停止录制
@@ -591,7 +942,9 @@ export function MacrosPage() {
         <div className="macro-recording-guide">
           <strong>正在录制</strong>
           <span>
-            切换到任何软件后直接操作。键盘、点击、拖拽和滚轮都会被记录；不绑定任何窗口。完成后回到这里点击“停止录制”，结果会立即保存。
+            {recordingCaptureStarted
+              ? `已开始捕获，请在目标软件中操作；按 ${RECORDING_SHORTCUT_LABEL} 停止`
+              : `请先切到目标软件；AutoFlow 第一次失去焦点后才开始录制。按 ${RECORDING_SHORTCUT_LABEL} 停止`}
           </span>
           <span className="recording-progress">
             正在捕获操作 · 已捕获 {recordingStepCount} 步
@@ -635,6 +988,35 @@ export function MacrosPage() {
               total={config.macros.length}
             />
           </div>
+          <section className="macro-reference-panel">
+            <div className="macro-reference-heading">
+              <div>
+                <strong>参考宏</strong>
+                <span>添加后可继续修改</span>
+              </div>
+            </div>
+            <div className="macro-reference-list">
+              {macroReferences.map((reference) => (
+                <article className="macro-reference-card" key={reference.id}>
+                  <div className="macro-reference-card-heading">
+                    <strong>{reference.name}</strong>
+                    <span className={`macro-reference-kind ${reference.kind}`}>
+                      {reference.kind === "advanced" ? "高级 Rhai" : "兼容宏"}
+                    </span>
+                  </div>
+                  <p>{reference.description}</p>
+                  <code>{reference.preview}</code>
+                  <button
+                    className="macro-reference-add"
+                    onClick={() => addReferenceMacro(reference)}
+                    type="button"
+                  >
+                    添加参考宏
+                  </button>
+                </article>
+              ))}
+            </div>
+          </section>
           {loading ? (
             <div className="panel-loading">正在读取本机配置…</div>
           ) : config.macros.length === 0 ? (
@@ -672,8 +1054,11 @@ export function MacrosPage() {
                   <span className="rule-icon macro">▶</span>
                   <span className="rule-list-copy">
                     <strong>{macro.name}</strong>
+                    {macro.program.kind === "rhai" ? (
+                      <small className="macro-program-badge">高级 Rhai</small>
+                    ) : null}
                     <span>
-                      {macro.triggerKeys.join(" + ")} · {macro.steps.length} 步
+                      {macro.triggerKeys.join(" + ")} · {macro.program.kind === "macro" ? macro.program.steps.length : 0} 步
                       · {modeLabels[macro.mode]}
                     </span>
                   </span>
@@ -713,479 +1098,640 @@ export function MacrosPage() {
                   删除宏
                 </button>
               </div>
-              <div className="macro-settings-grid">
-                <div className="form-section">
-                  <label htmlFor="macro-name">宏名称</label>
-                  <input
-                    id="macro-name"
-                    value={selected.name}
-                    onChange={(event) =>
-                      updateDraft({ name: event.target.value })
-                    }
-                    placeholder="例如：每日重复操作"
-                  />
-                </div>
-                <div className="form-section">
-                  <label htmlFor="macro-trigger">触发组合</label>
-                  <div className="trigger-capture-field">
-                    <input
-                      id="macro-trigger"
-                      value={selected.triggerKeys.join(" + ")}
-                      onBlur={() => {
-                        triggerCaptureActive.current = false;
-                      }}
-                      onFocus={() => {
-                        triggerCaptureActive.current = false;
-                      }}
-                      onKeyDown={captureTrigger}
-                      placeholder="点击后按下组合键"
-                      readOnly
-                    />
-                  </div>
-                  <div className="form-help">
-                    点击输入框后直接按组合键，例如 Ctrl、Alt、再按 F8。
-                  </div>
-                </div>
-                <div className="form-section">
-                  <label htmlFor="macro-mode">运行模式</label>
-                  <select
-                    id="macro-mode"
-                    value={selected.mode}
-                    onChange={(event) =>
-                      updateDraft({ mode: event.target.value as MacroMode })
-                    }
-                  >
-                    {Object.entries(modeLabels).map(([value, label]) => (
-                      <option key={value} value={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                  <div className="form-help">
-                    {modeDescriptions[selected.mode]}
-                  </div>
-                </div>
-                {selected.mode === "repeat" ? (
-                  <div className="form-section">
-                    <label htmlFor="macro-repeat">循环次数</label>
-                    <input
-                      id="macro-repeat"
-                      min={1}
-                      type="number"
-                      value={selected.repeatCount}
-                      onChange={(event) =>
-                        updateDraft({
-                          repeatCount: Math.max(
-                            1,
-                            Number(event.target.value) || 1,
-                          ),
-                        })
-                      }
-                    />
-                  </div>
-                ) : null}
-                <div className="form-section">
-                  <label htmlFor="macro-speed">
-                    整体速度 <span>1.0× 为原速</span>
-                  </label>
-                  <input
-                    id="macro-speed"
-                    min={0.05}
-                    max={10}
-                    step={0.05}
-                    type="number"
-                    value={selected.speed}
-                    onChange={(event) =>
-                      updateDraft({
-                        speed: Math.max(0.05, Number(event.target.value) || 1),
-                      })
-                    }
-                  />
-                </div>
+              <div
+                aria-label="宏编辑视图"
+                className="editor-view-switcher"
+                role="tablist"
+              >
+                <button
+                  aria-selected={editorView === "visual"}
+                  className={editorView === "visual" ? "is-active" : ""}
+                  disabled={selected.program.kind === "rhai"}
+                  onClick={() => {
+                    if (editorView === "visual") return;
+                    void applySourceAndSwitch();
+                  }}
+                  role="tab"
+                  type="button"
+                >
+                  图形界面
+                </button>
+                <button
+                  aria-selected={editorView === "source"}
+                  className={editorView === "source" ? "is-active" : ""}
+                  disabled={recording || editorView === "source"}
+                  onClick={openSourceEditor}
+                  role="tab"
+                  type="button"
+                >
+                  源码
+                </button>
               </div>
-              <div className="step-toolbar">
-                <div>
-                  <strong>步骤列表</strong>
-                  <span>{selected.steps.length} 步</span>
-                </div>
-                <div className="step-add-actions">
-                  <button
-                    onClick={() =>
-                      addStep({ type: "delay", durationMs: 300 })
-                    }
-                    type="button"
-                  >
-                    ＋ 等待
-                  </button>
-                  <button
-                    onClick={() =>
-                      addStep({ type: "key", key: "Enter", action: "down" })
-                    }
-                    type="button"
-                  >
-                    ＋ 按键
-                  </button>
-                  <button
-                    onClick={() =>
-                      addStep({
-                        type: "mouseButton",
-                        button: "left",
-                        action: "down",
-                        x: 0,
-                        y: 0,
-                      })
-                    }
-                    type="button"
-                  >
-                    ＋ 点击
-                  </button>
-                  <button
-                    onClick={() => addStep({ type: "text", text: "" })}
-                    type="button"
-                  >
-                    ＋ 文本
-                  </button>
-                  <button
-                    onClick={() => addStep({ type: "mouseMove", x: 0, y: 0 })}
-                    type="button"
-                  >
-                    ＋ 移动
-                  </button>
-                  <button
-                    onClick={() =>
-                      addStep({ type: "wheel", deltaX: 0, deltaY: -120 })
-                    }
-                    type="button"
-                  >
-                    ＋ 滚轮
-                  </button>
-                </div>
-              </div>
-              <div className="macro-steps">
-                {selected.steps.length === 0 ? (
-                  <div className="macro-empty-steps">
-                    <span>01</span>
+              {editorView === "source" ? (
+                <section className="macro-source-editor">
+                  <div className="rhai-source-heading">
                     <div>
-                      <strong>还没有步骤</strong>
-                      <small>点击开始录制，或从右上角手动添加。</small>
+                      <strong>Rhai 脚本</strong>
+                      <span>
+                        {selectedSourceKind === "advanced"
+                          ? "高级脚本：保留变量、条件、循环和函数，不能转换为图形步骤。"
+                          : "兼容宏：每个 AutoFlow API 调用都可安全转换回图形步骤。"}
+                      </span>
+                    </div>
+                    <button
+                      className="button button-primary"
+                      disabled={saving}
+                      onClick={() => void applySourceAndSwitch()}
+                      type="button"
+                    >
+                      {selectedSourceKind === "advanced"
+                        ? "保存高级脚本"
+                        : "应用并切回图形界面"}
+                    </button>
+                  </div>
+                  <RhaiEditor
+                    errorColumn={sourceError ? sourceErrorColumn : null}
+                    errorLine={sourceError ? sourceErrorLine : null}
+                    onChange={(value) => {
+                      setSourceText(value);
+                      setSourceError(null);
+                    }}
+                    onCheck={checkSource}
+                    onFormat={formatSource}
+                    onSave={() => void applySourceAndSwitch()}
+                    value={sourceText}
+                  />
+                  <div className="rhai-source-help">
+                    <strong>AutoFlow API v1</strong>
+                    <span>
+                      窗口：active_window_title() · window_exists(title) ·
+                      window_rect(title) · wait_window(title, timeoutMs, pollMs)
+                    </span>
+                    <span>
+                      像素：pixel_matches(x, y, r, g, b, tolerance) ·
+                      wait_pixel(x, y, r, g, b, tolerance, timeoutMs, pollMs)
+                    </span>
+                    <span>
+                      图像：find_image(assetId, x, y, width, height, threshold) ·
+                      wait_image(assetId, x, y, width, height, threshold, timeoutMs, pollMs)
+                    </span>
+                    <span>
+                      输入：wait_ms(ms) · wait_random_ms(min, max) · key_down(key) ·
+                      key_up(key) · press(key) · move_to(x, y) · mouse_down(button, x, y) ·
+                      mouse_up(button, x, y) · click(button, x, y) · scroll(dx, dy) · type_text(text) · is_cancelled()
+                    </span>
+                    <small>
+                      兼容宏只允许上述动作调用；高级脚本可使用 let、if/else、for、while 和 fn，不能访问文件、网络、进程或系统命令。F12 可随时停止脚本。
+                    </small>
+                  </div>
+                  <div className="rhai-examples">
+                    <details>
+                      <summary>查看窗口、像素和图像查找示例</summary>
+                      <pre>{`let window = window_rect("记事本");
+if window.found {
+  let result = find_image("confirm_button", window.x, window.y, window.width, window.height, 0.90);
+  if result.found { click("left", result.center_x, result.center_y); }
+}
+
+wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
+                    </details>
+                  </div>
+                  <AssetManager
+                    assets={config.assets}
+                    onError={(message) => setError(message)}
+                    refresh={refresh}
+                  />
+                  {sourceError ? (
+                    <div className="macro-source-error">{sourceError}</div>
+                  ) : null}
+                </section>
+              ) : (
+                <>
+                  <div className="macro-settings-grid">
+                    <div className="form-section">
+                      <label htmlFor="macro-name">宏名称</label>
+                      <input
+                        id="macro-name"
+                        value={selected.name}
+                        onChange={(event) =>
+                          updateDraft({ name: event.target.value })
+                        }
+                        placeholder="例如：每日重复操作"
+                      />
+                    </div>
+                    <div className="form-section">
+                      <label htmlFor="macro-trigger">触发组合</label>
+                      <div className="trigger-capture-field">
+                        <input
+                          id="macro-trigger"
+                          value={selected.triggerKeys.join(" + ")}
+                          onBlur={() => {
+                            triggerCaptureActive.current = false;
+                          }}
+                          onFocus={() => {
+                            triggerCaptureActive.current = false;
+                          }}
+                          onKeyDown={captureTrigger}
+                          placeholder="点击后按下组合键"
+                          readOnly
+                        />
+                      </div>
+                      <div className="form-help">
+                        点击输入框后直接按组合键，例如 Ctrl、Alt、再按 F8。
+                      </div>
+                    </div>
+                    <div className="form-section">
+                      <label htmlFor="macro-mode">运行模式</label>
+                      <select
+                        id="macro-mode"
+                        value={selected.mode}
+                        onChange={(event) =>
+                          updateDraft({ mode: event.target.value as MacroMode })
+                        }
+                      >
+                        {Object.entries(modeLabels).map(([value, label]) => (
+                          <option key={value} value={value}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="form-help">
+                        {modeDescriptions[selected.mode]}
+                      </div>
+                    </div>
+                    {selected.mode === "repeat" ? (
+                      <div className="form-section">
+                        <label htmlFor="macro-repeat">循环次数</label>
+                        <input
+                          id="macro-repeat"
+                          min={1}
+                          type="number"
+                          value={selected.repeatCount}
+                          onChange={(event) =>
+                            updateDraft({
+                              repeatCount: Math.max(
+                                1,
+                                Number(event.target.value) || 1,
+                              ),
+                            })
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    <div className="form-section">
+                      <label htmlFor="macro-speed">
+                        整体速度 <span>1.0× 为原速</span>
+                      </label>
+                      <input
+                        id="macro-speed"
+                        min={0.05}
+                        max={10}
+                        step={0.05}
+                        type="number"
+                        value={selected.speed}
+                        onChange={(event) =>
+                          updateDraft({
+                            speed: Math.max(
+                              0.05,
+                              Number(event.target.value) || 1,
+                            ),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="form-section recording-options-section">
+                      <label>录入内容</label>
+                      <div className="recording-options">
+                        <label className="recording-option">
+                          <input
+                            checked={selected.recordMouseMove !== false}
+                            disabled={recording}
+                            onChange={(event) =>
+                              updateDraft({
+                                recordMouseMove: event.target.checked,
+                              })
+                            }
+                            type="checkbox"
+                          />
+                          <span>鼠标移动</span>
+                        </label>
+                        <label className="recording-option">
+                          <input
+                            checked={selected.recordMouseClicks !== false}
+                            disabled={recording}
+                            onChange={(event) =>
+                              updateDraft({
+                                recordMouseClicks: event.target.checked,
+                              })
+                            }
+                            type="checkbox"
+                          />
+                          <span>鼠标点击与滚轮</span>
+                        </label>
+                      </div>
+                      <div className="form-help">
+                        录制快捷键：{RECORDING_SHORTCUT_LABEL}
+                        。快捷键本身、AutoFlow窗口内操作和首次聚焦目标窗口的动作不会录入宏。
+                      </div>
                     </div>
                   </div>
-                ) : (
-                  selected.steps.map((step, index) => (
-                    <div
-                      className={`macro-step-row ${
-                        draggingStepIndex === index ? "is-dragging" : ""
-                      } ${
-                        dragOverStepIndex === index &&
-                        draggingStepIndex !== index
-                          ? "is-drag-over"
-                          : ""
-                      }`}
-                      data-macro-step-index={index}
-                      key={`${selected.id}-${index}`}
-                    >
-                      <span
-                        aria-label="拖动排序"
-                        className="step-drag-handle"
-                        onPointerDown={(event) => {
-                          if (event.button !== 0) return;
-                          event.preventDefault();
-                          event.stopPropagation();
-                          dragStateRef.current = {
-                            fromIndex: index,
-                            pointerId: event.pointerId,
-                          };
-                          dragOverStepRef.current = index;
-                          setDraggingStepIndex(index);
-                          setDragOverStepIndex(index);
-                        }}
-                        role="button"
-                        tabIndex={0}
-                        title="拖动排序"
+                  <div className="step-toolbar">
+                    <div>
+                      <strong>步骤列表</strong>
+                      <span>{selectedSteps.length} 步</span>
+                    </div>
+                    <div className="step-add-actions">
+                      <button
+                        onClick={() =>
+                          addStep({ type: "delay", durationMs: 300 })
+                        }
+                        type="button"
                       >
-                        ⋮⋮
-                      </span>
-                      <span className="step-number">
-                        {String(index + 1).padStart(2, "0")}
-                      </span>
-                      <span className={`step-type step-type-${step.type}`}>
-                        {step.type === "delay"
-                          ? "时"
-                          : step.type === "key"
-                            ? "键"
-                            : step.type === "text"
-                              ? "文"
-                              : "鼠"}
-                      </span>
-                      <div className="step-main">
-                        <strong>{stepTitle(step)}</strong>
-                        {step.type === "delay" ? (
-                          <>
-                            <div className="delay-range-fields">
-                              <input
-                                aria-label="等待最小毫秒数"
-                                type="number"
-                                min={0}
-                                value={step.durationMs}
+                        ＋ 等待
+                      </button>
+                      <button
+                        onClick={() =>
+                          addStep({ type: "key", key: "Enter", action: "down" })
+                        }
+                        type="button"
+                      >
+                        ＋ 按键
+                      </button>
+                      <button
+                        onClick={() =>
+                          addStep({
+                            type: "mouseButton",
+                            button: "left",
+                            action: "down",
+                            x: 0,
+                            y: 0,
+                          })
+                        }
+                        type="button"
+                      >
+                        ＋ 点击
+                      </button>
+                      <button
+                        onClick={() => addStep({ type: "text", text: "" })}
+                        type="button"
+                      >
+                        ＋ 文本
+                      </button>
+                      <button
+                        onClick={() =>
+                          addStep({ type: "mouseMove", x: 0, y: 0 })
+                        }
+                        type="button"
+                      >
+                        ＋ 移动
+                      </button>
+                      <button
+                        onClick={() =>
+                          addStep({ type: "wheel", deltaX: 0, deltaY: -120 })
+                        }
+                        type="button"
+                      >
+                        ＋ 滚轮
+                      </button>
+                    </div>
+                  </div>
+                  <div className="macro-steps">
+                    {selectedSteps.length === 0 ? (
+                      <div className="macro-empty-steps">
+                        <span>01</span>
+                        <div>
+                          <strong>还没有步骤</strong>
+                          <small>点击开始录制，或从右上角手动添加。</small>
+                        </div>
+                      </div>
+                    ) : (
+                      selectedSteps.map((step, index) => (
+                        <div
+                          className={`macro-step-row ${
+                            step.type === "delay" ? "is-delay-step" : ""
+                          } ${draggingStepIndex === index ? "is-dragging" : ""} ${
+                            dragOverStepIndex === index &&
+                            draggingStepIndex !== index
+                              ? "is-drag-over"
+                              : ""
+                          }`}
+                          data-macro-step-index={index}
+                          key={`${selected.id}-${index}`}
+                        >
+                          <span
+                            aria-label="拖动排序"
+                            className="step-drag-handle"
+                            onPointerDown={(event) => {
+                              if (event.button !== 0) return;
+                              event.preventDefault();
+                              event.stopPropagation();
+                              dragStateRef.current = {
+                                fromIndex: index,
+                                pointerId: event.pointerId,
+                              };
+                              dragOverStepRef.current = index;
+                              setDraggingStepIndex(index);
+                              setDragOverStepIndex(index);
+                            }}
+                            role="button"
+                            tabIndex={0}
+                            title="拖动排序"
+                          >
+                            ⋮⋮
+                          </span>
+                          <span className="step-number">
+                            {String(index + 1).padStart(2, "0")}
+                          </span>
+                          <span className={`step-type step-type-${step.type}`}>
+                            {step.type === "delay"
+                              ? "时"
+                              : step.type === "key"
+                                ? "键"
+                                : step.type === "text"
+                                  ? "文"
+                                  : "鼠"}
+                          </span>
+                          <div className="step-main">
+                            <strong>{stepTitle(step)}</strong>
+                            {step.type === "delay" ? (
+                              <>
+                                <div className="delay-range-fields">
+                                  <div className="delay-range-input">
+                                    <input
+                                      aria-label="等待最小毫秒数"
+                                      type="number"
+                                      min={0}
+                                      value={step.durationMs}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          durationMs: Math.max(
+                                            0,
+                                            Number(event.target.value) || 0,
+                                          ),
+                                        })
+                                      }
+                                      placeholder="固定时间"
+                                    />
+                                    <span className="delay-range-unit">ms</span>
+                                  </div>
+                                  <span className="delay-range-separator">
+                                    至
+                                  </span>
+                                  <div className="delay-range-input">
+                                    <input
+                                      aria-label="等待最大毫秒数，可选"
+                                      type="number"
+                                      min={0}
+                                      value={step.durationMaxMs ?? ""}
+                                      onChange={(event) => {
+                                        const value = event.target.value;
+                                        updateStep(index, {
+                                          ...step,
+                                          durationMaxMs:
+                                            value === ""
+                                              ? undefined
+                                              : Math.max(0, Number(value) || 0),
+                                        });
+                                      }}
+                                      placeholder="最大时间"
+                                    />
+                                    <span className="delay-range-unit">ms</span>
+                                  </div>
+                                </div>
+                                <small className="delay-range-help">
+                                  只填左侧为固定等待；填写右侧后每次从区间随机抽取。
+                                </small>
+                              </>
+                            ) : null}
+                            {step.type === "key" ? (
+                              <div className="step-field-row">
+                                <select
+                                  aria-label="按键动作"
+                                  value={step.action}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      action: event.target.value as
+                                        "down" | "up",
+                                    })
+                                  }
+                                >
+                                  <option value="down">按下</option>
+                                  <option value="up">释放</option>
+                                </select>
+                                <input
+                                  aria-label="按键名称"
+                                  value={step.key}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      key: event.target.value,
+                                    })
+                                  }
+                                />
+                              </div>
+                            ) : null}
+                            {step.type === "mouseButton" ? (
+                              <div className="step-field-grid">
+                                <select
+                                  aria-label="鼠标按钮"
+                                  value={step.button}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      button: event.target
+                                        .value as typeof step.button,
+                                    })
+                                  }
+                                >
+                                  <option value="left">左键</option>
+                                  <option value="right">右键</option>
+                                  <option value="middle">中键</option>
+                                  <option value="x1">侧键 1</option>
+                                  <option value="x2">侧键 2</option>
+                                </select>
+                                <select
+                                  aria-label="鼠标动作"
+                                  value={step.action}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      action: event.target.value as
+                                        "down" | "up",
+                                    })
+                                  }
+                                >
+                                  <option value="down">按下</option>
+                                  <option value="up">释放</option>
+                                </select>
+                                <input
+                                  aria-label="鼠标 X 坐标"
+                                  type="number"
+                                  value={step.x}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      x: Number(event.target.value) || 0,
+                                    })
+                                  }
+                                />
+                                <input
+                                  aria-label="鼠标 Y 坐标"
+                                  type="number"
+                                  value={step.y}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      y: Number(event.target.value) || 0,
+                                    })
+                                  }
+                                />
+                              </div>
+                            ) : null}
+                            {step.type === "mouseMove" ? (
+                              <div className="step-field-row">
+                                <input
+                                  aria-label="移动 X 坐标"
+                                  type="number"
+                                  value={step.x}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      x: Number(event.target.value) || 0,
+                                    })
+                                  }
+                                />
+                                <input
+                                  aria-label="移动 Y 坐标"
+                                  type="number"
+                                  value={step.y}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      y: Number(event.target.value) || 0,
+                                    })
+                                  }
+                                />
+                              </div>
+                            ) : null}
+                            {step.type === "wheel" ? (
+                              <div className="step-field-row">
+                                <input
+                                  aria-label="水平滚动量"
+                                  type="number"
+                                  value={step.deltaX}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      deltaX: Number(event.target.value) || 0,
+                                    })
+                                  }
+                                />
+                                <input
+                                  aria-label="垂直滚动量"
+                                  type="number"
+                                  value={step.deltaY}
+                                  onChange={(event) =>
+                                    updateStep(index, {
+                                      ...step,
+                                      deltaY: Number(event.target.value) || 0,
+                                    })
+                                  }
+                                />
+                              </div>
+                            ) : null}
+                            {step.type === "text" ? (
+                              <textarea
+                                aria-label="输入文本"
+                                rows={2}
+                                value={step.text}
                                 onChange={(event) =>
                                   updateStep(index, {
                                     ...step,
-                                    durationMs: Math.max(
-                                      0,
-                                      Number(event.target.value) || 0,
-                                    ),
+                                    text: event.target.value,
                                   })
                                 }
-                                placeholder="固定毫秒"
                               />
-                              <span>至</span>
-                              <input
-                                aria-label="等待最大毫秒数，可选"
-                                type="number"
-                                min={0}
-                                value={step.durationMaxMs ?? ""}
-                                onChange={(event) => {
-                                  const value = event.target.value;
-                                  updateStep(index, {
-                                    ...step,
-                                    durationMaxMs:
-                                      value === ""
-                                        ? undefined
-                                        : Math.max(0, Number(value) || 0),
-                                  });
-                                }}
-                                placeholder="最大值（可选）"
-                              />
-                            </div>
-                            <small className="delay-range-help">
-                              只填左侧为固定等待；填写右侧后每次从区间随机抽取。
-                            </small>
-                          </>
-                        ) : null}
-                        {step.type === "key" ? (
-                          <div className="step-field-row">
-                            <select
-                              aria-label="按键动作"
-                              value={step.action}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  action: event.target.value as "down" | "up",
-                                })
-                              }
+                            ) : null}
+                          </div>
+                          <div className="step-controls">
+                            <button
+                              aria-label="上移步骤"
+                              disabled={index === 0}
+                              onClick={() => moveStep(index, -1)}
+                              type="button"
                             >
-                              <option value="down">按下</option>
-                              <option value="up">释放</option>
-                            </select>
-                            <input
-                              aria-label="按键名称"
-                              value={step.key}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  key: event.target.value,
-                                })
-                              }
-                            />
-                          </div>
-                        ) : null}
-                        {step.type === "mouseButton" ? (
-                          <div className="step-field-grid">
-                            <select
-                              aria-label="鼠标按钮"
-                              value={step.button}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  button: event.target
-                                    .value as typeof step.button,
-                                })
-                              }
+                              ↑
+                            </button>
+                            <button
+                              aria-label="下移步骤"
+                              disabled={index === selectedSteps.length - 1}
+                              onClick={() => moveStep(index, 1)}
+                              type="button"
                             >
-                              <option value="left">左键</option>
-                              <option value="right">右键</option>
-                              <option value="middle">中键</option>
-                              <option value="x1">侧键 1</option>
-                              <option value="x2">侧键 2</option>
-                            </select>
-                            <select
-                              aria-label="鼠标动作"
-                              value={step.action}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  action: event.target.value as "down" | "up",
-                                })
-                              }
+                              ↓
+                            </button>
+                            <button
+                              aria-label="复制步骤"
+                              onClick={() => duplicateStep(index)}
+                              type="button"
                             >
-                              <option value="down">按下</option>
-                              <option value="up">释放</option>
-                            </select>
-                            <input
-                              aria-label="鼠标 X 坐标"
-                              type="number"
-                              value={step.x}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  x: Number(event.target.value) || 0,
-                                })
-                              }
-                            />
-                            <input
-                              aria-label="鼠标 Y 坐标"
-                              type="number"
-                              value={step.y}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  y: Number(event.target.value) || 0,
-                                })
-                              }
-                            />
+                              ⧉
+                            </button>
+                            <button
+                              aria-label="删除步骤"
+                              onClick={() => deleteStep(index)}
+                              type="button"
+                            >
+                              ×
+                            </button>
                           </div>
-                        ) : null}
-                        {step.type === "mouseMove" ? (
-                          <div className="step-field-row">
-                            <input
-                              aria-label="移动 X 坐标"
-                              type="number"
-                              value={step.x}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  x: Number(event.target.value) || 0,
-                                })
-                              }
-                            />
-                            <input
-                              aria-label="移动 Y 坐标"
-                              type="number"
-                              value={step.y}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  y: Number(event.target.value) || 0,
-                                })
-                              }
-                            />
-                          </div>
-                        ) : null}
-                        {step.type === "wheel" ? (
-                          <div className="step-field-row">
-                            <input
-                              aria-label="水平滚动量"
-                              type="number"
-                              value={step.deltaX}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  deltaX: Number(event.target.value) || 0,
-                                })
-                              }
-                            />
-                            <input
-                              aria-label="垂直滚动量"
-                              type="number"
-                              value={step.deltaY}
-                              onChange={(event) =>
-                                updateStep(index, {
-                                  ...step,
-                                  deltaY: Number(event.target.value) || 0,
-                                })
-                              }
-                            />
-                          </div>
-                        ) : null}
-                        {step.type === "text" ? (
-                          <textarea
-                            aria-label="输入文本"
-                            rows={2}
-                            value={step.text}
-                            onChange={(event) =>
-                              updateStep(index, {
-                                ...step,
-                                text: event.target.value,
-                              })
-                            }
-                          />
-                        ) : null}
-                      </div>
-                      <div className="step-controls">
-                        <button
-                          aria-label="上移步骤"
-                          disabled={index === 0}
-                          onClick={() => moveStep(index, -1)}
-                          type="button"
-                        >
-                          ↑
-                        </button>
-                        <button
-                          aria-label="下移步骤"
-                          disabled={index === selected.steps.length - 1}
-                          onClick={() => moveStep(index, 1)}
-                          type="button"
-                        >
-                          ↓
-                        </button>
-                        <button
-                          aria-label="复制步骤"
-                          onClick={() => duplicateStep(index)}
-                          type="button"
-                        >
-                          ⧉
-                        </button>
-                        <button
-                          aria-label="删除步骤"
-                          onClick={() => deleteStep(index)}
-                          type="button"
-                        >
-                          ×
-                        </button>
-                      </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <div className="editor-footer macro-editor-footer">
+                    <div>
+                      <span
+                        className={`status-label ${selected.enabled ? "enabled" : "disabled"}`}
+                      >
+                        <i />
+                        {selected.enabled ? "触发已启用" : "触发已停用"}
+                      </span>
+                      <span className="save-hint">
+                        {saving ? "正在保存…" : "已自动保存"}
+                      </span>
                     </div>
-                  ))
-                )}
-              </div>
-              <div className="editor-footer macro-editor-footer">
-                <div>
-                  <span
-                    className={`status-label ${selected.enabled ? "enabled" : "disabled"}`}
-                  >
-                    <i />
-                    {selected.enabled ? "触发已启用" : "触发已停用"}
-                  </span>
-                  <span className="save-hint">
-                    {saving ? "正在保存…" : "已自动保存"}
-                  </span>
-                </div>
-                <div className="editor-actions">
-                  {playing ? (
-                    <button
-                      className="button button-danger"
-                      onClick={() => void stopPlaying()}
-                      type="button"
-                    >
-                      停止播放
-                    </button>
-                  ) : (
-                    <button
-                      className="button button-secondary"
-                      onClick={() => void runSelected()}
-                      type="button"
-                    >
-                      测试播放
-                    </button>
-                  )}
-                  <button
-                    className={`button ${selected.enabled ? "button-soft-danger" : "button-primary"}`}
-                    onClick={() => toggleMacro(selected)}
-                    type="button"
-                  >
-                    {selected.enabled ? "停用宏" : "启用宏"}
-                  </button>
-                </div>
-              </div>
+                    <div className="editor-actions">
+                      {playing ? (
+                        <button
+                          className="button button-danger"
+                          onClick={() => void stopPlaying()}
+                          type="button"
+                        >
+                          停止播放
+                        </button>
+                      ) : (
+                        <button
+                          className="button button-secondary"
+                          onClick={() => void runSelected()}
+                          type="button"
+                        >
+                          测试播放
+                        </button>
+                      )}
+                      <button
+                        className={`button ${selected.enabled ? "button-soft-danger" : "button-primary"}`}
+                        onClick={() => toggleMacro(selected)}
+                        type="button"
+                      >
+                        {selected.enabled ? "停用宏" : "启用宏"}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
             </>
           ) : (
             <div className="editor-empty">

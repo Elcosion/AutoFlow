@@ -21,7 +21,11 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig, AppError> {
 
     match serde_json::from_str::<AppConfig>(&content) {
         Ok(config) => {
+            let (config, migrated) = config.migrate()?;
             config.validate()?;
+            if migrated {
+                save_config(app, &config)?;
+            }
             Ok(config)
         }
         Err(error) => {

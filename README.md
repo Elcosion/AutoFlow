@@ -13,7 +13,7 @@ AutoFlow 是面向中文 Windows 用户的快捷键、文本扩展与轻量宏�
 - 宏播放：单实例限制、整体速度、按键/鼠标释放保护和 F12 紧急停止。
 - 浏览器预览：运行 `npm run dev` 时可以体验界面，配置保存在浏览器 localStorage；真正的全局键盘能力需要桌面端。
 
-托盘、开机启动和 AutoHotkey 适配仍未开放；复杂条件、OCR、找图和流程图也不在当前范围内。
+当前已支持高级 Rhai 条件/循环，以及基础窗口、像素和模板找图；OCR、流程图和 AutoHotkey 适配尚未开放。
 
 ## 第一次试用
 
@@ -32,6 +32,8 @@ AutoFlow 是面向中文 Windows 用户的快捷键、文本扩展与轻量宏�
 7. 如果需要完全停止输入服务，进入“设置”点击“立即停止”；关闭“全局总开关”会暂停全部规则。
 
 也可以用 `pnpm run dev` 先看界面和编辑流程，但浏览器预览不会监听系统全局键盘。
+
+宏录制、图形步骤、兼容源码、高级 Rhai、窗口/像素/找图 API 的完整说明见 [宏与 Rhai 脚本详细使用说明](docs/macro-and-script-guide.md)。
 
 ## 开发环境
 
@@ -90,4 +92,4 @@ cargo clippy --all-targets --all-features --offline -- -D warnings
 - `src-tauri/src/storage.rs`：配置读写和损坏恢复。
 - `src-tauri/src/hook.rs`：Windows 低级键盘/鼠标监听、按键映射、程序启动、文本扩展、宏录制与播放。
 - `src-tauri/src/commands.rs`：前端 IPC command。
-- `docs/`：架构、数据格式和阶段决策。
+- `docs/`：架构、数据格式、阶段决策，以及宏与 Rhai 脚本使用说明。

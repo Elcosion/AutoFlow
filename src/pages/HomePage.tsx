@@ -1,5 +1,10 @@
 import { useAppConfig } from "../lib/config";
-import type { HotkeyRule, MacroRule, TextExpansionRule } from "../types/config";
+import {
+  macroSteps,
+  type HotkeyRule,
+  type MacroRule,
+  type TextExpansionRule,
+} from "../types/config";
 
 type HomeRoute = "hotkeys" | "text-expansion" | "macros";
 
@@ -21,7 +26,7 @@ function textSummary(rule: TextExpansionRule) {
 }
 
 function macroSummary(rule: MacroRule) {
-  return `${rule.triggerKeys.join(" + ")} · ${rule.steps.length} 步 · ${
+  return `${rule.triggerKeys.join(" + ")} · ${macroSteps(rule).length} 步 · ${
     rule.mode === "once"
       ? "单次"
       : rule.mode === "repeat"

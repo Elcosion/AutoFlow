@@ -1,5 +1,11 @@
+use crate::automation::VisionService;
+#[cfg(windows)]
+use crate::rhai_runtime::{
+    run_rhai_script, validate_rhai_source, AutomationInput, ExecutionContext,
+};
 use crate::{
-    AppConfig, AppError, KeyAction, MacroMode, MacroRule, MacroStep, MacroTarget, MouseButton,
+    AppConfig, AppError, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep,
+    MacroTarget, MouseButton,
 };
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -23,7 +29,10 @@ pub struct HookService {
 #[serde(rename_all = "camelCase")]
 pub struct MacroRecordingStatus {
     pub active: bool,
+    pub capture_started: bool,
     pub step_count: usize,
+    pub capture_mouse_move: bool,
+    pub capture_mouse_clicks: bool,
     pub target_locked: bool,
     pub target_name: Option<String>,
 }
@@ -45,8 +54,8 @@ pub struct MacroPlaybackStatus {
 }
 
 impl HookService {
-    pub fn start(config: AppConfig) -> Result<Self, AppError> {
-        let shared = Arc::new(HookShared::new(config));
+    pub fn start(config: AppConfig, vision: Arc<VisionService>) -> Result<Self, AppError> {
+        let shared = Arc::new(HookShared::new(config, vision));
 
         #[cfg(windows)]
         {
@@ -73,9 +82,31 @@ impl HookService {
             .config
             .lock()
             .map_err(|_| AppError::internal("输入服务状态异常，请重启 AutoFlow"))?;
+        let assets = config.assets.clone();
         *current = config;
+        if let Ok(vision) = self.shared.vision.lock() {
+            vision.set_assets(&assets);
+        }
         #[cfg(windows)]
         self.shared.clear_transient_state();
+        Ok(())
+    }
+
+    pub fn set_vision(&self, vision: Arc<VisionService>) -> Result<(), AppError> {
+        let assets = self
+            .shared
+            .config
+            .lock()
+            .map_err(|_| AppError::internal("输入服务状态异常，请重启 AutoFlow"))?
+            .assets
+            .clone();
+        vision.set_assets(&assets);
+        let mut current = self
+            .shared
+            .vision
+            .lock()
+            .map_err(|_| AppError::internal("视觉服务状态异常，请重启 AutoFlow"))?;
+        *current = vision;
         Ok(())
     }
 
@@ -84,10 +115,15 @@ impl HookService {
         self.shared.clear_transient_state();
     }
 
-    pub fn start_recording(&self) -> Result<(), AppError> {
+    pub fn start_recording(
+        &self,
+        capture_mouse_move: bool,
+        capture_mouse_clicks: bool,
+    ) -> Result<(), AppError> {
         #[cfg(windows)]
         {
-            self.shared.start_recording()
+            self.shared
+                .start_recording(capture_mouse_move, capture_mouse_clicks)
         }
         #[cfg(not(windows))]
         Err(AppError::invalid(
@@ -96,10 +132,30 @@ impl HookService {
         ))
     }
 
-    pub fn stop_recording(&self) -> Result<MacroRecordingResult, AppError> {
+    pub fn set_recording_options(
+        &self,
+        capture_mouse_move: bool,
+        capture_mouse_clicks: bool,
+    ) -> Result<(), AppError> {
         #[cfg(windows)]
         {
-            self.shared.stop_recording()
+            self.shared
+                .set_recording_options(capture_mouse_move, capture_mouse_clicks)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (capture_mouse_move, capture_mouse_clicks);
+            Ok(())
+        }
+    }
+
+    pub fn stop_recording(
+        &self,
+        discard_trailing_mouse_input: bool,
+    ) -> Result<MacroRecordingResult, AppError> {
+        #[cfg(windows)]
+        {
+            self.shared.stop_recording(discard_trailing_mouse_input)
         }
         #[cfg(not(windows))]
         Err(AppError::invalid(
@@ -145,7 +201,10 @@ impl HookService {
         #[cfg(not(windows))]
         MacroRecordingStatus {
             active: false,
+            capture_started: false,
             step_count: 0,
+            capture_mouse_move: true,
+            capture_mouse_clicks: true,
             target_locked: false,
             target_name: None,
         }
@@ -189,6 +248,7 @@ impl Drop for HookService {
 
 struct HookShared {
     config: Mutex<AppConfig>,
+    vision: Mutex<Arc<VisionService>>,
     #[cfg(windows)]
     pressed: Mutex<HashSet<u32>>,
     #[cfg(windows)]
@@ -210,9 +270,10 @@ struct HookShared {
 }
 
 impl HookShared {
-    fn new(config: AppConfig) -> Self {
+    fn new(config: AppConfig, vision: Arc<VisionService>) -> Self {
         Self {
             config: Mutex::new(config),
+            vision: Mutex::new(vision),
             #[cfg(windows)]
             pressed: Mutex::new(HashSet::new()),
             #[cfg(windows)]
@@ -239,6 +300,7 @@ impl HookShared {
         self.stop_playback();
         if let Ok(mut recorder) = self.recorder.lock() {
             recorder.active = false;
+            recorder.capture_started = false;
             recorder.last_event = None;
             recorder.last_mouse_move = None;
             recorder.steps.clear();
@@ -263,7 +325,11 @@ impl HookShared {
     }
 
     #[cfg(windows)]
-    fn start_recording(&self) -> Result<(), AppError> {
+    fn start_recording(
+        &self,
+        capture_mouse_move: bool,
+        capture_mouse_clicks: bool,
+    ) -> Result<(), AppError> {
         if self.is_playback_running() {
             return Err(AppError::invalid(
                 "macro_busy",
@@ -277,6 +343,9 @@ impl HookShared {
         if recorder.active {
             return Err(AppError::invalid("recording_active", "宏录制已经在进行中"));
         }
+        recorder.capture_mouse_move = capture_mouse_move;
+        recorder.capture_mouse_clicks = capture_mouse_clicks;
+        recorder.capture_started = false;
         recorder.active = true;
         recorder.started_at = Some(Instant::now());
         recorder.last_event = None;
@@ -289,12 +358,45 @@ impl HookShared {
     }
 
     #[cfg(windows)]
-    fn stop_recording(&self) -> Result<MacroRecordingResult, AppError> {
+    fn set_recording_options(
+        &self,
+        capture_mouse_move: bool,
+        capture_mouse_clicks: bool,
+    ) -> Result<(), AppError> {
+        let mut recorder = self
+            .recorder
+            .lock()
+            .map_err(|_| AppError::internal("褰曞埗鍣ㄧ姸鎬佸紓甯革紝璇烽噸鍚?AutoFlow"))?;
+        if !recorder.active {
+            recorder.capture_mouse_move = capture_mouse_move;
+            recorder.capture_mouse_clicks = capture_mouse_clicks;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn start_recording_from_hotkey(&self) -> Result<(), AppError> {
+        let (capture_mouse_move, capture_mouse_clicks) = self
+            .recorder
+            .lock()
+            .map(|recorder| (recorder.capture_mouse_move, recorder.capture_mouse_clicks))
+            .map_err(|_| AppError::internal("褰曞埗鍣ㄧ姸鎬佸紓甯革紝璇烽噸鍚?AutoFlow"))?;
+        self.start_recording(capture_mouse_move, capture_mouse_clicks)
+    }
+
+    #[cfg(windows)]
+    fn stop_recording(
+        &self,
+        discard_trailing_mouse_input: bool,
+    ) -> Result<MacroRecordingResult, AppError> {
         let mut recorder = self
             .recorder
             .lock()
             .map_err(|_| AppError::internal("录制器状态异常，请重启 AutoFlow"))?;
         if recorder.active {
+            if discard_trailing_mouse_input {
+                discard_trailing_mouse_input_steps(&mut recorder);
+            }
             finish_recorder(&mut recorder);
         }
         let Some(steps) = recorder.completed_steps.take() else {
@@ -319,6 +421,16 @@ impl HookShared {
     }
 
     #[cfg(windows)]
+    fn finish_recording_from_hotkey(&self) {
+        if let Ok(mut recorder) = self.recorder.lock() {
+            if recorder.active {
+                discard_recording_shortcut_steps(&mut recorder);
+                finish_recorder(&mut recorder);
+            }
+        }
+    }
+
+    #[cfg(windows)]
     fn is_recording(&self) -> bool {
         self.recorder
             .lock()
@@ -332,17 +444,23 @@ impl HookShared {
             .lock()
             .map(|recorder| MacroRecordingStatus {
                 active: recorder.active,
+                capture_started: recorder.capture_started,
                 step_count: if recorder.active {
                     recorder.steps.len()
                 } else {
                     recorder.completed_steps.as_ref().map_or(0, Vec::len)
                 },
+                capture_mouse_move: recorder.capture_mouse_move,
+                capture_mouse_clicks: recorder.capture_mouse_clicks,
                 target_locked: false,
                 target_name: None,
             })
             .unwrap_or(MacroRecordingStatus {
                 active: false,
+                capture_started: false,
                 step_count: 0,
+                capture_mouse_move: true,
+                capture_mouse_clicks: true,
                 target_locked: false,
                 target_name: None,
             })
@@ -393,11 +511,31 @@ impl HookShared {
     #[cfg(windows)]
     fn start_playback(self: &Arc<Self>, macro_rule: MacroRule) -> Result<(), AppError> {
         let macro_rule = normalize_playback_rule(macro_rule);
-        if macro_rule.steps.is_empty() {
+        let total_steps = macro_rule.macro_steps().map_or(0, |steps| steps.len());
+        if total_steps == 0 && matches!(&macro_rule.program, AutomationProgram::Macro { .. }) {
             let error =
                 AppError::invalid("macro_empty", "这个宏还没有步骤，录制或添加步骤后才能播放");
             self.set_playback_error(error.message.clone());
             return Err(error);
+        }
+        if let AutomationProgram::Rhai {
+            source,
+            api_version,
+        } = &macro_rule.program
+        {
+            if *api_version != crate::rhai_runtime::RHAI_API_VERSION {
+                let error = AppError::invalid(
+                    "rhai_api_version",
+                    "Rhai API 版本不受支持，请使用 apiVersion: 1",
+                );
+                self.set_playback_error(error.message.clone());
+                return Err(error);
+            }
+            if let Err(message) = validate_rhai_source(source) {
+                let error = AppError::invalid("rhai_compile_error", message);
+                self.set_playback_error(error.message.clone());
+                return Err(error);
+            }
         }
         // Macros always act on the current foreground program. A saved target
         // from older versions is intentionally ignored so the same macro can
@@ -410,10 +548,12 @@ impl HookShared {
             return Err(AppError::invalid("macro_busy", "已有一个宏正在运行"));
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let restore_window = foreground_window_handle();
         playback.running = true;
         playback.stop = Some(Arc::clone(&stop));
+        playback.restore_window = restore_window;
         playback.current_step = 0;
-        playback.total_steps = macro_rule.steps.len();
+        playback.total_steps = total_steps;
         playback.last_error = None;
         let shared = Arc::clone(self);
         thread::Builder::new()
@@ -423,9 +563,11 @@ impl HookShared {
                 // injecting the first recorded event.
                 thread::sleep(Duration::from_millis(120));
                 let result = play_macro_thread(&shared, &macro_rule, &stop);
+                restore_previous_window_if_own_process(restore_window);
                 if let Ok(mut playback) = shared.playback.lock() {
                     playback.running = false;
                     playback.stop = None;
+                    playback.restore_window = None;
                     if let Err(error) = result {
                         playback.last_error = Some(error);
                     }
@@ -434,6 +576,7 @@ impl HookShared {
             .map_err(|error| {
                 playback.running = false;
                 playback.stop = None;
+                playback.restore_window = None;
                 AppError::with_detail("playback_start_failed", "宏播放启动失败", error.to_string())
             })?;
         Ok(())
@@ -456,36 +599,40 @@ fn normalize_playback_rule(mut macro_rule: MacroRule) -> MacroRule {
     // active, so a bad/partial recording can never turn it into a no-op.
     if macro_rule.name.trim() == "连点器" {
         macro_rule.mode = MacroMode::Toggle;
-        macro_rule.steps = vec![
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Down,
-                x: 0,
-                y: 0,
-            },
-            MacroStep::Delay {
-                duration_ms: 25,
-                duration_max_ms: None,
-            },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Up,
-                x: 0,
-                y: 0,
-            },
-            MacroStep::Delay {
-                duration_ms: 75,
-                duration_max_ms: None,
-            },
-        ];
+        macro_rule.program = AutomationProgram::Macro {
+            steps: vec![
+                MacroStep::MouseButton {
+                    button: MouseButton::Left,
+                    action: KeyAction::Down,
+                    x: 0,
+                    y: 0,
+                },
+                MacroStep::Delay {
+                    duration_ms: 25,
+                    duration_max_ms: None,
+                },
+                MacroStep::MouseButton {
+                    button: MouseButton::Left,
+                    action: KeyAction::Up,
+                    x: 0,
+                    y: 0,
+                },
+                MacroStep::Delay {
+                    duration_ms: 75,
+                    duration_max_ms: None,
+                },
+            ],
+        };
     }
     macro_rule
 }
 
 #[cfg(windows)]
-#[derive(Default)]
 struct RecorderState {
     active: bool,
+    capture_started: bool,
+    capture_mouse_move: bool,
+    capture_mouse_clicks: bool,
     started_at: Option<Instant>,
     last_event: Option<Instant>,
     last_mouse_move: Option<(Instant, i32, i32)>,
@@ -496,10 +643,30 @@ struct RecorderState {
 }
 
 #[cfg(windows)]
+impl Default for RecorderState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            capture_started: false,
+            capture_mouse_move: true,
+            capture_mouse_clicks: true,
+            started_at: None,
+            last_event: None,
+            last_mouse_move: None,
+            steps: Vec::new(),
+            completed_steps: None,
+            pressed_keys: HashSet::new(),
+            pressed_buttons: HashSet::new(),
+        }
+    }
+}
+
+#[cfg(windows)]
 #[derive(Default)]
 struct PlaybackState {
     running: bool,
     stop: Option<Arc<AtomicBool>>,
+    restore_window: Option<isize>,
     current_step: usize,
     total_steps: usize,
     last_error: Option<String>,
@@ -637,12 +804,13 @@ unsafe extern "system" fn keyboard_hook(
         Err(_) => return CallNextHookEx(None, code, message, data),
     };
 
+    let was_pressed = pressed.contains(&vk);
     if is_down {
         pressed.insert(vk);
     } else {
         pressed.remove(&vk);
         if let Ok(mut latched) = shared.latched_hotkeys.lock() {
-            latched.retain(|signature| !signature.split('+').any(|key| key_to_vk(key) == Some(vk)));
+            latched.retain(|signature| !latched_signature_contains_vk(signature, vk));
         }
     }
 
@@ -657,6 +825,23 @@ unsafe extern "system" fn keyboard_hook(
             shared.clear_transient_state();
         }
         return LRESULT(1);
+    }
+
+    // Ctrl+Shift+F9 is reserved for starting/stopping recording. Handle it
+    // before the recorder and consume it so no part of the shortcut reaches
+    // the macro or the foreground application.
+    if is_down && !was_pressed && is_recording_shortcut_key(vk, &pressed) {
+        if shared.is_recording() {
+            shared.finish_recording_from_hotkey();
+        } else if let Err(error) = shared.start_recording_from_hotkey() {
+            log::warn!("录制快捷键启动录制失败: {}", error.message);
+        }
+        return LRESULT(1);
+    }
+
+    if shared.is_recording() && is_focus_switch_key(vk, &pressed) {
+        discard_focus_switch_steps(shared);
+        return CallNextHookEx(None, code, message, data);
     }
 
     if recording_input_is_allowed(shared) {
@@ -819,15 +1004,30 @@ unsafe extern "system" fn mouse_hook(
     let message_id = message.0 as u32;
     let x = info.pt.x;
     let y = info.pt.y;
-    // Motion is meaningful even before the user has clicked into the target
-    // application. Capture it as soon as recording starts, while button and
-    // wheel events still exclude AutoFlow itself so the stop control is not
-    // replayed as part of the macro.
-    if message_id == WM_MOUSEMOVE && shared.is_recording() {
-        record_mouse_move(shared, x, y);
+    if shared.is_recording() && is_own_process_at_point(x, y) && is_mouse_button_message(message_id)
+    {
+        // A click on AutoFlow is the UI stop action. Remove the cursor path
+        // leading to that button, but leave the same final mouse move intact
+        // when recording is stopped with the keyboard shortcut.
+        discard_trailing_mouse_actions(shared);
         return CallNextHookEx(None, code, message, data);
     }
-    if !recording_input_is_allowed(shared) {
+    // Motion is meaningful even before the user has clicked into the target
+    // application. Capture it as soon as recording starts, but use the window
+    // under the pointer rather than the current foreground window so moving
+    // back to AutoFlow cannot become part of the macro.
+    if message_id == WM_MOUSEMOVE && shared.is_recording() {
+        if recording_mouse_input_is_allowed(shared, x, y) {
+            if recording_mouse_move_enabled(shared) {
+                record_mouse_move(shared, x, y);
+            }
+        }
+        return CallNextHookEx(None, code, message, data);
+    }
+    if !recording_mouse_input_is_allowed(shared, x, y) {
+        return CallNextHookEx(None, code, message, data);
+    }
+    if !recording_mouse_clicks_enabled(shared) {
         return CallNextHookEx(None, code, message, data);
     }
 
@@ -891,10 +1091,195 @@ fn is_own_process_foreground() -> bool {
 }
 
 #[cfg(windows)]
+fn foreground_window_handle() -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let window = unsafe { GetForegroundWindow() };
+    (!window.0.is_null()).then_some(window.0 as isize)
+}
+
+#[cfg(windows)]
+fn restore_previous_window_if_own_process(previous_window: Option<isize>) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
+
+    if !is_own_process_foreground() {
+        return;
+    }
+    let Some(previous_window) = previous_window else {
+        return;
+    };
+    let window = HWND(previous_window as *mut _);
+    unsafe {
+        if IsWindow(Some(window)).as_bool() {
+            let _ = SetForegroundWindow(window);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_recording_shortcut_key(vk: u32, pressed: &HashSet<u32>) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x78)
+        && [0x10_u32, 0x11_u32, 0x78_u32]
+            .iter()
+            .all(|key| pressed.contains(key))
+}
+
+#[cfg(windows)]
+fn latched_signature_contains_vk(signature: &str, vk: u32) -> bool {
+    signature
+        .split('+')
+        .any(|key| key_to_vk(key) == Some(vk) || key.parse::<u32>().ok() == Some(vk))
+}
+
+#[cfg(windows)]
+fn is_focus_switch_key(vk: u32, pressed: &HashSet<u32>) -> bool {
+    matches!(vk, 0x09 | 0x1B) && (pressed.contains(&0x12) || pressed.contains(&0x5B))
+}
+
+#[cfg(windows)]
+fn is_mouse_button_message(message_id: u32) -> bool {
+    matches!(
+        message_id,
+        windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP
+            | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP
+            | windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONUP
+            | windows::Win32::UI::WindowsAndMessaging::WM_XBUTTONDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_XBUTTONUP
+    )
+}
+
+#[cfg(windows)]
+fn discard_focus_switch_steps(shared: &HookShared) {
+    if let Ok(mut recorder) = shared.recorder.lock() {
+        for vk in [0x09_u32, 0x12_u32, 0x5B_u32] {
+            recorder.pressed_keys.remove(&vk);
+        }
+        while let Some(step) = recorder.steps.last() {
+            let is_focus_switch_step = match step {
+                MacroStep::Delay { .. } => true,
+                MacroStep::Key { key, action } => {
+                    matches!(action, KeyAction::Down)
+                        && key_to_vk(key).is_some_and(|vk| matches!(vk, 0x09 | 0x12 | 0x5B))
+                }
+                _ => false,
+            };
+            if !is_focus_switch_step {
+                break;
+            }
+            recorder.steps.pop();
+        }
+        recorder.last_event = None;
+    }
+}
+
+#[cfg(windows)]
+fn discard_trailing_mouse_actions(shared: &HookShared) {
+    if let Ok(mut recorder) = shared.recorder.lock() {
+        discard_trailing_mouse_input_steps(&mut recorder);
+    }
+}
+
+#[cfg(windows)]
+fn discard_trailing_mouse_input_steps(recorder: &mut RecorderState) {
+    let mut removed_mouse_input = false;
+
+    // If the stop-button click made it into the recorder, remove only that
+    // final down/up sequence and its delays. The previous click remains.
+    for _ in 0..2 {
+        let Some(MacroStep::MouseButton { button, .. }) = recorder.steps.last().cloned() else {
+            break;
+        };
+        recorder.steps.pop();
+        recorder.pressed_buttons.remove(&button);
+        removed_mouse_input = true;
+        if matches!(recorder.steps.last(), Some(MacroStep::Delay { .. })) {
+            recorder.steps.pop();
+        }
+    }
+
+    // The button click may have been filtered by the hook, leaving the cursor
+    // path as the final steps. Remove all contiguous move samples and their
+    // delays, but stop at the previous keyboard or mouse-button action.
+    while matches!(recorder.steps.last(), Some(MacroStep::MouseMove { .. })) {
+        recorder.steps.pop();
+        if matches!(recorder.steps.last(), Some(MacroStep::Delay { .. })) {
+            recorder.steps.pop();
+        }
+        removed_mouse_input = true;
+    }
+
+    if removed_mouse_input {
+        recorder.last_event = None;
+        recorder.last_mouse_move = None;
+    }
+}
+
+#[cfg(windows)]
+fn is_own_process_at_point(x: i32, y: i32) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, WindowFromPoint};
+
+    unsafe {
+        let window = WindowFromPoint(POINT { x, y });
+        if window.0.is_null() {
+            return false;
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, Some(&mut process_id));
+        process_id == GetCurrentProcessId()
+    }
+}
+
+#[cfg(windows)]
 fn recording_input_is_allowed(shared: &HookShared) -> bool {
-    // Keep the stop-recording click out of the result, but otherwise record
-    // every foreground app. A macro belongs to the user's input, not a window.
-    shared.is_recording() && !is_own_process_foreground()
+    if !shared.is_recording() || is_own_process_foreground() {
+        return false;
+    }
+
+    // Starting recording while AutoFlow is focused arms the recorder. The
+    // first hook event after AutoFlow loses focus only marks the boundary;
+    // this keeps the click or Alt+Tab used to focus the target out of the
+    // macro. Subsequent events are the actual macro input.
+    if let Ok(mut recorder) = shared.recorder.lock() {
+        if !recorder.capture_started {
+            recorder.capture_started = true;
+            recorder.last_event = None;
+            recorder.last_mouse_move = None;
+            recorder.pressed_keys.clear();
+            recorder.pressed_buttons.clear();
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn recording_mouse_input_is_allowed(shared: &HookShared, x: i32, y: i32) -> bool {
+    recording_input_is_allowed(shared) && !is_own_process_at_point(x, y)
+}
+
+#[cfg(windows)]
+fn recording_mouse_move_enabled(shared: &HookShared) -> bool {
+    shared
+        .recorder
+        .lock()
+        .map(|recorder| recorder.capture_mouse_move)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn recording_mouse_clicks_enabled(shared: &HookShared) -> bool {
+    shared
+        .recorder
+        .lock()
+        .map(|recorder| recorder.capture_mouse_clicks)
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -1015,6 +1400,29 @@ fn push_record_step(recorder: &mut RecorderState, step: MacroStep) {
 }
 
 #[cfg(windows)]
+fn discard_recording_shortcut_steps(recorder: &mut RecorderState) {
+    for vk in [0x10_u32, 0x11_u32, 0x78_u32] {
+        recorder.pressed_keys.remove(&vk);
+    }
+
+    while let Some(step) = recorder.steps.last() {
+        let is_recording_shortcut_step = match step {
+            MacroStep::Delay { .. } => true,
+            MacroStep::Key { key, action } => {
+                matches!(action, KeyAction::Down)
+                    && key_to_vk(key).is_some_and(|vk| matches!(vk, 0x10 | 0x11 | 0x78))
+            }
+            _ => false,
+        };
+        if !is_recording_shortcut_step {
+            break;
+        }
+        recorder.steps.pop();
+    }
+    recorder.last_event = None;
+}
+
+#[cfg(windows)]
 fn finish_recorder(recorder: &mut RecorderState) {
     let pressed_keys = recorder.pressed_keys.drain().collect::<Vec<_>>();
     for vk in pressed_keys {
@@ -1033,6 +1441,7 @@ fn finish_recorder(recorder: &mut RecorderState) {
         });
     }
     recorder.active = false;
+    recorder.capture_started = false;
     recorder.started_at = None;
     recorder.last_event = None;
     recorder.last_mouse_move = None;
@@ -1324,7 +1733,7 @@ fn key_to_character(vk: u32, scan_code: u32, pressed: &HashSet<u32>) -> Option<S
 
 #[cfg(windows)]
 fn play_macro_thread(
-    shared: &HookShared,
+    shared: &Arc<HookShared>,
     macro_rule: &MacroRule,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -1341,9 +1750,9 @@ fn play_macro_thread(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        if !play_macro_steps(
+        if !play_automation_program(
             shared,
-            &macro_rule.steps,
+            macro_rule,
             macro_rule.speed,
             stop,
             &mut held_keys,
@@ -1364,6 +1773,120 @@ fn play_macro_thread(
         let _ = send_mouse_button(button, KeyAction::Up);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsAutomationInput;
+
+#[cfg(windows)]
+impl AutomationInput for WindowsAutomationInput {
+    fn wait_ms(&self, milliseconds: u64, speed: f32, cancel: &AtomicBool) -> Result<(), String> {
+        if sleep_interruptible(milliseconds as f32 / speed.max(0.05), cancel) {
+            Ok(())
+        } else {
+            Err("脚本已被 F12 停止".to_string())
+        }
+    }
+
+    fn wait_random_ms(
+        &self,
+        minimum: u64,
+        maximum: u64,
+        speed: f32,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.wait_ms(randomized_delay_ms(minimum, Some(maximum)), speed, cancel)
+    }
+
+    fn key_down(&self, key: &str) -> Result<(), String> {
+        let vk = key_to_vk(key).ok_or_else(|| format!("未知按键：{key}"))?;
+        send_key(vk, true)
+    }
+
+    fn key_up(&self, key: &str) -> Result<(), String> {
+        let vk = key_to_vk(key).ok_or_else(|| format!("未知按键：{key}"))?;
+        send_key(vk, false)
+    }
+
+    fn move_to(&self, x: i32, y: i32) -> Result<(), String> {
+        send_mouse_move(x, y)
+    }
+
+    fn mouse_down(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
+        if x != 0 || y != 0 {
+            send_mouse_move(x, y)?;
+        }
+        send_mouse_button(parse_mouse_button(button)?, KeyAction::Down)
+    }
+
+    fn mouse_up(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
+        if x != 0 || y != 0 {
+            send_mouse_move(x, y)?;
+        }
+        send_mouse_button(parse_mouse_button(button)?, KeyAction::Up)
+    }
+
+    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
+        send_mouse_wheel(delta_x, delta_y)
+    }
+
+    fn type_text(&self, text: &str) -> Result<(), String> {
+        send_unicode_text(text)
+    }
+}
+
+#[cfg(windows)]
+fn parse_mouse_button(button: &str) -> Result<MouseButton, String> {
+    match button {
+        "left" => Ok(MouseButton::Left),
+        "right" => Ok(MouseButton::Right),
+        "middle" => Ok(MouseButton::Middle),
+        "x1" => Ok(MouseButton::X1),
+        "x2" => Ok(MouseButton::X2),
+        _ => Err("鼠标按钮必须是 left、right、middle、x1 或 x2".to_string()),
+    }
+}
+
+#[cfg(windows)]
+fn play_automation_program(
+    shared: &Arc<HookShared>,
+    macro_rule: &MacroRule,
+    speed: f32,
+    stop: &Arc<AtomicBool>,
+    held_keys: &mut HashSet<u32>,
+    held_buttons: &mut HashSet<MouseButton>,
+) -> Result<bool, String> {
+    match &macro_rule.program {
+        AutomationProgram::Macro { steps } => {
+            play_macro_steps(shared, steps, speed, stop, held_keys, held_buttons)
+        }
+        AutomationProgram::Rhai { source, .. } => {
+            let input: Arc<dyn AutomationInput> = Arc::new(WindowsAutomationInput);
+            let vision = shared
+                .vision
+                .lock()
+                .map_err(|_| "视觉服务状态异常".to_string())?
+                .clone();
+            let assets = shared
+                .config
+                .lock()
+                .map_err(|_| "配置状态异常".to_string())?
+                .assets
+                .clone();
+            vision.set_assets(&assets);
+            let progress_shared = Arc::clone(shared);
+            let progress: Arc<dyn Fn(usize) + Send + Sync> =
+                Arc::new(move |action| progress_shared.set_playback_step(action));
+            let context = ExecutionContext::new_with_vision(
+                input,
+                Arc::clone(stop),
+                speed,
+                Some(progress),
+                vision,
+            );
+            run_rhai_script(source, context).map(|_| true)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1450,7 +1973,7 @@ fn randomized_delay_ms(minimum: u64, maximum: Option<u64>) -> u64 {
 }
 
 #[cfg(windows)]
-fn sleep_interruptible(duration_ms: f32, stop: &Arc<AtomicBool>) -> bool {
+fn sleep_interruptible(duration_ms: f32, stop: &AtomicBool) -> bool {
     let duration = Duration::from_secs_f32((duration_ms.max(0.0)) / 1000.0);
     let started = Instant::now();
     while started.elapsed() < duration {
@@ -1655,9 +2178,12 @@ fn split_command_line(command_line: &str) -> Vec<String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        canonical_virtual_key, is_keyboard_modifier, is_shift_key, is_text_modifier,
-        randomized_delay_ms, shifted_printable_character, split_command_line,
+        canonical_virtual_key, discard_recording_shortcut_steps, discard_trailing_mouse_actions,
+        is_keyboard_modifier, is_recording_shortcut_key, is_shift_key, is_text_modifier,
+        latched_signature_contains_vk, randomized_delay_ms, shifted_printable_character,
+        split_command_line, HookShared, RecorderState,
     };
+    use crate::{KeyAction, MacroStep};
     use std::collections::HashSet;
 
     #[test]
@@ -1704,5 +2230,133 @@ mod tests {
                 "--open".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn recording_shortcut_is_detected_and_removed_from_recording() {
+        let pressed = HashSet::from([0x10_u32, 0x11_u32, 0x78_u32]);
+        assert!(is_recording_shortcut_key(0x78, &pressed));
+
+        let mut recorder = RecorderState::default();
+        recorder.steps = vec![
+            MacroStep::Key {
+                key: "Ctrl".to_string(),
+                action: KeyAction::Down,
+            },
+            MacroStep::Delay {
+                duration_ms: 20,
+                duration_max_ms: None,
+            },
+            MacroStep::Key {
+                key: "Shift".to_string(),
+                action: KeyAction::Down,
+            },
+            MacroStep::Key {
+                key: "F9".to_string(),
+                action: KeyAction::Down,
+            },
+        ];
+        recorder.pressed_keys = pressed;
+        discard_recording_shortcut_steps(&mut recorder);
+        assert!(recorder.steps.is_empty());
+        assert!(recorder.pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn macro_and_hotkey_latches_are_released_by_key_up() {
+        assert!(latched_signature_contains_vk("macro+119", 0x77));
+        assert!(latched_signature_contains_vk("17+119", 0x11));
+        assert!(latched_signature_contains_vk("Ctrl+F8", 0x77));
+        assert!(!latched_signature_contains_vk("macro+119", 0x78));
+    }
+
+    #[test]
+    fn stopping_by_click_removes_trailing_mouse_input() {
+        let shared = HookShared::new(
+            crate::AppConfig::default(),
+            crate::automation::VisionService::new(
+                std::env::temp_dir()
+                    .join("AutoFlow")
+                    .join("assets")
+                    .join("images"),
+            ),
+        );
+        let mut recorder = shared.recorder.lock().expect("recorder should lock");
+        recorder.steps = vec![
+            MacroStep::Key {
+                key: "A".to_string(),
+                action: KeyAction::Down,
+            },
+            MacroStep::Delay {
+                duration_ms: 20,
+                duration_max_ms: None,
+            },
+            MacroStep::MouseButton {
+                button: crate::MouseButton::Left,
+                action: KeyAction::Down,
+                x: 50,
+                y: 50,
+            },
+            MacroStep::MouseButton {
+                button: crate::MouseButton::Left,
+                action: KeyAction::Up,
+                x: 50,
+                y: 50,
+            },
+            MacroStep::Delay {
+                duration_ms: 20,
+                duration_max_ms: None,
+            },
+            MacroStep::MouseMove { x: 100, y: 100 },
+            MacroStep::Delay {
+                duration_ms: 20,
+                duration_max_ms: None,
+            },
+            MacroStep::MouseMove { x: 200, y: 200 },
+            MacroStep::Delay {
+                duration_ms: 20,
+                duration_max_ms: None,
+            },
+            MacroStep::MouseButton {
+                button: crate::MouseButton::Left,
+                action: KeyAction::Down,
+                x: 300,
+                y: 300,
+            },
+            MacroStep::MouseButton {
+                button: crate::MouseButton::Left,
+                action: KeyAction::Up,
+                x: 300,
+                y: 300,
+            },
+        ];
+        drop(recorder);
+
+        discard_trailing_mouse_actions(&shared);
+
+        let recorder = shared.recorder.lock().expect("recorder should lock");
+        assert_eq!(recorder.steps.len(), 4);
+        assert!(matches!(
+            recorder.steps.get(0),
+            Some(MacroStep::Key { key, .. }) if key == "A"
+        ));
+        assert!(matches!(
+            recorder.steps.get(2),
+            Some(MacroStep::MouseButton {
+                action: KeyAction::Down,
+                ..
+            })
+        ));
+        assert!(matches!(
+            recorder.steps.get(3),
+            Some(MacroStep::MouseButton {
+                action: KeyAction::Up,
+                ..
+            })
+        ));
+        assert!(recorder
+            .steps
+            .iter()
+            .all(|step| !matches!(step, MacroStep::MouseMove { .. })));
     }
 }

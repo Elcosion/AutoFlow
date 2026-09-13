@@ -880,6 +880,33 @@ button:focus-visible {
   font-weight: 500;
 }
 
+.recording-options-section {
+  grid-column: 1 / -1;
+}
+
+.recording-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+}
+
+.recording-options .recording-option {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 7px;
+  margin: 0;
+  color: #4e6863;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.recording-options .recording-option input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  accent-color: #4e8d80;
+}
+
 .step-toolbar {
   display: flex;
   align-items: center;
@@ -3113,5 +3140,63 @@ body {
   }
   .hero-note {
     width: 190px;
+  }
+}
+
+/* Keep delay editors readable inside the compact macro step grid. */
+.delay-range-fields {
+  display: grid;
+  width: min(430px, 100%);
+  grid-template-columns: minmax(100px, 1fr) auto minmax(100px, 1fr);
+  gap: 9px;
+  align-items: center;
+  margin-top: 7px;
+}
+
+.delay-range-input {
+  position: relative;
+  min-width: 0;
+}
+
+.step-main .delay-range-input input {
+  width: 100%;
+  min-width: 0;
+  margin-top: 0;
+  padding-right: 30px;
+}
+
+.delay-range-unit,
+.delay-range-separator {
+  color: #7f9690;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.delay-range-unit {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.delay-range-separator {
+  font-weight: 750;
+}
+
+.delay-range-help {
+  display: block;
+  width: min(520px, 100%);
+  margin-top: 8px;
+  color: #8b9d99;
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
+@media (max-width: 650px) {
+  .delay-range-fields {
+    grid-template-columns: minmax(84px, 1fr) auto minmax(84px, 1fr);
+    gap: 6px;
   }
 }

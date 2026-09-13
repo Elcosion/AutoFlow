@@ -40,7 +40,13 @@ export function useAppConfig() {
     }
   }, []);
 
-  return { config, loading, saving, error, setError, persist };
+  const refresh = useCallback(async () => {
+    const nextConfig = await getConfig();
+    setConfig(nextConfig);
+    return nextConfig;
+  }, []);
+
+  return { config, loading, saving, error, setError, persist, refresh };
 }
 
 export function toErrorMessage(reason: unknown): string {

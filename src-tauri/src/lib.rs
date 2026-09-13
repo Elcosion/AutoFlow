@@ -3,17 +3,20 @@ use serde::Serialize;
 use std::sync::Mutex;
 use tauri::Manager;
 
+pub mod automation;
 mod autostart;
 mod commands;
 mod config;
 mod hook;
+mod rhai_runtime;
 mod storage;
 
 pub(crate) const APP_NAME: &str = "AutoFlow";
 
+pub use automation::AutomationAsset;
 pub use config::{
-    AppConfig, HotkeyAction, HotkeyRule, KeyAction, MacroMode, MacroRule, MacroStep, MacroTarget,
-    MouseButton, TextExpansionRule,
+    AppConfig, AutomationProgram, HotkeyAction, HotkeyRule, KeyAction, MacroMode, MacroRule,
+    MacroStep, MacroTarget, MouseButton, TextExpansionRule,
 };
 use hook::{HookService, MacroPlaybackStatus, MacroRecordingResult, MacroRecordingStatus};
 
@@ -84,11 +87,33 @@ pub struct RuntimeState {
 impl RuntimeState {
     pub(crate) fn new() -> Result<Self, AppError> {
         let config = AppConfig::default();
+        let vision = automation::VisionService::new(
+            std::env::temp_dir()
+                .join("AutoFlow")
+                .join("assets")
+                .join("images"),
+        );
         Ok(Self {
             core_state: Mutex::new("待机".to_string()),
-            hook: HookService::start(config.clone())?,
+            hook: HookService::start(config.clone(), vision)?,
             config: Mutex::new(config),
         })
+    }
+
+    pub(crate) fn configure_vision(&self, app: &tauri::AppHandle) -> Result<(), AppError> {
+        let root = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| {
+                AppError::with_detail(
+                    "asset_directory_failed",
+                    "无法定位 AutoFlow 图像资源目录",
+                    error.to_string(),
+                )
+            })?
+            .join("assets")
+            .join("images");
+        self.hook.set_vision(automation::VisionService::new(root))
     }
 
     pub(crate) fn current_state(&self) -> Result<String, AppError> {
@@ -119,12 +144,29 @@ impl RuntimeState {
         self.hook.emergency_stop();
     }
 
-    pub(crate) fn start_recording(&self) -> Result<(), AppError> {
-        self.hook.start_recording()
+    pub(crate) fn start_recording(
+        &self,
+        capture_mouse_move: bool,
+        capture_mouse_clicks: bool,
+    ) -> Result<(), AppError> {
+        self.hook
+            .start_recording(capture_mouse_move, capture_mouse_clicks)
     }
 
-    pub(crate) fn stop_recording(&self) -> Result<MacroRecordingResult, AppError> {
-        self.hook.stop_recording()
+    pub(crate) fn set_recording_options(
+        &self,
+        capture_mouse_move: bool,
+        capture_mouse_clicks: bool,
+    ) -> Result<(), AppError> {
+        self.hook
+            .set_recording_options(capture_mouse_move, capture_mouse_clicks)
+    }
+
+    pub(crate) fn stop_recording(
+        &self,
+        discard_trailing_mouse_input: bool,
+    ) -> Result<MacroRecordingResult, AppError> {
+        self.hook.stop_recording(discard_trailing_mouse_input)
     }
 
     pub(crate) fn play_macro(&self, macro_rule: MacroRule) -> Result<(), AppError> {
@@ -163,18 +205,31 @@ pub fn run() {
             commands::ping,
             commands::get_config,
             commands::save_config,
+            commands::import_asset,
+            commands::read_asset,
+            commands::rename_asset,
+            commands::delete_asset,
+            commands::run_vision_diagnostic,
             commands::emergency_stop,
             commands::start_macro_recording,
+            commands::set_macro_recording_options,
             commands::stop_macro_recording,
             commands::get_macro_recording_status,
             commands::play_macro,
             commands::stop_macro,
             commands::is_macro_playing,
-            commands::get_macro_playback_status
+            commands::get_macro_playback_status,
+            commands::validate_rhai_source
         ])
         .setup(|app| {
+            let state = app.state::<RuntimeState>();
+            if let Err(error) = state.configure_vision(app.handle()) {
+                log::warn!(
+                    "视觉服务目录初始化失败，视觉功能将在使用时重试: {}",
+                    error.message
+                );
+            }
             if let Ok(config) = storage::load_config(app.handle()) {
-                let state = app.state::<RuntimeState>();
                 if let Err(error) = state.replace_config(config) {
                     log::error!("配置应用失败: {}", error.message);
                 }
