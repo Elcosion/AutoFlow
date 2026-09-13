@@ -2,7 +2,7 @@ use super::assets::{AssetCacheStats, AssetStore};
 use super::capture::WindowsCaptureBackend;
 use super::types::{
     AutomationAsset, CaptureBackend, CaptureFrame, ImageMatch, Point, RgbColor, ScreenRect,
-    VisionApi, VisionError, VisionMatcher, VisionPollBudget, WindowProvider, WindowRectValue,
+    VisionApi, VisionError, VisionMatcher, VisionPollOptions, WindowProvider, WindowRectValue,
     MAX_POLL_MS, MAX_WAIT_MS, MIN_POLL_MS,
 };
 use super::vision::ImageProcVisionMatcher;
@@ -231,11 +231,14 @@ impl VisionApi for VisionService {
     fn wait_window(
         &self,
         title_query: &str,
-        timeout: Duration,
-        poll: Duration,
-        cancel: &AtomicBool,
-        budget: &VisionPollBudget,
+        options: VisionPollOptions<'_>,
     ) -> Result<bool, VisionError> {
+        let VisionPollOptions {
+            timeout,
+            poll,
+            cancel,
+            budget,
+        } = options;
         validate_wait(timeout, poll)?;
         if title_query.trim().is_empty() {
             return Ok(false);
@@ -274,11 +277,14 @@ impl VisionApi for VisionService {
         point: Point,
         expected: RgbColor,
         tolerance: u8,
-        timeout: Duration,
-        poll: Duration,
-        cancel: &AtomicBool,
-        budget: &VisionPollBudget,
+        options: VisionPollOptions<'_>,
     ) -> Result<bool, VisionError> {
+        let VisionPollOptions {
+            timeout,
+            poll,
+            cancel,
+            budget,
+        } = options;
         validate_wait(timeout, poll)?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -322,11 +328,14 @@ impl VisionApi for VisionService {
         asset_id: &str,
         region: ScreenRect,
         threshold: f32,
-        timeout: Duration,
-        poll: Duration,
-        cancel: &AtomicBool,
-        budget: &VisionPollBudget,
+        options: VisionPollOptions<'_>,
     ) -> Result<Option<ImageMatch>, VisionError> {
+        let VisionPollOptions {
+            timeout,
+            poll,
+            cancel,
+            budget,
+        } = options;
         super::vision::validate_threshold(threshold)?;
         region.validate()?;
         validate_wait(timeout, poll)?;
@@ -531,13 +540,13 @@ fn virtual_screen_region() -> Option<ScreenRect> {
         if width <= 0 || height <= 0 {
             return None;
         }
-        return ScreenRect::new(
+        ScreenRect::new(
             x,
             y,
             u32::try_from(width).ok()?,
             u32::try_from(height).ok()?,
         )
-        .ok();
+        .ok()
     }
     #[cfg(not(windows))]
     {
@@ -553,7 +562,7 @@ fn filetime_value(value: FILETIME) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation::types::{CaptureBackend, WindowId, WindowInfo};
+    use crate::automation::types::{CaptureBackend, VisionPollBudget, WindowId, WindowInfo};
     use image::codecs::png::PngEncoder;
     use image::{ColorType, ImageEncoder};
     use std::collections::VecDeque;
@@ -675,30 +684,38 @@ mod tests {
         assert!(service
             .wait_window(
                 "demo",
-                Duration::from_millis(100),
-                Duration::from_millis(50),
-                &cancel,
-                &budget
+                VisionPollOptions::new(
+                    Duration::from_millis(100),
+                    Duration::from_millis(50),
+                    &cancel,
+                    &budget,
+                ),
             )
             .expect("window wait"));
-        assert!(!service
-            .wait_window(
-                "missing",
-                Duration::ZERO,
-                Duration::from_millis(50),
-                &cancel,
-                &budget
-            )
-            .expect("window timeout"));
+        assert!(
+            !service
+                .wait_window(
+                    "missing",
+                    VisionPollOptions::new(
+                        Duration::ZERO,
+                        Duration::from_millis(50),
+                        &cancel,
+                        &budget,
+                    ),
+                )
+                .expect("window timeout")
+        );
         cancel.store(true, Ordering::SeqCst);
         assert_eq!(
             service
                 .wait_window(
                     "missing",
-                    Duration::from_millis(100),
-                    Duration::from_millis(50),
-                    &cancel,
-                    &budget
+                    VisionPollOptions::new(
+                        Duration::from_millis(100),
+                        Duration::from_millis(50),
+                        &cancel,
+                        &budget,
+                    ),
                 )
                 .expect_err("cancel")
                 .code,
@@ -736,10 +753,12 @@ mod tests {
                     blue: 3
                 },
                 0,
-                Duration::from_millis(100),
-                Duration::from_millis(50),
-                &cancel,
-                &budget,
+                VisionPollOptions::new(
+                    Duration::from_millis(100),
+                    Duration::from_millis(50),
+                    &cancel,
+                    &budget,
+                ),
             )
             .expect("pixel wait"));
         cancel.store(true, Ordering::SeqCst);
@@ -753,10 +772,12 @@ mod tests {
                         blue: 3
                     },
                     0,
-                    Duration::from_millis(100),
-                    Duration::from_millis(50),
-                    &cancel,
-                    &budget,
+                    VisionPollOptions::new(
+                        Duration::from_millis(100),
+                        Duration::from_millis(50),
+                        &cancel,
+                        &budget,
+                    ),
                 )
                 .expect_err("pixel cancel")
                 .code,
@@ -803,10 +824,12 @@ mod tests {
                 &asset.id,
                 ScreenRect::from_parts(0, 0, 2, 2),
                 0.99,
-                Duration::from_millis(100),
-                Duration::from_millis(50),
-                &cancel,
-                &budget,
+                VisionPollOptions::new(
+                    Duration::from_millis(100),
+                    Duration::from_millis(50),
+                    &cancel,
+                    &budget,
+                ),
             )
             .expect("image wait")
             .is_some());
@@ -846,10 +869,12 @@ mod tests {
                 &mismatch_asset.id,
                 ScreenRect::from_parts(0, 0, 2, 2),
                 0.99,
-                Duration::ZERO,
-                Duration::from_millis(50),
-                &cancel,
-                &VisionPollBudget::new(None),
+                VisionPollOptions::new(
+                    Duration::ZERO,
+                    Duration::from_millis(50),
+                    &cancel,
+                    &VisionPollBudget::new(None),
+                ),
             )
             .expect("image timeout")
             .is_none());
@@ -860,10 +885,12 @@ mod tests {
                     &asset.id,
                     ScreenRect::from_parts(0, 0, 2, 2),
                     0.99,
-                    Duration::from_millis(100),
-                    Duration::from_millis(50),
-                    &cancel,
-                    &VisionPollBudget::new(None),
+                    VisionPollOptions::new(
+                        Duration::from_millis(100),
+                        Duration::from_millis(50),
+                        &cancel,
+                        &VisionPollBudget::new(None),
+                    ),
                 )
                 .expect_err("image cancel")
                 .code,
@@ -900,11 +927,13 @@ mod tests {
                 blue: 3,
             },
             0,
-            Duration::from_millis(100),
-            Duration::from_millis(50),
-            &AtomicBool::new(false),
-            &VisionPollBudget::new(None),
+            VisionPollOptions::new(
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                &AtomicBool::new(false),
+                &VisionPollBudget::new(None),
+            ),
         );
-        assert_eq!(result.expect("recovered wait"), true);
+        assert!(result.expect("recovered wait"));
     }
 }
