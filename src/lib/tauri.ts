@@ -264,50 +264,116 @@ export function normalizeConfig(value: Partial<AppConfig>): AppConfig {
     ? (value.behaviorSessionsV2 as BehaviorSessionV2[])
     : defaultConfig.behaviorSessionsV2;
   const behaviorProfilesV2 = Array.isArray(value.behaviorProfilesV2)
-    ? (value.behaviorProfilesV2 as BehaviorProfileV2[]).map((profile) => ({
-        ...profile,
-        modelConfig: normalizeBehaviorModelConfig(profile.modelConfig),
-        pointerModel: {
-          ...profile.pointerModel,
-          buckets: Array.isArray(profile.pointerModel?.buckets)
-            ? profile.pointerModel.buckets.map((bucket) => ({
+    ? (value.behaviorProfilesV2 as BehaviorProfileV2[]).map((profile) => {
+        const modelConfig = normalizeBehaviorModelConfig(profile.modelConfig);
+        const pointerBuckets = Array.isArray(profile.pointerModel?.buckets)
+          ? profile.pointerModel.buckets.map((bucket) => {
+              const validSampleCount = Number.isFinite(bucket.validSampleCount)
+                ? Math.max(0, Math.floor(bucket.validSampleCount))
+                : 0;
+              const trainingReady =
+                validSampleCount >= modelConfig.minBucketSamples;
+              return {
                 ...bucket,
-                fallbackLevel:
-                  typeof bucket.fallbackLevel === "number" &&
-                  Number.isFinite(bucket.fallbackLevel)
-                    ? Math.max(0, Math.floor(bucket.fallbackLevel))
-                    : 0,
+                validSampleCount,
+                fallbackLevel: trainingReady ? 0 : 1,
+                trainingReady,
+                trainingFallbackReason: trainingReady
+                  ? undefined
+                  : "insufficient_samples",
                 exemplars: Array.isArray(bucket.exemplars)
                   ? bucket.exemplars
                   : [],
-              }))
-            : [],
-        },
-        clickModel: {
-          ...profile.clickModel,
-          buckets: Array.isArray(profile.clickModel?.buckets)
-            ? profile.clickModel.buckets.map((bucket) => ({
+              };
+            })
+          : [];
+        const eligibleEpisodeCount = pointerBuckets
+          .filter((bucket) => bucket.trainingReady)
+          .reduce((sum, bucket) => sum + bucket.validSampleCount, 0);
+        const validPointerEpisodeCount =
+          typeof profile.coverage.validPointerEpisodeCount === "number" &&
+          Number.isFinite(profile.coverage.validPointerEpisodeCount)
+            ? Math.max(0, profile.coverage.validPointerEpisodeCount)
+            : 0;
+        const eligibleCoverage =
+          validPointerEpisodeCount > 0
+            ? Math.min(1, eligibleEpisodeCount / validPointerEpisodeCount)
+            : 0;
+        const hasMinimumSamples =
+          validPointerEpisodeCount >= modelConfig.minQualityEpisodes &&
+          pointerBuckets.length > 0;
+        const reachesGoodSamples =
+          validPointerEpisodeCount >= modelConfig.usableQualityEpisodes &&
+          validPointerEpisodeCount >= modelConfig.goodQualityEpisodes;
+        const quality = !hasMinimumSamples
+          ? "insufficient"
+          : !reachesGoodSamples ||
+              eligibleCoverage < modelConfig.minBucketCoverage
+            ? "usable"
+            : "good";
+        const bucketCoverage = Array.isArray(profile.coverage.bucketCoverage)
+          ? profile.coverage.bucketCoverage.map((bucket) => {
+              const validSampleCount = Number.isFinite(
+                bucket.validSampleCount,
+              )
+                ? Math.max(0, Math.floor(bucket.validSampleCount))
+                : 0;
+              const trainingReady =
+                validSampleCount >= modelConfig.minBucketSamples;
+              return {
                 ...bucket,
-                fallbackLevel:
-                  typeof bucket.fallbackLevel === "number" &&
-                  Number.isFinite(bucket.fallbackLevel)
-                    ? Math.max(0, Math.floor(bucket.fallbackLevel))
-                    : 0,
-              }))
-            : [],
-        },
-        sourceRetention:
-          profile.sourceRetention === "ephemeral" ? "ephemeral" : "persisted",
-        coverage: {
-          ...profile.coverage,
-          clickAssociatedPointerEpisodeCount:
-            typeof profile.coverage.clickAssociatedPointerEpisodeCount ===
-              "number" &&
-            Number.isFinite(profile.coverage.clickAssociatedPointerEpisodeCount)
-              ? profile.coverage.clickAssociatedPointerEpisodeCount
-              : 0,
-        },
-      }))
+                validSampleCount,
+                fallbackLevel: trainingReady ? 0 : 1,
+                trainingReady,
+                trainingFallbackReason: trainingReady
+                  ? undefined
+                  : "insufficient_samples",
+              };
+            })
+          : [];
+        return {
+          ...profile,
+          modelConfig,
+          pointerModel: {
+            ...profile.pointerModel,
+            buckets: pointerBuckets,
+          },
+          clickModel: {
+            ...profile.clickModel,
+            buckets: Array.isArray(profile.clickModel?.buckets)
+              ? profile.clickModel.buckets.map((bucket) => ({
+                  ...bucket,
+                  fallbackLevel:
+                    Number.isFinite(bucket.validSampleCount) &&
+                    bucket.validSampleCount >= modelConfig.minBucketSamples
+                      ? 0
+                      : 1,
+                }))
+              : [],
+          },
+          sourceRetention:
+            profile.sourceRetention === "ephemeral" ? "ephemeral" : "persisted",
+          coverage: {
+            ...profile.coverage,
+            clickAssociatedPointerEpisodeCount:
+              typeof profile.coverage.clickAssociatedPointerEpisodeCount ===
+                "number" &&
+              Number.isFinite(profile.coverage.clickAssociatedPointerEpisodeCount)
+                ? profile.coverage.clickAssociatedPointerEpisodeCount
+                : 0,
+            bucketCoverage,
+            quality,
+            eligibleEpisodeCount,
+            eligibleCoverage,
+            qualityFilteredPointerEpisodeCount:
+              typeof profile.coverage.qualityFilteredPointerEpisodeCount ===
+                "number" &&
+              Number.isFinite(profile.coverage.qualityFilteredPointerEpisodeCount)
+                ? profile.coverage.qualityFilteredPointerEpisodeCount
+                : 0,
+          },
+        };
+      })
     : defaultConfig.behaviorProfilesV2;
   const policyValue = value.behaviorPolicy as Partial<BehaviorPolicy> | undefined;
   const behaviorPolicy = normalizeBehaviorPolicy(policyValue);

@@ -18,7 +18,10 @@ pub use events::{
     ClickEpisode, DiscardedEvent, PointerMoveEpisode, PointerSample, SegmentationConfig,
     SegmentationResult,
 };
-pub use features::{extract_pointer_features, PointerFeatures};
+pub use features::{
+    extract_pointer_features, training_quality_rejection_reason, PointerFeatures,
+    MAX_TRAINING_PATH_RATIO, MIN_TRAINING_PATH_EFFICIENCY,
+};
 pub use model::{
     train_behavior_profile, train_behavior_profile_with_retention, BehaviorModelConfig,
     BehaviorProfileV2, BucketCoverage, ClickBucketModel, ClickModel, CoverageSummary,

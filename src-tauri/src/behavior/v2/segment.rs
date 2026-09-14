@@ -30,7 +30,13 @@ pub fn segment_mouse_actions(
     let mut pending_buttons = HashMap::<u8, PendingClick>::new();
     let mut last_click_up = None::<(usize, u64)>;
     let mut last_down_by_button = HashMap::<u8, u64>::new();
-    let mut last_mouse_sample = None::<PointerSample>;
+    // Keep the latest raw observation for dwell/click association, while the
+    // current episode stores only unique coordinates. A repeated coordinate
+    // can still move the endpoint dwell forward even though it is not kept as
+    // another trajectory sample.
+    let mut last_mouse_observation = None::<PointerSample>;
+    let mut last_unique_sample = None::<PointerSample>;
+    let mut pending_mouse_move = None::<(usize, PointerSample)>;
     let mut previous_timestamp = None::<u64>;
     let mut accepted_event_count = 0usize;
 
@@ -43,6 +49,18 @@ pub fn segment_mouse_actions(
             ));
         }
         previous_timestamp = Some(timestamp);
+
+        if !matches!(event, BehaviorEvent::MouseMove { .. }) {
+            accepted_event_count += usize::from(flush_pending_mouse_move(
+                &mut pending_mouse_move,
+                &mut current_samples,
+                &mut pointer_moves,
+                &mut discarded_events,
+                &mut last_mouse_observation,
+                &mut last_unique_sample,
+                config,
+            ));
+        }
 
         if let Some((click_index, click_up_at)) = last_click_up {
             if timestamp >= click_up_at {
@@ -67,29 +85,26 @@ pub fn segment_mouse_actions(
                     x: *x,
                     y: *y,
                 };
-                if last_mouse_sample.is_some_and(|previous| previous.x == *x && previous.y == *y) {
-                    discarded_events.push(DiscardedEvent {
-                        event_index,
-                        reason: "duplicate_coordinate".to_string(),
-                    });
-                    continue;
-                }
-                if let Some(previous) = current_samples.last().copied() {
-                    let gap = timestamp.saturating_sub(previous.timestamp_ms);
-                    if gap > config.max_event_gap_ms || gap > config.move_end_dwell_ms {
-                        finish_current_move(
+                match pending_mouse_move {
+                    Some((_, pending)) if pending.timestamp_ms == timestamp => {
+                        // Same-millisecond hook samples do not contain enough
+                        // time information to synthesize an ordering. Keep
+                        // the last valid coordinate from that millisecond.
+                        pending_mouse_move = Some((event_index, sample));
+                    }
+                    _ => {
+                        accepted_event_count += usize::from(flush_pending_mouse_move(
+                            &mut pending_mouse_move,
                             &mut current_samples,
                             &mut pointer_moves,
                             &mut discarded_events,
-                            event_index,
+                            &mut last_mouse_observation,
+                            &mut last_unique_sample,
                             config,
-                            gap,
-                        );
+                        ));
+                        pending_mouse_move = Some((event_index, sample));
                     }
                 }
-                current_samples.push(sample);
-                last_mouse_sample = Some(sample);
-                accepted_event_count += 1;
             }
             BehaviorEvent::MouseButton {
                 button,
@@ -127,7 +142,7 @@ pub fn segment_mouse_actions(
                         event_index,
                         timestamp,
                         config,
-                        last_mouse_sample,
+                        last_mouse_observation,
                     );
                     let is_double_click = last_down_by_button
                         .get(button)
@@ -183,8 +198,10 @@ pub fn segment_mouse_actions(
                 }
             }
             BehaviorEvent::Key { .. } | BehaviorEvent::Wheel { .. } => {
-                if let Some(previous) = current_samples.last().copied() {
-                    let dwell = timestamp.saturating_sub(previous.timestamp_ms);
+                if !current_samples.is_empty() {
+                    let dwell = last_mouse_observation
+                        .map(|sample| timestamp.saturating_sub(sample.timestamp_ms))
+                        .unwrap_or(0);
                     finish_current_move(
                         &mut current_samples,
                         &mut pointer_moves,
@@ -198,6 +215,16 @@ pub fn segment_mouse_actions(
             }
         }
     }
+
+    accepted_event_count += usize::from(flush_pending_mouse_move(
+        &mut pending_mouse_move,
+        &mut current_samples,
+        &mut pointer_moves,
+        &mut discarded_events,
+        &mut last_mouse_observation,
+        &mut last_unique_sample,
+        config,
+    ));
 
     if !current_samples.is_empty() {
         finish_current_move(
@@ -260,9 +287,9 @@ fn finalize_before_click(
     event_index: usize,
     click_timestamp: u64,
     config: &SegmentationConfig,
-    last_mouse_sample: Option<PointerSample>,
+    last_mouse_observation: Option<PointerSample>,
 ) -> Option<(usize, u64)> {
-    let dwell = last_mouse_sample
+    let dwell = last_mouse_observation
         .map(|sample| click_timestamp.saturating_sub(sample.timestamp_ms))
         .unwrap_or(0);
     let can_associate = !current_samples.is_empty()
@@ -278,6 +305,64 @@ fn finalize_before_click(
         dwell,
     );
     (can_associate && pointer_moves.len() > before_len).then(|| (pointer_moves.len() - 1, dwell))
+}
+
+fn flush_pending_mouse_move(
+    pending_mouse_move: &mut Option<(usize, PointerSample)>,
+    current_samples: &mut Vec<PointerSample>,
+    pointer_moves: &mut Vec<PointerMoveEpisode>,
+    discarded_events: &mut Vec<DiscardedEvent>,
+    last_mouse_observation: &mut Option<PointerSample>,
+    last_unique_sample: &mut Option<PointerSample>,
+    config: &SegmentationConfig,
+) -> bool {
+    let Some((pending_index, sample)) = pending_mouse_move.take() else {
+        return false;
+    };
+
+    if last_unique_sample
+        .as_ref()
+        .is_some_and(|previous| previous.x == sample.x && previous.y == sample.y)
+    {
+        discarded_events.push(DiscardedEvent {
+            event_index: pending_index,
+            reason: "duplicate_coordinate".to_string(),
+        });
+        // The coordinate is redundant, but its timestamp is still the latest
+        // endpoint observation for click dwell and association.
+        *last_mouse_observation = Some(sample);
+        return false;
+    }
+
+    if let Some(previous) = current_samples.last().copied() {
+        let gap = sample.timestamp_ms.saturating_sub(previous.timestamp_ms);
+        if gap > config.max_event_gap_ms || gap > config.move_end_dwell_ms {
+            finish_current_move(
+                current_samples,
+                pointer_moves,
+                discarded_events,
+                pending_index,
+                config,
+                gap,
+            );
+        }
+        if current_samples
+            .last()
+            .is_some_and(|previous| sample.timestamp_ms <= previous.timestamp_ms)
+        {
+            discarded_events.push(DiscardedEvent {
+                event_index: pending_index,
+                reason: "non_increasing_timestamp_after_coalesce".to_string(),
+            });
+            *last_mouse_observation = Some(sample);
+            return false;
+        }
+    }
+
+    current_samples.push(sample);
+    *last_mouse_observation = Some(sample);
+    *last_unique_sample = Some(sample);
+    true
 }
 
 fn finish_current_move(
@@ -314,9 +399,15 @@ fn finish_current_move(
     }
     match PointerMoveEpisode::from_samples(samples, false, None, endpoint_dwell_ms) {
         Ok(episode) => pointer_moves.push(episode),
-        Err(_) => discarded_events.push(DiscardedEvent {
+        Err(error) => discarded_events.push(DiscardedEvent {
             event_index,
-            reason: "invalid_episode".to_string(),
+            reason: match error.code.as_str() {
+                "behavior_v2_episode_timestamp_order" => {
+                    "non_increasing_timestamp_after_coalesce".to_string()
+                }
+                "behavior_v2_empty_episode" => "empty_episode".to_string(),
+                _ => "invalid_episode_features".to_string(),
+            },
         }),
     }
 }

@@ -4063,13 +4063,16 @@ button:focus-visible {
 /* A compact in-app title bar replaces the Windows chrome. */
 .app-window {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .app-window > .app-shell {
+  height: auto;
   min-height: 0;
-  flex: 1 1 auto;
+  flex: 1 1 0;
 }
 
 .window-titlebar {
@@ -5769,6 +5772,33 @@ button:focus-visible {
 .macro-reference-add:hover {
   color: #ffffff;
   background: #176a5d;
+}
+
+.page-stack.behavior-page {
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #777777 #e5e5e5;
+  overscroll-behavior-y: contain;
+}
+
+.page-stack.behavior-page::-webkit-scrollbar {
+  width: 10px;
+}
+
+.page-stack.behavior-page::-webkit-scrollbar-thumb {
+  border: 2px solid #e5e5e5;
+  border-radius: 999px;
+  background: #777777;
+}
+
+.page-stack.behavior-page::-webkit-scrollbar-track {
+  background: #e5e5e5;
+}
+
+.page-stack.behavior-page > * {
+  flex-shrink: 0;
 }
 
 .behavior-grid {

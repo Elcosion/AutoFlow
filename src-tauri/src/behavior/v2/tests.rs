@@ -72,6 +72,66 @@ fn varied_profile() -> BehaviorProfileV2 {
     train_behavior_profile(&make_session(events)).unwrap()
 }
 
+fn synthetic_features() -> PointerFeatures {
+    PointerFeatures {
+        movement_time_ms: 120.0,
+        distance_px: 100.0,
+        path_length_px: 105.0,
+        path_efficiency: 0.95,
+        mean_speed: 800.0,
+        peak_speed: 1_200.0,
+        time_to_peak_ratio: 0.4,
+        acceleration_phase_ratio: 0.4,
+        deceleration_phase_ratio: 0.6,
+        maximum_lateral_deviation_px: 4.0,
+        signed_curvature: 0.01,
+        endpoint_dwell_ms: 10.0,
+        overshoot_count: 0,
+        overshoot_distance_px: 0.0,
+        correction_count: 0,
+        coverage: 1.0,
+    }
+}
+
+fn synthetic_pointer_model(valid_episode_count: u32, bucket_counts: &[u32]) -> PointerModel {
+    let directions = [
+        DirectionBucket::E,
+        DirectionBucket::Ne,
+        DirectionBucket::N,
+        DirectionBucket::Nw,
+        DirectionBucket::W,
+        DirectionBucket::Sw,
+        DirectionBucket::S,
+        DirectionBucket::Se,
+    ];
+    let features = synthetic_features();
+    let buckets = bucket_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(index, count)| PointerBucketModel {
+            key: PointerBucket {
+                distance: DistanceBucket::Short,
+                direction: directions[index % directions.len()],
+                followed_by_click: false,
+                target_width: TargetWidthBucket::Unknown,
+            },
+            valid_sample_count: *count,
+            coverage: *count as f32 / valid_episode_count.max(1) as f32,
+            features: PointerFeatureDistributions::from_features(&vec![features; *count as usize])
+                .unwrap(),
+            exemplars: vec![features],
+            fallback_level: u8::from(*count < BehaviorModelConfig::default().min_bucket_samples),
+        })
+        .collect();
+    PointerModel {
+        buckets,
+        total_episode_count: valid_episode_count,
+        valid_episode_count,
+        discarded_episode_count: 0,
+    }
+}
+
 fn straight_episode() -> PointerMoveEpisode {
     PointerMoveEpisode::from_samples(
         vec![
@@ -147,6 +207,43 @@ fn segmentation_rejects_unordered_timestamps_and_drops_duplicates() {
 }
 
 #[test]
+fn same_millisecond_moves_keep_the_last_coordinate_and_click_association() {
+    let events = vec![
+        mouse_move(0, 0, 0),
+        mouse_move(10, 10, 0),
+        mouse_move(10, 20, 0),
+        mouse_move(10, 20, 0),
+        mouse_move(20, 30, 0),
+        mouse_move(30, 30, 0),
+        mouse_button(40, 1, true, 30, 0),
+        mouse_button(80, 1, false, 30, 0),
+    ];
+    let result = segment_mouse_actions(&events, &SegmentationConfig::default()).unwrap();
+    assert_eq!(result.pointer_moves.len(), 1);
+    let episode = &result.pointer_moves[0];
+    assert_eq!(episode.sample_points[1].x, 20);
+    assert!(episode
+        .sample_points
+        .windows(2)
+        .all(|pair| pair[1].timestamp_ms > pair[0].timestamp_ms));
+    assert!(episode.followed_by_click);
+    assert_eq!(result.clicks[0].pointer_move_episode_index, Some(0));
+    assert_eq!(result.clicks[0].pre_click_dwell_ms, 10);
+    assert!(!result
+        .discarded_events
+        .iter()
+        .any(|discarded| discarded.reason.starts_with("invalid_episode")));
+
+    let profile = train_behavior_profile(&make_session(events)).unwrap();
+    let context = PointerActionContext::new((0, 0), (30, 0), None, true, 1.0, Some(12)).unwrap();
+    let trajectory = generate_pointer_trajectory(&profile, &context, None).unwrap();
+    assert_eq!(
+        trajectory.points.last().map(|point| (point.x, point.y)),
+        Some((30, 0))
+    );
+}
+
+#[test]
 fn features_distinguish_straight_curve_peak_and_correction() {
     let straight = extract_pointer_features(&straight_episode()).unwrap();
     assert!(straight.path_efficiency > 0.99);
@@ -219,6 +316,85 @@ fn features_distinguish_straight_curve_peak_and_correction() {
     assert!(overshoot_features.overshoot_distance_px >= 25.0);
     assert!(overshoot_features.correction_count >= 1);
     assert!(overshoot_features.finite());
+    assert_eq!(training_quality_rejection_reason(&curved_features), None);
+    assert_eq!(training_quality_rejection_reason(&overshoot_features), None);
+}
+
+#[test]
+fn quality_uses_aggregate_eligible_coverage_and_has_three_clear_levels() {
+    let config = BehaviorModelConfig::default();
+
+    let insufficient = synthetic_pointer_model(2, &[2]);
+    assert_eq!(insufficient.eligible_episode_count(&config), 0);
+    assert_eq!(insufficient.eligible_coverage(&config), 0.0);
+    assert_eq!(insufficient.quality(&config), ModelQuality::Insufficient);
+
+    let usable = synthetic_pointer_model(8, &[3, 2, 2, 1]);
+    assert_eq!(usable.eligible_episode_count(&config), 3);
+    assert!(usable.eligible_coverage(&config) < config.min_bucket_coverage);
+    assert_eq!(usable.quality(&config), ModelQuality::Usable);
+
+    let good = synthetic_pointer_model(35, &[3, 3, 3, 6, 6, 6, 1, 1, 1, 1, 1, 1, 1]);
+    assert_eq!(good.eligible_episode_count(&config), 27);
+    assert!((good.eligible_coverage(&config) - 27.0 / 35.0).abs() < 0.0001);
+    assert_eq!(good.quality(&config), ModelQuality::Good);
+
+    let below_good_coverage = synthetic_pointer_model(16, &[2, 2, 2, 2, 2, 2, 2, 2]);
+    assert_eq!(below_good_coverage.quality(&config), ModelQuality::Usable);
+}
+
+#[test]
+fn extreme_low_efficiency_training_episode_is_filtered_with_a_reason() {
+    let mut events = vec![
+        mouse_move(0, 0, 0),
+        mouse_move(40, 50, 0),
+        mouse_move(80, 100, 0),
+    ];
+    let base = 1_000;
+    let extreme_points = [
+        (0, 0),
+        (100, 100),
+        (-100, 100),
+        (100, -100),
+        (-100, -100),
+        (100, 100),
+        (-100, 100),
+        (100, -100),
+        (-100, -100),
+        (100, 0),
+    ];
+    for (index, (x, y)) in extreme_points.into_iter().enumerate() {
+        events.push(mouse_move(base + index as u64 * 20, x, y));
+    }
+    let profile = train_behavior_profile(&make_session(events)).unwrap();
+    assert_eq!(profile.coverage.quality_filtered_pointer_episode_count, 1);
+    assert!(profile.coverage.discarded_reasons.keys().any(|reason| {
+        reason == "path_efficiency_below_floor" || reason == "path_ratio_exceeded"
+    }));
+    assert!(profile
+        .pointer_model
+        .buckets
+        .iter()
+        .flat_map(|bucket| bucket.exemplars.iter())
+        .all(|features| features.path_efficiency >= MIN_TRAINING_PATH_EFFICIENCY));
+}
+
+#[test]
+fn trajectory_quality_reasons_distinguish_efficiency_and_path_ratio() {
+    let mut ratio = synthetic_features();
+    ratio.path_length_px = 900.0;
+    assert_eq!(
+        training_quality_rejection_reason(&ratio),
+        Some("path_ratio_exceeded")
+    );
+
+    let mut efficiency = synthetic_features();
+    efficiency.path_length_px = 200.0;
+    efficiency.path_efficiency = 0.1;
+    assert_eq!(
+        training_quality_rejection_reason(&efficiency),
+        Some("path_efficiency_below_floor")
+    );
 }
 
 #[test]
@@ -290,6 +466,14 @@ fn insufficient_bucket_is_explicitly_marked_as_fallback() {
     ]))
     .unwrap();
     assert_eq!(profile.coverage.quality, ModelQuality::Insufficient);
+    assert_eq!(profile.pointer_model.buckets[0].fallback_level, 1);
+    assert!(!profile.coverage.bucket_coverage[0].training_ready);
+    assert_eq!(
+        profile.coverage.bucket_coverage[0]
+            .training_fallback_reason
+            .as_deref(),
+        Some("insufficient_samples")
+    );
 
     let context = PointerActionContext::new((0, 0), (50, 0), None, false, 1.0, Some(3)).unwrap();
     let trajectory = generate_pointer_trajectory(&profile, &context, None).unwrap();
@@ -298,6 +482,50 @@ fn insufficient_bucket_is_explicitly_marked_as_fallback() {
         trajectory.fallback_reason.as_deref(),
         Some("insufficient_samples_in_exact_bucket")
     );
+}
+
+#[test]
+fn legacy_profile_normalization_repairs_sparse_training_metadata() {
+    let profile = train_behavior_profile(&make_session(vec![
+        mouse_move(0, 0, 0),
+        mouse_move(50, 20, 0),
+        mouse_move(100, 50, 0),
+    ]))
+    .unwrap();
+    let mut legacy = serde_json::to_value(&profile).unwrap();
+    let object = legacy.as_object_mut().unwrap();
+    object.remove("eligibleEpisodeCount");
+    object.remove("eligibleCoverage");
+    object.remove("qualityFilteredPointerEpisodeCount");
+    if let Some(buckets) = object
+        .get_mut("pointerModel")
+        .and_then(|model| model.get_mut("buckets"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for bucket in buckets {
+            bucket["fallbackLevel"] = serde_json::json!(0);
+        }
+    }
+    if let Some(buckets) = object
+        .get_mut("coverage")
+        .and_then(|coverage| coverage.get_mut("bucketCoverage"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for bucket in buckets {
+            bucket.as_object_mut().unwrap().remove("trainingReady");
+            bucket
+                .as_object_mut()
+                .unwrap()
+                .remove("trainingFallbackReason");
+            bucket["fallbackLevel"] = serde_json::json!(0);
+        }
+    }
+    let parsed: BehaviorProfileV2 = serde_json::from_value(legacy).unwrap();
+    let normalized = parsed.normalize_derived_fields();
+    assert_eq!(normalized.pointer_model.buckets[0].fallback_level, 1);
+    assert!(!normalized.coverage.bucket_coverage[0].training_ready);
+    assert_eq!(normalized.coverage.eligible_episode_count, 0);
+    normalized.validate().unwrap();
 }
 
 #[test]
@@ -556,6 +784,72 @@ fn fallback_diagnostics_never_claim_training() {
 }
 
 #[test]
+fn click_hold_sampling_is_robust_to_one_long_press_and_seeded() {
+    let holds = [80u64, 82, 84, 86, 88, 90, 92, 94, 96, 764];
+    let mut events = Vec::new();
+    for (index, hold_ms) in holds.into_iter().enumerate() {
+        let base = index as u64 * 1_000;
+        events.push(mouse_button(base + 100, 1, true, 20, 20));
+        events.push(mouse_button(base + 100 + hold_ms, 1, false, 20, 20));
+    }
+    let profile = train_behavior_profile(&make_session(events)).unwrap();
+    let bucket = profile
+        .click_model
+        .buckets
+        .iter()
+        .find(|bucket| bucket.button == MouseButton::Left && !bucket.followed_by_move)
+        .unwrap();
+    assert_eq!(bucket.hold_ms.max, 764.0);
+
+    let first = sample_click_plan(&profile, MouseButton::Left, false, 1.0, Some(44), None).unwrap();
+    let replay =
+        sample_click_plan(&profile, MouseButton::Left, false, 1.0, Some(44), None).unwrap();
+    assert_eq!(first, replay);
+    assert!(first.hold_ms <= 140);
+    assert!(first.hold_ms >= 1);
+}
+
+#[test]
+fn unknown_training_width_is_reported_as_wildcard_fallback() {
+    let mut events = Vec::new();
+    for episode in 0..4u64 {
+        let base = episode * 1_000;
+        events.extend([
+            mouse_move(base, 0, 0),
+            mouse_move(base + 40, 40, 0),
+            mouse_move(base + 80, 100, 0),
+            mouse_button(base + 140, 1, true, 100, 0),
+            mouse_button(base + 190, 1, false, 100, 0),
+        ]);
+    }
+    let profile = train_behavior_profile(&make_session(events)).unwrap();
+    assert!(profile
+        .pointer_model
+        .buckets
+        .iter()
+        .all(|bucket| bucket.key.target_width == TargetWidthBucket::Unknown));
+    let policy = BehaviorPolicy {
+        enabled: true,
+        timing_strength: 1.0,
+        pointer_path_strength: 1.0,
+        pause_strength: 1.0,
+        correction_strength: 1.0,
+        ..BehaviorPolicy::default()
+    };
+    let mut runtime = BehaviorRuntimeV2::with_runtime_seed(profile, policy, 55).unwrap();
+    let trajectory = runtime
+        .pointer_trajectory((0, 0), (100, 0), Some(80.0), true, None)
+        .unwrap();
+    let diagnostic = trajectory.diagnostic.unwrap();
+    assert!(!diagnostic.trained);
+    assert_eq!(
+        diagnostic.fallback_reason.as_deref(),
+        Some("target_width_wildcard_fallback")
+    );
+    assert!(diagnostic.bucket.contains("width=unknown"));
+}
+
+#[test]
 fn correction_strength_and_target_width_bound_runtime_corrections() {
     let mut profile = varied_profile();
     let bucket = profile
@@ -704,4 +998,74 @@ fn cancellation_stops_a_generated_trajectory() {
     let context = PointerActionContext::new((0, 0), (1_000, 0), None, false, 1.0, Some(1)).unwrap();
     let error = generate_pointer_trajectory(&profile, &context, Some(&cancelled)).unwrap_err();
     assert_eq!(error.code, "behavior_cancelled");
+}
+
+#[test]
+fn optional_test1_retraining_is_read_only_and_reports_before_after_metrics() {
+    let Some(session_path) = std::env::var_os("AUTOFLOW_TEST1_SESSION") else {
+        return;
+    };
+    let Some(profile_path) = std::env::var_os("AUTOFLOW_TEST1_PROFILE") else {
+        return;
+    };
+    let session_text = std::fs::read_to_string(session_path).unwrap();
+    let profile_text = std::fs::read_to_string(profile_path).unwrap();
+    let session: BehaviorSessionV2 = serde_json::from_str(&session_text).unwrap();
+    let before: BehaviorProfileV2 = serde_json::from_str(&profile_text).unwrap();
+    let after = train_behavior_profile(&session).unwrap();
+    let segmentation =
+        segment_mouse_actions(&session.raw_events, &SegmentationConfig::default()).unwrap();
+    let filtered_episodes = segmentation
+        .pointer_moves
+        .iter()
+        .enumerate()
+        .filter_map(|(index, episode)| {
+            let features = extract_pointer_features(episode).ok()?;
+            let reason = training_quality_rejection_reason(&features)?;
+            Some(serde_json::json!({
+                "episodeIndex": index,
+                "bucket": PointerBucket::for_episode(episode).label(),
+                "start": [episode.start_x, episode.start_y],
+                "end": [episode.end_x, episode.end_y],
+                "distancePx": features.distance_px,
+                "pathLengthPx": features.path_length_px,
+                "pathEfficiency": features.path_efficiency,
+                "reason": reason,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    println!(
+        "test1 read-only retraining comparison: {}",
+        serde_json::json!({
+            "before": {
+                "validPointerEpisodeCount": before.coverage.valid_pointer_episode_count,
+                "bucketCount": before.coverage.bucket_coverage.len(),
+                "quality": before.coverage.quality,
+                "discardedReasons": before.coverage.discarded_reasons,
+            },
+            "after": {
+                "validPointerEpisodeCount": after.coverage.valid_pointer_episode_count,
+                "bucketCount": after.coverage.bucket_coverage.len(),
+                "eligibleEpisodeCount": after.coverage.eligible_episode_count,
+                "eligibleCoverage": after.coverage.eligible_coverage,
+                "quality": after.coverage.quality,
+                "qualityFilteredPointerEpisodeCount": after
+                    .coverage
+                    .quality_filtered_pointer_episode_count,
+                "discardedReasons": after.coverage.discarded_reasons,
+                "filteredEpisodes": filtered_episodes,
+            }
+        })
+    );
+    assert!(after.validate().is_ok());
+    assert_eq!(
+        after
+            .coverage
+            .discarded_reasons
+            .get("invalid_episode")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
 }

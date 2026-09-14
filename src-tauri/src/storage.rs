@@ -57,8 +57,14 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig, AppError> {
                 load_behavior_sessions_v2(app, &config.behavior_session_files_v2)?
             };
             let (profiles_v2, profile_files_v2, mut missing_profiles_v2) = if inline_profiles_v2 {
-                let files = sync_behavior_profiles_v2(app, &config.behavior_profiles_v2)?;
-                (config.behavior_profiles_v2.clone(), files, false)
+                let profiles = config
+                    .behavior_profiles_v2
+                    .iter()
+                    .cloned()
+                    .map(BehaviorProfileV2::normalize_derived_fields)
+                    .collect::<Vec<_>>();
+                let files = sync_behavior_profiles_v2(app, &profiles)?;
+                (profiles, files, true)
             } else {
                 load_behavior_profiles_v2(app, &config.behavior_profile_v2_files)?
             };
@@ -327,12 +333,17 @@ fn load_behavior_profiles_v2(
             continue;
         }
         match read_json_file_with_backup::<BehaviorProfileV2>(&path) {
-            Ok((profile, recovered)) if profile.id == entry.id && profile.validate().is_ok() => {
-                profiles.push(profile);
-                valid_entries.push(entry.clone());
-                missing |= recovered;
+            Ok((profile, recovered)) => {
+                let normalized = profile.clone().normalize_derived_fields();
+                if normalized.id == entry.id && normalized.validate().is_ok() {
+                    missing |= recovered || normalized != profile;
+                    profiles.push(normalized);
+                    valid_entries.push(entry.clone());
+                } else {
+                    missing = true;
+                }
             }
-            Ok(_) | Err(_) => {
+            Err(_) => {
                 missing = true;
             }
         }

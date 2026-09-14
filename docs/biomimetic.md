@@ -10,14 +10,21 @@
 
 ```text
 WH_MOUSE_LL 原始事件
-  -> Segmenter：按重复坐标、静止间隔和下一个动作切分
+  -> Segmenter：合并同一毫秒内的连续采样、去重并按静止间隔切分
   -> Extractor：计算时间、路径效率、峰值速度、曲率、越过和修正
+  -> Quality gate：过滤有限值异常和极端绕行，并记录具体原因
   -> PointerModel：按距离、方向、点击上下文和目标宽度分桶
   -> Sampler：从经验分布采样，样本不足时显式 fallback
   -> Runtime：生成可取消的 Windows 输入计划
 ```
 
-切分阈值集中在 `SegmentationConfig`。乱序时间戳会拒绝，重复坐标不会参与速度计算，极短轨迹会进入丢弃原因统计。采样点不足不会被标记为“已训练”。
+切分阈值集中在 `SegmentationConfig`。同一毫秒的连续鼠标采样保留该毫秒最后一个有效坐标，不能因为毫秒精度冲突丢弃整条轨迹；合并后仍会去除重复坐标，并以最后一次有效观测计算 endpoint dwell。乱序时间戳会拒绝，极短轨迹会进入丢弃原因统计。采样点不足不会被标记为“已训练”。
+
+训练质量使用所有样本数达到 `minBucketSamples` 的 bucket 所覆盖的轨迹总数计算
+`eligibleCoverage`，而不是要求每个 bucket 各自占到全体的一半。有限值、最低
+`pathEfficiency` 和最大路径/直线距离比的阈值集中在特征模块；被过滤的轨迹会记录
+`path_efficiency_below_floor` 或 `path_ratio_exceeded` 等原因。普通点击时长使用稳健上界
+采样，保留原始 `max` 以便将来支持显式长按语义。
 
 ## 运行策略
 
@@ -41,7 +48,10 @@ F12 与现有取消标志在每个轨迹点和点击停顿之间检查；坐标�
 vision result or known control rectangle. It affects Fitts-like timing and the bounded
 correction/overshoot envelope, but it is never invented and written back as a training
 measurement. The current Windows hook records coordinates and clicks but not target
-geometry, so training buckets normally use `targetWidth: unknown`.
+geometry, so training buckets normally use `targetWidth: unknown`. If a runtime
+request supplies a width while only an `unknown` training bucket exists, the
+diagnostic is `target_width_wildcard_fallback` and `trained` is false; this is
+not reported as an exact trained match.
 
 ### Retention and diagnostics
 
@@ -68,7 +78,7 @@ bio_type_text("示例文本", #{ mode: "normal" });
 
 ## UI 质量指标
 
-行为页面展示有效轨迹数、移动后点击关联数、各 bucket coverage、丢弃原因和模型质量（不足/可用/良好），并明确标记真实训练数据与运行时 fallback。平均鼠标速度不是主要质量指标。
+行为页面展示有效轨迹数、eligible coverage、移动后点击关联数、各 bucket 样本数/最低要求、丢弃原因和模型质量（不足/可用/良好），并明确标记真实训练数据与运行时 fallback。平均鼠标速度不是主要质量指标。
 
 ## 下一阶段
 

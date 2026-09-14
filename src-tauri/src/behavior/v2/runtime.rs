@@ -440,12 +440,31 @@ pub fn generate_pointer_trajectory_with_policy(
     };
     let seed = context.seed.or(policy.seed).unwrap_or_else(random_seed);
     let mut rng = SeededRng::from_seed(seed);
+    let sparse_exact_bucket = profile
+        .pointer_model
+        .has_sparse_exact_bucket(&key, &profile.model_config);
     let selection = profile
         .pointer_model
         .select_bucket(&key, &profile.model_config);
     let (mut sampled, bucket, fallback_reason, fallback_level, trained, coverage) = match selection
     {
-        Some((bucket, label, reason, fallback_level)) => {
+        Some((bucket, label, mut reason, fallback_level)) => {
+            let mut fallback_level = fallback_level;
+            if sparse_exact_bucket {
+                reason = Some("insufficient_samples_in_exact_bucket".to_string());
+                fallback_level = fallback_level.max(1);
+            }
+            if context.target_width.is_some() && bucket.key.target_width != key.target_width {
+                reason = Some(
+                    if bucket.key.target_width == TargetWidthBucket::Unknown {
+                        "target_width_wildcard_fallback"
+                    } else {
+                        "target_width_bucket_fallback"
+                    }
+                    .to_string(),
+                );
+                fallback_level = fallback_level.max(1);
+            }
             let trained = reason.is_none()
                 && bucket.valid_sample_count >= profile.model_config.min_bucket_samples;
             (
@@ -460,8 +479,15 @@ pub fn generate_pointer_trajectory_with_policy(
         None => (
             fallback_features,
             key.label(),
-            Some("no_trained_bucket".to_string()),
-            u8::MAX,
+            Some(
+                if sparse_exact_bucket {
+                    "insufficient_samples_in_exact_bucket"
+                } else {
+                    "no_trained_bucket"
+                }
+                .to_string(),
+            ),
+            if sparse_exact_bucket { 1 } else { u8::MAX },
             false,
             0.0,
         ),
@@ -664,7 +690,7 @@ pub fn sample_click_plan_with_policy(
     {
         Some((bucket, reason, fallback_level)) => (
             bucket.pre_click_dwell_ms.sample(&mut rng),
-            bucket.hold_ms.sample(&mut rng),
+            bucket.hold_ms.sample_robust(&mut rng),
             bucket.post_click_dwell_ms.sample(&mut rng),
             format!("button={:?}/afterMove={}", button, followed_by_move),
             reason,

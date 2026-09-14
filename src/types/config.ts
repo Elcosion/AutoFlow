@@ -181,6 +181,8 @@ export type PointerBucketModel = {
   validSampleCount: number;
   coverage: number;
   fallbackLevel: number;
+  trainingReady: boolean;
+  trainingFallbackReason?: string;
   exemplars: Array<Record<string, number>>;
   features: Record<string, PointerFeatureSummary>;
 };
@@ -206,8 +208,13 @@ export type BehaviorProfileV2 = {
       validSampleCount: number;
       coverage: number;
       fallbackLevel: number;
+      trainingReady: boolean;
+      trainingFallbackReason?: string;
     }>;
     quality: ModelQuality;
+    eligibleEpisodeCount: number;
+    eligibleCoverage: number;
+    qualityFilteredPointerEpisodeCount: number;
   };
   pointerModel: {
     buckets: PointerBucketModel[];

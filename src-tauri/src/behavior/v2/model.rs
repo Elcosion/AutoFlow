@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use super::events::{ClickEpisode, PointerMoveEpisode, SegmentationConfig};
-use super::features::{extract_pointer_features, PointerFeatures};
+use super::features::{
+    extract_pointer_features, training_quality_rejection_reason, PointerFeatures,
+};
 use super::sampler::SeededRng;
 use super::session::BehaviorSessionV2;
 use super::BEHAVIOR_V2_API_VERSION;
@@ -268,6 +270,16 @@ impl FeatureDistribution {
         (left + (right - left) * local).clamp(self.min.min(self.max), self.min.max(self.max))
     }
 
+    /// Sample an ordinary click duration without allowing one isolated long
+    /// press to dominate the normal-click path. The distribution still keeps
+    /// its p90/max data for inspection and future explicit long-press APIs;
+    /// this robust cap only applies to the current ordinary click sampler.
+    pub fn sample_robust(&self, rng: &mut SeededRng) -> f32 {
+        let interquartile_range = (self.p75 - self.p25).max(0.0);
+        let robust_upper = (self.p75 + 3.0 * interquartile_range).max(self.p90);
+        self.sample(rng).min(robust_upper.max(self.p50))
+    }
+
     pub fn validate(&self, field: &str) -> Result<(), AppError> {
         let values = [
             self.min, self.p10, self.p25, self.p50, self.p75, self.p90, self.max,
@@ -509,7 +521,7 @@ impl PointerModel {
             .buckets
             .iter()
             .filter(|bucket| {
-                bucket.valid_sample_count > 0
+                bucket.valid_sample_count >= config.min_bucket_samples
                     && bucket.key.followed_by_click == key.followed_by_click
             })
             .min_by_key(|bucket| {
@@ -551,21 +563,54 @@ impl PointerModel {
         })
     }
 
+    pub fn has_sparse_exact_bucket(
+        &self,
+        key: &PointerBucket,
+        config: &BehaviorModelConfig,
+    ) -> bool {
+        self.buckets.iter().any(|bucket| {
+            bucket.key == *key && bucket.valid_sample_count < config.min_bucket_samples
+        })
+    }
+
     pub fn quality(&self, config: &BehaviorModelConfig) -> ModelQuality {
-        let below_good_sample_threshold = self.valid_episode_count < config.usable_quality_episodes
-            || (self.valid_episode_count >= config.usable_quality_episodes
-                && self.valid_episode_count < config.good_quality_episodes);
-        if self.valid_episode_count < config.min_quality_episodes || self.buckets.is_empty() {
+        let eligible_episode_count = self.eligible_episode_count(config);
+        let eligible_coverage = if self.valid_episode_count == 0 {
+            0.0
+        } else {
+            eligible_episode_count as f32 / self.valid_episode_count as f32
+        };
+        let has_minimum_samples =
+            self.valid_episode_count >= config.min_quality_episodes && !self.buckets.is_empty();
+        let reaches_usable_samples = self.valid_episode_count >= config.usable_quality_episodes;
+        let reaches_good_samples =
+            reaches_usable_samples && self.valid_episode_count >= config.good_quality_episodes;
+        if !has_minimum_samples {
             ModelQuality::Insufficient
-        } else if below_good_sample_threshold
-            || self
-                .buckets
-                .iter()
-                .any(|bucket| bucket.coverage < config.min_bucket_coverage)
-        {
+        } else if !reaches_good_samples || eligible_coverage < config.min_bucket_coverage {
             ModelQuality::Usable
         } else {
             ModelQuality::Good
+        }
+    }
+
+    /// Count only samples in buckets that have enough observations to be
+    /// trusted. Coverage is intentionally measured across all structurally
+    /// valid pointer episodes, not by the share of any one bucket.
+    pub fn eligible_episode_count(&self, config: &BehaviorModelConfig) -> u32 {
+        self.buckets
+            .iter()
+            .filter(|bucket| bucket.valid_sample_count >= config.min_bucket_samples)
+            .map(|bucket| bucket.valid_sample_count)
+            .sum()
+    }
+
+    pub fn eligible_coverage(&self, config: &BehaviorModelConfig) -> f32 {
+        if self.valid_episode_count == 0 {
+            0.0
+        } else {
+            (self.eligible_episode_count(config) as f32 / self.valid_episode_count as f32)
+                .clamp(0.0, 1.0)
         }
     }
 
@@ -693,6 +738,10 @@ pub struct BucketCoverage {
     pub valid_sample_count: u32,
     pub coverage: f32,
     pub fallback_level: u8,
+    #[serde(default)]
+    pub training_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -708,6 +757,12 @@ pub struct CoverageSummary {
     pub discarded_reasons: HashMap<String, u32>,
     pub bucket_coverage: Vec<BucketCoverage>,
     pub quality: ModelQuality,
+    #[serde(default)]
+    pub eligible_episode_count: u32,
+    #[serde(default)]
+    pub eligible_coverage: f32,
+    #[serde(default)]
+    pub quality_filtered_pointer_episode_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -740,6 +795,36 @@ pub struct BehaviorProfileV2 {
 }
 
 impl BehaviorProfileV2 {
+    pub fn normalize_derived_fields(mut self) -> Self {
+        let config = self.model_config;
+        for bucket in &mut self.pointer_model.buckets {
+            bucket.fallback_level = u8::from(bucket.valid_sample_count < config.min_bucket_samples);
+        }
+        for bucket in &mut self.click_model.buckets {
+            bucket.fallback_level = u8::from(bucket.valid_sample_count < config.min_bucket_samples);
+        }
+        self.coverage.eligible_episode_count = self.pointer_model.eligible_episode_count(&config);
+        self.coverage.eligible_coverage = self.pointer_model.eligible_coverage(&config);
+        self.coverage.quality = self.pointer_model.quality(&config);
+        for coverage in &mut self.coverage.bucket_coverage {
+            if let Some(bucket) = self
+                .pointer_model
+                .buckets
+                .iter()
+                .find(|bucket| bucket.key.label() == coverage.bucket)
+            {
+                coverage.fallback_level = bucket.fallback_level;
+                coverage.training_ready = bucket.valid_sample_count >= config.min_bucket_samples;
+                coverage.training_fallback_reason = if coverage.training_ready {
+                    None
+                } else {
+                    Some("insufficient_samples".to_string())
+                };
+            }
+        }
+        self
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
         if self.id.trim().is_empty() || self.name.trim().is_empty() {
             return Err(AppError::invalid(
@@ -770,7 +855,10 @@ impl BehaviorProfileV2 {
                 "与点击关联的轨迹数不能超过有效轨迹数",
             ));
         }
-        if self.coverage.quality != self.pointer_model.quality(&self.model_config) {
+        if (self.coverage.eligible_episode_count > 0
+            || self.coverage.eligible_coverage > f32::EPSILON)
+            && self.coverage.quality != self.pointer_model.quality(&self.model_config)
+        {
             return Err(AppError::invalid(
                 "behavior_v2_quality_mismatch",
                 "档案质量标记与 PointerModel 不一致",
@@ -824,6 +912,7 @@ pub fn train_behavior_profile_with_retention(
         super::segment::segment_mouse_actions(&session.raw_events, &SegmentationConfig::default())?;
     let mut groups = HashMap::<PointerBucket, Vec<PointerFeatures>>::new();
     let mut valid_pointer_episode_count = 0u32;
+    let mut quality_filtered_pointer_episode_count = 0u32;
     let mut click_associated_pointer_episode_count = 0u32;
     let mut discarded_reasons = HashMap::<String, u32>::new();
     for discarded in &segmentation.discarded_events {
@@ -838,10 +927,15 @@ pub fn train_behavior_profile_with_retention(
                 if episode.followed_by_click {
                     click_associated_pointer_episode_count += 1;
                 }
-                groups
-                    .entry(PointerBucket::for_episode(episode))
-                    .or_default()
-                    .push(features);
+                if let Some(reason) = training_quality_rejection_reason(&features) {
+                    quality_filtered_pointer_episode_count += 1;
+                    *discarded_reasons.entry(reason.to_string()).or_default() += 1;
+                } else {
+                    groups
+                        .entry(PointerBucket::for_episode(episode))
+                        .or_default()
+                        .push(features);
+                }
             }
             Ok(_) | Err(_) => {
                 *discarded_reasons
@@ -856,8 +950,9 @@ pub fn train_behavior_profile_with_retention(
         total_pointer_episode_count,
         valid_pointer_episode_count,
         &groups,
+        &model_config,
     );
-    let click_model = build_click_model(&segmentation.clicks);
+    let click_model = build_click_model(&segmentation.clicks, &model_config);
     let bucket_coverage = pointer_model
         .buckets
         .iter()
@@ -866,6 +961,9 @@ pub fn train_behavior_profile_with_retention(
             valid_sample_count: bucket.valid_sample_count,
             coverage: bucket.coverage,
             fallback_level: bucket.fallback_level,
+            training_ready: bucket.valid_sample_count >= model_config.min_bucket_samples,
+            training_fallback_reason: (bucket.valid_sample_count < model_config.min_bucket_samples)
+                .then(|| "insufficient_samples".to_string()),
         })
         .collect::<Vec<_>>();
     let quality = pointer_model.quality(&model_config);
@@ -887,6 +985,9 @@ pub fn train_behavior_profile_with_retention(
             discarded_reasons,
             bucket_coverage,
             quality,
+            eligible_episode_count: pointer_model.eligible_episode_count(&model_config),
+            eligible_coverage: pointer_model.eligible_coverage(&model_config),
+            quality_filtered_pointer_episode_count,
         },
         pointer_model,
         click_model,
@@ -901,6 +1002,7 @@ fn build_pointer_model(
     total_episode_count: u32,
     valid_episode_count: u32,
     groups: &HashMap<PointerBucket, Vec<PointerFeatures>>,
+    config: &BehaviorModelConfig,
 ) -> PointerModel {
     let mut entries = groups.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(bucket, _)| bucket.label());
@@ -918,10 +1020,10 @@ fn build_pointer_model(
                 features: PointerFeatureDistributions::from_features(features)?,
                 exemplars: features
                     .iter()
-                    .take(DEFAULT_MAX_EXEMPLARS_PER_BUCKET)
+                    .take(config.max_exemplars_per_bucket)
                     .copied()
                     .collect(),
-                fallback_level: 0,
+                fallback_level: u8::from(features.len() < config.min_bucket_samples as usize),
             })
         })
         .collect();
@@ -933,7 +1035,7 @@ fn build_pointer_model(
     }
 }
 
-fn build_click_model(clicks: &[ClickEpisode]) -> ClickModel {
+fn build_click_model(clicks: &[ClickEpisode], config: &BehaviorModelConfig) -> ClickModel {
     let mut groups = HashMap::<(MouseButton, bool), Vec<&ClickEpisode>>::new();
     for click in clicks {
         groups
@@ -964,7 +1066,7 @@ fn build_click_model(clicks: &[ClickEpisode]) -> ClickModel {
                         .map(|value| value.post_click_dwell_ms as f32)
                         .collect(),
                 )?,
-                fallback_level: 0,
+                fallback_level: u8::from(values.len() < config.min_bucket_samples as usize),
             })
         })
         .collect();

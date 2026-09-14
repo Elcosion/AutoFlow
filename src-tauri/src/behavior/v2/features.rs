@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 use super::events::PointerMoveEpisode;
 use super::validation::validate_finite;
 
+// Training-quality floors are deliberately broad: normal curves, small
+// corrections, and reasonable overshoot remain valid, while a trajectory
+// that spends most of its path circling instead of approaching its endpoint
+// cannot become a reusable move-to exemplar.
+pub const MIN_TRAINING_PATH_EFFICIENCY: f32 = 0.20;
+pub const MAX_TRAINING_PATH_RATIO: f32 = 8.0;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PointerFeatures {
@@ -200,6 +207,26 @@ pub fn extract_pointer_features(episode: &PointerMoveEpisode) -> Result<PointerF
     }
     let _ = peak_index;
     Ok(features)
+}
+
+/// Return a stable, explainable reason when a finite episode is unsafe as a
+/// reusable training exemplar. This is intentionally separate from feature
+/// extraction so structural validity and model quality remain distinguishable.
+pub fn training_quality_rejection_reason(features: &PointerFeatures) -> Option<&'static str> {
+    if !features.finite() {
+        return Some("feature_non_finite");
+    }
+    if features.distance_px <= f32::EPSILON {
+        return Some("direct_distance_zero");
+    }
+    let path_ratio = features.path_length_px / features.distance_px;
+    if !path_ratio.is_finite() || path_ratio > MAX_TRAINING_PATH_RATIO {
+        return Some("path_ratio_exceeded");
+    }
+    if features.path_efficiency < MIN_TRAINING_PATH_EFFICIENCY {
+        return Some("path_efficiency_below_floor");
+    }
+    None
 }
 
 fn point_line_distance(

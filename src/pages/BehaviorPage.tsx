@@ -2,6 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { PageHeader } from "../components/PageHeader";
 import { toErrorMessage, useAppConfig } from "../lib/config";
 import {
+  getBehaviorQualityView,
+  getBucketTrainingView,
+  getTargetWidthTrainingView,
+} from "../lib/behaviorView";
+import {
   deleteBehaviorProfileV2,
   deleteBehaviorSessionV2,
   exportBehaviorProfileV2,
@@ -86,6 +91,12 @@ export function BehaviorPage() {
       null,
     [config.behaviorProfilesV2, selectedId],
   );
+  const qualityView = selectedProfile
+    ? getBehaviorQualityView(selectedProfile)
+    : null;
+  const targetWidthView = selectedProfile
+    ? getTargetWidthTrainingView(selectedProfile)
+    : null;
 
   const showNotice = (message: string) => {
     setNotice(message);
@@ -443,12 +454,33 @@ export function BehaviorPage() {
           <p className="form-help">
             模型阈值：每个 bucket 至少 {selectedProfile.modelConfig.minBucketSamples} 个样本；质量等级按 {selectedProfile.modelConfig.minQualityEpisodes}/{selectedProfile.modelConfig.usableQualityEpisodes}/{selectedProfile.modelConfig.goodQualityEpisodes} 条有效轨迹计算。运行时 fallbackLevel 与 fallbackReason 只反映请求上下文，不会伪装成训练覆盖率。
           </p>
+          {qualityView ? (
+            <p className="form-help">
+              充足样本覆盖：{qualityView.eligibleEpisodeCount}/{qualityView.validEpisodeCount} 条（{Math.round(qualityView.eligibleCoverage * 1000) / 10}%）；质量过滤轨迹：{selectedProfile.coverage.qualityFilteredPointerEpisodeCount} 条。
+            </p>
+          ) : null}
+          {targetWidthView ? (
+            <p className="form-help">
+              {targetWidthView.message}。Profile 中不从屏幕尺寸、坐标或位移推测目标宽度。
+            </p>
+          ) : null}
           <div className="behavior-profile-list">
             <div className="behavior-list-heading"><strong>Bucket coverage</strong><span>运行时默认回退不会计入训练覆盖率</span></div>
             {selectedProfile.coverage.bucketCoverage.map((bucket) => (
               <div className="behavior-profile-row" key={bucket.bucket}>
                 <strong>{bucket.bucket}</strong>
-                <span>{bucket.validSampleCount} 条有效样本 · {Math.round(bucket.coverage * 100)}% coverage · 训练 fallbackLevel {bucket.fallbackLevel}</span>
+                {(() => {
+                  const training = getBucketTrainingView(
+                    bucket.validSampleCount,
+                    selectedProfile.modelConfig.minBucketSamples,
+                  );
+                  return (
+                    <span>
+                      {training.sampleCount}/{training.minimumSamples} 条样本 · {training.ready ? "样本充足" : "样本不足"} · {Math.round(bucket.coverage * 100)}% coverage · 预计{training.expectedFallback ? "需要" : "不需要"} fallback
+                      {training.fallbackReason ? ` · 原因：${training.fallbackReason}` : ""}
+                    </span>
+                  );
+                })()}
               </div>
             ))}
           </div>
@@ -457,7 +489,18 @@ export function BehaviorPage() {
             {selectedProfile.clickModel.buckets.map((bucket) => (
               <div className="behavior-profile-row" key={`${bucket.button}-${bucket.followedByMove}`}>
                 <strong>{bucket.button} · afterMove={bucket.followedByMove ? "true" : "false"}</strong>
-                <span>{bucket.validSampleCount} 条有效样本 · 训练 fallbackLevel {bucket.fallbackLevel}</span>
+                {(() => {
+                  const training = getBucketTrainingView(
+                    bucket.validSampleCount,
+                    selectedProfile.modelConfig.minBucketSamples,
+                  );
+                  return (
+                    <span>
+                      {training.sampleCount}/{training.minimumSamples} 条样本 · {training.ready ? "样本充足" : "样本不足"} · 预计{training.expectedFallback ? "需要" : "不需要"} fallback
+                      {training.fallbackReason ? ` · 原因：${training.fallbackReason}` : ""}
+                    </span>
+                  );
+                })()}
               </div>
             ))}
           </div>
