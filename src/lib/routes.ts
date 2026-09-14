@@ -5,6 +5,7 @@ const routeIds: RouteId[] = [
   "hotkeys",
   "text-expansion",
   "macros",
+  "behavior",
   "settings",
 ];
 

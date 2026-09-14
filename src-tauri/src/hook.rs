@@ -1,4 +1,9 @@
 use crate::automation::VisionService;
+use crate::behavior::v2::{BehaviorPolicy, BehaviorRuntimeV2};
+use crate::behavior::{
+    BehaviorProfile, BehaviorRecorder, BehaviorRecordingResult, BehaviorRecordingStatus,
+    BiomimeticInput, BiomimeticRuntime, DelayKind,
+};
 #[cfg(windows)]
 use crate::rhai_runtime::{
     run_rhai_script, validate_rhai_source, AutomationInput, ExecutionContext,
@@ -164,6 +169,53 @@ impl HookService {
         ))
     }
 
+    pub fn start_behavior_recording(&self, name: String) -> Result<(), AppError> {
+        #[cfg(windows)]
+        {
+            self.shared.start_behavior_recording(&name)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            Err(AppError::invalid(
+                "recording_unsupported",
+                "行为录制目前只支持 Windows 桌面端",
+            ))
+        }
+    }
+
+    pub fn stop_behavior_recording(&self) -> Result<BehaviorRecordingResult, AppError> {
+        #[cfg(windows)]
+        {
+            self.shared.stop_behavior_recording()
+        }
+        #[cfg(not(windows))]
+        Err(AppError::invalid(
+            "recording_unsupported",
+            "行为录制目前只支持 Windows 桌面端",
+        ))
+    }
+
+    pub fn behavior_recording_status(&self) -> BehaviorRecordingStatus {
+        #[cfg(windows)]
+        {
+            self.shared.behavior_recording_status()
+        }
+        #[cfg(not(windows))]
+        BehaviorRecordingStatus {
+            active: false,
+            capture_started: false,
+            duration_ms: 0,
+            event_count: 0,
+            keyboard_events: 0,
+            mouse_events: 0,
+            wheel_events: 0,
+            capped: false,
+            persisting_raw_session: false,
+            session_name: None,
+        }
+    }
+
     pub fn play_macro(&self, macro_rule: MacroRule) -> Result<(), AppError> {
         #[cfg(windows)]
         {
@@ -260,6 +312,8 @@ struct HookShared {
     #[cfg(windows)]
     recorder: Mutex<RecorderState>,
     #[cfg(windows)]
+    behavior: Mutex<BehaviorRecorder>,
+    #[cfg(windows)]
     playback: Mutex<PlaybackState>,
     #[cfg(windows)]
     thread_id: AtomicU32,
@@ -285,6 +339,8 @@ impl HookShared {
             #[cfg(windows)]
             recorder: Mutex::new(RecorderState::default()),
             #[cfg(windows)]
+            behavior: Mutex::new(BehaviorRecorder::default()),
+            #[cfg(windows)]
             playback: Mutex::new(PlaybackState::default()),
             #[cfg(windows)]
             thread_id: AtomicU32::new(0),
@@ -298,6 +354,9 @@ impl HookShared {
     #[cfg(windows)]
     fn clear_transient_state(&self) {
         self.stop_playback();
+        if let Ok(mut behavior) = self.behavior.lock() {
+            behavior.reset();
+        }
         if let Ok(mut recorder) = self.recorder.lock() {
             recorder.active = false;
             recorder.capture_started = false;
@@ -372,6 +431,96 @@ impl HookShared {
             recorder.capture_mouse_clicks = capture_mouse_clicks;
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn start_behavior_recording(&self, name: &str) -> Result<(), AppError> {
+        if self.is_playback_running() {
+            return Err(AppError::invalid(
+                "macro_busy",
+                "宏正在运行，请先停止播放后再开始行为训练",
+            ));
+        }
+        if self.is_recording() {
+            return Err(AppError::invalid(
+                "recording_busy",
+                "图形宏录制正在进行中，请先停止后再开始行为训练",
+            ));
+        }
+        let persist_raw_session = self
+            .config
+            .lock()
+            .map_err(|_| AppError::internal("配置状态异常，请重启 AutoFlow"))?
+            .retain_behavior_records;
+        let mut behavior = self
+            .behavior
+            .lock()
+            .map_err(|_| AppError::internal("行为录制器状态异常，请重启 AutoFlow"))?;
+        behavior.start(name, persist_raw_session)
+    }
+
+    #[cfg(windows)]
+    fn stop_behavior_recording(&self) -> Result<BehaviorRecordingResult, AppError> {
+        let mut behavior = self
+            .behavior
+            .lock()
+            .map_err(|_| AppError::internal("行为录制器状态异常，请重启 AutoFlow"))?;
+        behavior.stop()
+    }
+
+    #[cfg(windows)]
+    fn behavior_recording_status(&self) -> BehaviorRecordingStatus {
+        self.behavior
+            .lock()
+            .map(|behavior| behavior.status())
+            .unwrap_or(BehaviorRecordingStatus {
+                active: false,
+                capture_started: false,
+                duration_ms: 0,
+                event_count: 0,
+                keyboard_events: 0,
+                mouse_events: 0,
+                wheel_events: 0,
+                capped: false,
+                persisting_raw_session: false,
+                session_name: None,
+            })
+    }
+
+    #[cfg(windows)]
+    fn is_behavior_recording(&self) -> bool {
+        self.behavior
+            .lock()
+            .map(|behavior| behavior.status().active)
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    fn record_behavior_key(&self, vk: u32, scan_code: u32, is_down: bool) {
+        if let Ok(mut behavior) = self.behavior.lock() {
+            behavior.record_key(vk, scan_code, is_down);
+        }
+    }
+
+    #[cfg(windows)]
+    fn record_behavior_mouse_move(&self, x: i32, y: i32) {
+        if let Ok(mut behavior) = self.behavior.lock() {
+            behavior.record_mouse_move(x, y);
+        }
+    }
+
+    #[cfg(windows)]
+    fn record_behavior_mouse_button(&self, button: MouseButton, is_down: bool, x: i32, y: i32) {
+        if let Ok(mut behavior) = self.behavior.lock() {
+            behavior.record_mouse_button(mouse_button_id(button), is_down, x, y);
+        }
+    }
+
+    #[cfg(windows)]
+    fn record_behavior_wheel(&self, delta_x: i32, delta_y: i32, x: i32, y: i32) {
+        if let Ok(mut behavior) = self.behavior.lock() {
+            behavior.record_wheel(delta_x, delta_y, x, y);
+        }
     }
 
     #[cfg(windows)]
@@ -510,6 +659,12 @@ impl HookShared {
 
     #[cfg(windows)]
     fn start_playback(self: &Arc<Self>, macro_rule: MacroRule) -> Result<(), AppError> {
+        if self.is_behavior_recording() {
+            return Err(AppError::invalid(
+                "behavior_recording_active",
+                "行为训练录制进行中，请先停止录制后再播放宏",
+            ));
+        }
         let macro_rule = normalize_playback_rule(macro_rule);
         let total_steps = macro_rule.macro_steps().map_or(0, |steps| steps.len());
         if total_steps == 0 && matches!(&macro_rule.program, AutomationProgram::Macro { .. }) {
@@ -589,6 +744,101 @@ impl HookShared {
                 stop.store(true, Ordering::SeqCst);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    fn behavior_runtime(&self) -> Result<Option<Arc<Mutex<BiomimeticRuntime>>>, String> {
+        let config = self.config.lock().map_err(|_| "配置状态异常".to_string())?;
+        if !config.biomimetic_enabled {
+            return Ok(None);
+        }
+        if !config.selected_biomimetic_input_ids.is_empty() {
+            let inputs = config
+                .selected_biomimetic_input_ids
+                .iter()
+                .filter_map(|input_id| {
+                    config
+                        .biomimetic_inputs
+                        .iter()
+                        .find(|input| input.id == *input_id)
+                        .cloned()
+                })
+                .collect::<Vec<BiomimeticInput>>();
+            if inputs.len() != config.selected_biomimetic_input_ids.len() {
+                return Err("当前选中的仿生输入文件不存在".to_string());
+            }
+            return BiomimeticRuntime::from_inputs(&inputs, config.biomimetic_intensity)
+                .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
+                .map_err(|error| error.message);
+        }
+        let selected_ids = if config.selected_behavior_profile_ids.is_empty() {
+            config
+                .active_behavior_profile_id
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            config.selected_behavior_profile_ids.clone()
+        };
+        if selected_ids.is_empty() {
+            return Ok(None);
+        }
+        let profiles = selected_ids
+            .iter()
+            .filter_map(|profile_id| {
+                config
+                    .behavior_profiles
+                    .iter()
+                    .find(|profile| profile.id == *profile_id)
+                    .cloned()
+            })
+            .collect::<Vec<BehaviorProfile>>();
+        if profiles.len() != selected_ids.len() {
+            return Err("当前选中的仿生行为档案不存在".to_string());
+        }
+        BiomimeticRuntime::from_profiles(&profiles, config.biomimetic_intensity)
+            .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
+            .map_err(|error| error.message)
+    }
+
+    #[cfg(windows)]
+    fn behavior_runtime_v2(
+        &self,
+        macro_rule: &MacroRule,
+    ) -> Result<Option<Arc<Mutex<BehaviorRuntimeV2>>>, String> {
+        let config = self
+            .config
+            .lock()
+            .map_err(|_| "行为配置状态异常".to_string())?;
+        let mut policy = macro_rule
+            .behavior_policy
+            .clone()
+            .unwrap_or_else(|| config.behavior_policy.clone());
+        if macro_rule.behavior_policy.is_none() && !policy.enabled && config.biomimetic_enabled {
+            policy = BehaviorPolicy::from_legacy(
+                true,
+                config.biomimetic_intensity,
+                config.active_behavior_profile_v2_id.clone(),
+            );
+        }
+        if !policy.enabled {
+            return Ok(None);
+        }
+        let profile_id = policy
+            .profile_id
+            .clone()
+            .or_else(|| config.active_behavior_profile_v2_id.clone())
+            .ok_or_else(|| "行为策略未绑定 V2 行为档案".to_string())?;
+        let profile = config
+            .behavior_profiles_v2
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| "行为策略绑定的 V2 行为档案不存在".to_string())?;
+        BehaviorRuntimeV2::new(profile, policy)
+            .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
+            .map_err(|error| error.message)
     }
 }
 
@@ -839,6 +1089,10 @@ unsafe extern "system" fn keyboard_hook(
         return LRESULT(1);
     }
 
+    if behavior_input_is_allowed(shared) {
+        shared.record_behavior_key(vk, info.scanCode, is_down);
+    }
+
     if shared.is_recording() && is_focus_switch_key(vk, &pressed) {
         discard_focus_switch_steps(shared);
         return CallNextHookEx(None, code, message, data);
@@ -988,7 +1242,8 @@ unsafe extern "system" fn mouse_hook(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
     };
 
     if code < 0 || data.0 == 0 {
@@ -1004,6 +1259,30 @@ unsafe extern "system" fn mouse_hook(
     let message_id = message.0 as u32;
     let x = info.pt.x;
     let y = info.pt.y;
+    if behavior_mouse_input_is_allowed(shared, x, y) {
+        match message_id {
+            WM_MOUSEMOVE => shared.record_behavior_mouse_move(x, y),
+            WM_LBUTTONDOWN => shared.record_behavior_mouse_button(MouseButton::Left, true, x, y),
+            WM_LBUTTONUP => shared.record_behavior_mouse_button(MouseButton::Left, false, x, y),
+            WM_RBUTTONDOWN => shared.record_behavior_mouse_button(MouseButton::Right, true, x, y),
+            WM_RBUTTONUP => shared.record_behavior_mouse_button(MouseButton::Right, false, x, y),
+            WM_MBUTTONDOWN => shared.record_behavior_mouse_button(MouseButton::Middle, true, x, y),
+            WM_MBUTTONUP => shared.record_behavior_mouse_button(MouseButton::Middle, false, x, y),
+            WM_XBUTTONDOWN => {
+                shared.record_behavior_mouse_button(x_button(info.mouseData), true, x, y)
+            }
+            WM_XBUTTONUP => {
+                shared.record_behavior_mouse_button(x_button(info.mouseData), false, x, y)
+            }
+            WM_MOUSEWHEEL => {
+                shared.record_behavior_wheel(0, i32::from((info.mouseData >> 16) as i16), x, y)
+            }
+            WM_MOUSEHWHEEL => {
+                shared.record_behavior_wheel(i32::from((info.mouseData >> 16) as i16), 0, x, y)
+            }
+            _ => {}
+        }
+    }
     if shared.is_recording() && is_own_process_at_point(x, y) && is_mouse_button_message(message_id)
     {
         // A click on AutoFlow is the UI stop action. Remove the cursor path
@@ -1041,6 +1320,7 @@ unsafe extern "system" fn mouse_hook(
         }
         WM_XBUTTONUP => record_mouse_button(shared, x_button(info.mouseData), KeyAction::Up, x, y),
         WM_MOUSEWHEEL => record_mouse_wheel(shared, 0, i32::from((info.mouseData >> 16) as i16)),
+        WM_MOUSEHWHEEL => record_mouse_wheel(shared, i32::from((info.mouseData >> 16) as i16), 0),
         _ => {}
     }
     CallNextHookEx(None, code, message, data)
@@ -1052,6 +1332,17 @@ fn x_button(mouse_data: u32) -> MouseButton {
         MouseButton::X1
     } else {
         MouseButton::X2
+    }
+}
+
+#[cfg(windows)]
+fn mouse_button_id(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Right => 2,
+        MouseButton::Middle => 3,
+        MouseButton::X1 => 4,
+        MouseButton::X2 => 5,
     }
 }
 
@@ -1255,6 +1546,16 @@ fn recording_input_is_allowed(shared: &HookShared) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(windows)]
+fn behavior_input_is_allowed(shared: &HookShared) -> bool {
+    shared.is_behavior_recording() && !is_own_process_foreground()
+}
+
+#[cfg(windows)]
+fn behavior_mouse_input_is_allowed(shared: &HookShared, x: i32, y: i32) -> bool {
+    behavior_input_is_allowed(shared) && !is_own_process_at_point(x, y)
 }
 
 #[cfg(windows)]
@@ -1735,6 +2036,7 @@ fn play_macro_thread(
     macro_rule: &MacroRule,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let behavior = shared.behavior_runtime_v2(macro_rule)?;
     let max_iterations = match macro_rule.mode {
         MacroMode::Once => Some(1),
         MacroMode::Repeat => Some(macro_rule.repeat_count.max(1)),
@@ -1755,6 +2057,7 @@ fn play_macro_thread(
             stop,
             &mut held_keys,
             &mut held_buttons,
+            behavior.clone(),
         )? {
             break;
         }
@@ -1774,11 +2077,252 @@ fn play_macro_thread(
 }
 
 #[cfg(windows)]
-struct WindowsAutomationInput;
+struct WindowsAutomationInput {
+    behavior: Option<Arc<Mutex<BehaviorRuntimeV2>>>,
+    cursor: Mutex<Option<(i32, i32)>>,
+}
+
+#[cfg(windows)]
+impl WindowsAutomationInput {
+    fn new(behavior: Option<Arc<Mutex<BehaviorRuntimeV2>>>) -> Self {
+        Self {
+            behavior,
+            cursor: Mutex::new(current_cursor_position()),
+        }
+    }
+
+    fn human_pause(&self, kind: DelayKind) {
+        let Some(behavior) = &self.behavior else {
+            return;
+        };
+        let delay = behavior
+            .lock()
+            .map(|mut runtime| runtime.adjust_delay_ms(0, kind))
+            .unwrap_or(0);
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
+    }
+
+    fn move_to_raw_with_cancel(
+        &self,
+        x: i32,
+        y: i32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err("脚本已被 F12 停止".to_string());
+        }
+        send_mouse_move(x, y)?;
+        if let Ok(mut cursor) = self.cursor.lock() {
+            *cursor = Some((x, y));
+        }
+        Ok(())
+    }
+
+    fn move_to_with_cancel(
+        &self,
+        x: i32,
+        y: i32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        let start = self.cursor.lock().ok().and_then(|cursor| *cursor);
+        let Some(behavior) = &self.behavior else {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
+                return Err("脚本已被 F12 停止".to_string());
+            }
+            send_mouse_move(x, y)?;
+            if let Ok(mut cursor) = self.cursor.lock() {
+                *cursor = Some((x, y));
+            }
+            return Ok(());
+        };
+        let points = behavior
+            .lock()
+            .map_err(|_| "仿生运行时状态异常".to_string())?
+            .plan_mouse_move(start.unwrap_or((x, y)), (x, y));
+        for point in points {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
+                return Err("脚本已被 F12 停止".to_string());
+            }
+            send_mouse_move(point.x, point.y)?;
+            if point.delay_ms > 0 {
+                if let Some(cancel) = cancel {
+                    if !sleep_interruptible(point.delay_ms as f32, cancel) {
+                        return Err("脚本已被 F12 停止".to_string());
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(point.delay_ms));
+                }
+            }
+        }
+        if let Ok(mut cursor) = self.cursor.lock() {
+            *cursor = Some((x, y));
+        }
+        Ok(())
+    }
+
+    fn execute_pointer_trajectory(
+        &self,
+        trajectory: crate::behavior::v2::PointerTrajectory,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        for point in &trajectory.points {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("脚本已被 F12 停止".to_string());
+            }
+            send_mouse_move(point.x, point.y)?;
+            if point.delay_ms > 0 && !sleep_interruptible(point.delay_ms as f32, cancel) {
+                return Err("脚本已被 F12 停止".to_string());
+            }
+        }
+        if let Some(last) = trajectory.points.last() {
+            if let Ok(mut cursor) = self.cursor.lock() {
+                *cursor = Some((last.x, last.y));
+            }
+        }
+        Ok(())
+    }
+
+    fn bio_move_to_with_cancel(
+        &self,
+        x: i32,
+        y: i32,
+        target_width: Option<f32>,
+        followed_by_click: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("脚本已被 F12 停止".to_string());
+        }
+        let Some(behavior) = &self.behavior else {
+            return self.move_to_raw_with_cancel(x, y, Some(cancel));
+        };
+        let start = self.cursor.lock().ok().and_then(|cursor| *cursor);
+        let Some(start) = start else {
+            return self.move_to_raw_with_cancel(x, y, Some(cancel));
+        };
+        let mut runtime = behavior
+            .lock()
+            .map_err(|_| "V2 仿生运行时状态异常".to_string())?;
+        if !runtime.applies_pointer_behavior() {
+            drop(runtime);
+            return self.move_to_raw_with_cancel(x, y, Some(cancel));
+        }
+        let trajectory = runtime
+            .pointer_trajectory(start, (x, y), target_width, followed_by_click, Some(cancel))
+            .map_err(|error| error.message)?;
+        if let Some(diagnostic) = trajectory.diagnostic.as_ref() {
+            log::debug!(
+                "behavior_v2 pointer action={} seed={} action_seed={} bucket={} trained={} fallback_level={} reason={:?} movement_ms={:?} target_width={:?} time_to_peak={:?} path_efficiency={:?} overshoot_enabled={} correction_enabled={}",
+                diagnostic.action_index,
+                diagnostic.runtime_seed,
+                diagnostic.action_seed,
+                diagnostic.bucket,
+                diagnostic.trained,
+                diagnostic.fallback_level,
+                diagnostic.fallback_reason,
+                diagnostic.movement_time_ms,
+                diagnostic.target_width,
+                diagnostic.time_to_peak_ratio,
+                diagnostic.path_efficiency,
+                diagnostic.overshoot_enabled,
+                diagnostic.correction_enabled,
+            );
+        }
+        self.execute_pointer_trajectory(trajectory, cancel)
+    }
+
+    fn bio_click_with_cancel(
+        &self,
+        button: &str,
+        x: i32,
+        y: i32,
+        target_width: Option<f32>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let button = parse_mouse_button(button)?;
+        let Some(behavior) = &self.behavior else {
+            self.move_to_with_cancel(x, y, Some(cancel))?;
+            send_mouse_button(button, KeyAction::Down)?;
+            if !sleep_interruptible(1.0, cancel) {
+                return Err("脚本已被 F12 停止".to_string());
+            }
+            return send_mouse_button(button, KeyAction::Up);
+        };
+        let applies_behavior = behavior
+            .lock()
+            .map_err(|_| "V2 仿生运行时状态异常".to_string())?
+            .applies_behavior();
+        if !applies_behavior {
+            self.move_to_raw_with_cancel(x, y, Some(cancel))?;
+            send_mouse_button(button, KeyAction::Down)?;
+            return send_mouse_button(button, KeyAction::Up);
+        }
+        self.bio_move_to_with_cancel(x, y, target_width, true, cancel)?;
+        let plan = behavior
+            .lock()
+            .map_err(|_| "V2 仿生运行时状态异常".to_string())?
+            .click_plan(button, true, Some(cancel))
+            .map_err(|error| error.message)?;
+        if let Some(diagnostic) = plan.diagnostic.as_ref() {
+            log::debug!(
+                "behavior_v2 click action={} seed={} action_seed={} bucket={} trained={} coverage={} fallback_level={} reason={:?} pre_ms={} hold_ms={} post_ms={}",
+                diagnostic.action_index,
+                diagnostic.runtime_seed,
+                diagnostic.action_seed,
+                diagnostic.bucket,
+                diagnostic.trained,
+                diagnostic.coverage,
+                diagnostic.fallback_level,
+                diagnostic.fallback_reason,
+                plan.pre_click_dwell_ms,
+                plan.hold_ms,
+                plan.post_click_dwell_ms,
+            );
+        }
+        if !sleep_interruptible(plan.pre_click_dwell_ms as f32, cancel) {
+            return Err("脚本已被 F12 停止".to_string());
+        }
+        send_mouse_button(button, KeyAction::Down)?;
+        if !sleep_interruptible(plan.hold_ms as f32, cancel) {
+            let _ = send_mouse_button(button, KeyAction::Up);
+            return Err("脚本已被 F12 停止".to_string());
+        }
+        send_mouse_button(button, KeyAction::Up)?;
+        if !sleep_interruptible(plan.post_click_dwell_ms as f32, cancel) {
+            return Err("脚本已被 F12 停止".to_string());
+        }
+        Ok(())
+    }
+
+    fn type_text_with_cancel(&self, text: &str, cancel: Option<&AtomicBool>) -> Result<(), String> {
+        if self.behavior.is_none() {
+            return send_unicode_text(text);
+        }
+        for character in text.chars() {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
+                return Err("脚本已被 F12 停止".to_string());
+            }
+            send_unicode_text(&character.to_string())?;
+            self.human_pause(DelayKind::KeyInterval);
+        }
+        Ok(())
+    }
+}
 
 #[cfg(windows)]
 impl AutomationInput for WindowsAutomationInput {
     fn wait_ms(&self, milliseconds: u64, speed: f32, cancel: &AtomicBool) -> Result<(), String> {
+        let milliseconds =
+            self.behavior
+                .as_ref()
+                .and_then(|behavior| {
+                    behavior.lock().ok().map(|mut runtime| {
+                        runtime.adjust_delay_ms(milliseconds, DelayKind::General)
+                    })
+                })
+                .unwrap_or(milliseconds);
         if sleep_interruptible(milliseconds as f32 / speed.max(0.05), cancel) {
             Ok(())
         } else {
@@ -1798,38 +2342,74 @@ impl AutomationInput for WindowsAutomationInput {
 
     fn key_down(&self, key: &str) -> Result<(), String> {
         let vk = key_to_vk(key).ok_or_else(|| format!("未知按键：{key}"))?;
+        self.human_pause(DelayKind::KeyInterval);
         send_key(vk, true)
     }
 
     fn key_up(&self, key: &str) -> Result<(), String> {
         let vk = key_to_vk(key).ok_or_else(|| format!("未知按键：{key}"))?;
+        self.human_pause(DelayKind::KeyHold);
         send_key(vk, false)
     }
 
     fn move_to(&self, x: i32, y: i32) -> Result<(), String> {
-        send_mouse_move(x, y)
+        self.move_to_raw_with_cancel(x, y, None)
+    }
+
+    fn click(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
+        if x != 0 || y != 0 {
+            self.move_to(x, y)?;
+        }
+        let button = parse_mouse_button(button)?;
+        send_mouse_button(button, KeyAction::Down)?;
+        send_mouse_button(button, KeyAction::Up)
+    }
+
+    fn bio_move_to(
+        &self,
+        x: i32,
+        y: i32,
+        target_width: Option<f32>,
+        followed_by_click: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.bio_move_to_with_cancel(x, y, target_width, followed_by_click, cancel)
+    }
+
+    fn bio_click(
+        &self,
+        button: &str,
+        x: i32,
+        y: i32,
+        target_width: Option<f32>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.bio_click_with_cancel(button, x, y, target_width, cancel)
     }
 
     fn mouse_down(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
         if x != 0 || y != 0 {
-            send_mouse_move(x, y)?;
+            self.move_to(x, y)?;
         }
+        self.human_pause(DelayKind::ClickInterval);
         send_mouse_button(parse_mouse_button(button)?, KeyAction::Down)
     }
 
     fn mouse_up(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
         if x != 0 || y != 0 {
-            send_mouse_move(x, y)?;
+            self.move_to(x, y)?;
         }
+        self.human_pause(DelayKind::ClickHold);
         send_mouse_button(parse_mouse_button(button)?, KeyAction::Up)
     }
 
     fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
+        self.human_pause(DelayKind::MousePause);
         send_mouse_wheel(delta_x, delta_y)
     }
 
     fn type_text(&self, text: &str) -> Result<(), String> {
-        send_unicode_text(text)
+        self.type_text_with_cancel(text, None)
     }
 }
 
@@ -1846,6 +2426,26 @@ fn parse_mouse_button(button: &str) -> Result<MouseButton, String> {
 }
 
 #[cfg(windows)]
+fn mouse_button_name(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+        MouseButton::X1 => "x1",
+        MouseButton::X2 => "x2",
+    }
+}
+
+#[cfg(windows)]
+fn current_cursor_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point).is_ok() }.then_some((point.x, point.y))
+}
+
+#[cfg(windows)]
 fn play_automation_program(
     shared: &Arc<HookShared>,
     macro_rule: &MacroRule,
@@ -1853,13 +2453,20 @@ fn play_automation_program(
     stop: &Arc<AtomicBool>,
     held_keys: &mut HashSet<u32>,
     held_buttons: &mut HashSet<MouseButton>,
+    behavior: Option<Arc<Mutex<BehaviorRuntimeV2>>>,
 ) -> Result<bool, String> {
     match &macro_rule.program {
-        AutomationProgram::Macro { steps } => {
-            play_macro_steps(shared, steps, speed, stop, held_keys, held_buttons)
-        }
+        AutomationProgram::Macro { steps } => play_macro_steps(
+            shared,
+            steps,
+            speed,
+            stop,
+            held_keys,
+            held_buttons,
+            behavior,
+        ),
         AutomationProgram::Rhai { source, .. } => {
-            let input: Arc<dyn AutomationInput> = Arc::new(WindowsAutomationInput);
+            let input: Arc<dyn AutomationInput> = Arc::new(WindowsAutomationInput::new(behavior));
             let vision = shared
                 .vision
                 .lock()
@@ -1895,20 +2502,40 @@ fn play_macro_steps(
     stop: &Arc<AtomicBool>,
     held_keys: &mut HashSet<u32>,
     held_buttons: &mut HashSet<MouseButton>,
+    behavior: Option<Arc<Mutex<BehaviorRuntimeV2>>>,
 ) -> Result<bool, String> {
     let speed = speed.max(0.05);
-    for (index, step) in steps.iter().enumerate() {
+    let input = WindowsAutomationInput::new(behavior);
+    let mut index = 0usize;
+    while index < steps.len() {
         if stop.load(Ordering::SeqCst) {
             return Ok(false);
         }
+
+        if input.behavior.is_some() {
+            if let Some((button, x, y)) = combinable_click_at(steps, index, held_buttons) {
+                shared.set_playback_step(index + 1);
+                input.bio_click_with_cancel(mouse_button_name(button), x, y, None, stop)?;
+                // Keep progress aligned with the original three recorded
+                // steps even though V2 executes them as one action.
+                shared.set_playback_step(index + 3);
+                index += 3;
+                continue;
+            }
+        }
+
         shared.set_playback_step(index + 1);
+        let step = &steps[index];
         match step {
             MacroStep::Delay {
                 duration_ms,
                 duration_max_ms,
             } => {
-                let delay = randomized_delay_ms(*duration_ms, *duration_max_ms);
-                if !sleep_interruptible(delay as f32 / speed, stop) {
+                let result = match duration_max_ms {
+                    Some(maximum) => input.wait_random_ms(*duration_ms, *maximum, speed, stop),
+                    None => input.wait_ms(*duration_ms, speed, stop),
+                };
+                if result.is_err() {
                     return Ok(false);
                 }
             }
@@ -1916,7 +2543,11 @@ fn play_macro_steps(
                 let Some(vk) = key_to_vk(key) else {
                     return Err(format!("第 {} 步的按键“{}”暂不支持", index + 1, key));
                 };
-                send_key(vk, matches!(action, KeyAction::Down))?;
+                if matches!(action, KeyAction::Down) {
+                    input.key_down(key)?;
+                } else {
+                    input.key_up(key)?;
+                }
                 if matches!(action, KeyAction::Down) {
                     held_keys.insert(vk);
                 } else {
@@ -1929,22 +2560,86 @@ fn play_macro_steps(
                 x,
                 y,
             } => {
-                if *x != 0 || *y != 0 {
-                    send_mouse_move(*x, *y)?;
+                let already_at_target = index > 0
+                    && matches!(
+                        &steps[index - 1],
+                        MacroStep::MouseMove {
+                            x: previous_x,
+                            y: previous_y
+                        } if *previous_x == *x && *previous_y == *y
+                    );
+                let action_x = if already_at_target { 0 } else { *x };
+                let action_y = if already_at_target { 0 } else { *y };
+                if matches!(action, KeyAction::Down) {
+                    input.mouse_down(mouse_button_name(*button), action_x, action_y)?;
+                } else {
+                    input.mouse_up(mouse_button_name(*button), action_x, action_y)?;
                 }
-                send_mouse_button(*button, *action)?;
                 if matches!(action, KeyAction::Down) {
                     held_buttons.insert(*button);
                 } else {
                     held_buttons.remove(button);
                 }
             }
-            MacroStep::MouseMove { x, y } => send_mouse_move(*x, *y)?,
-            MacroStep::Wheel { delta_x, delta_y } => send_mouse_wheel(*delta_x, *delta_y)?,
-            MacroStep::Text { text } => send_unicode_text(text)?,
+            MacroStep::MouseMove { x, y } => {
+                let followed_by_click = steps.get(index + 1).is_some_and(|next| {
+                    matches!(
+                        next,
+                        MacroStep::MouseButton {
+                            action: KeyAction::Down,
+                            ..
+                        }
+                    )
+                });
+                if input.behavior.is_some() {
+                    input.bio_move_to_with_cancel(*x, *y, None, followed_by_click, stop)?;
+                } else {
+                    input.move_to_with_cancel(*x, *y, Some(stop))?;
+                }
+            }
+            MacroStep::Wheel { delta_x, delta_y } => input.scroll(*delta_x, *delta_y)?,
+            MacroStep::Text { text } => input.type_text_with_cancel(text, Some(stop))?,
         }
+        index += 1;
     }
     Ok(true)
+}
+
+#[cfg(windows)]
+fn combined_click_at(steps: &[MacroStep], index: usize) -> Option<(MouseButton, i32, i32)> {
+    let (Some(MacroStep::MouseMove { x, y }), Some(down), Some(up)) =
+        (steps.get(index), steps.get(index + 1), steps.get(index + 2))
+    else {
+        return None;
+    };
+    let (
+        MacroStep::MouseButton {
+            button: down_button,
+            action: KeyAction::Down,
+            x: down_x,
+            y: down_y,
+        },
+        MacroStep::MouseButton {
+            button: up_button,
+            action: KeyAction::Up,
+            x: up_x,
+            y: up_y,
+        },
+    ) = (down, up)
+    else {
+        return None;
+    };
+    (*x == *down_x && *y == *down_y && *x == *up_x && *y == *up_y && down_button == up_button)
+        .then_some((*down_button, *x, *y))
+}
+
+#[cfg(windows)]
+fn combinable_click_at(
+    steps: &[MacroStep],
+    index: usize,
+    held_buttons: &HashSet<MouseButton>,
+) -> Option<(MouseButton, i32, i32)> {
+    combined_click_at(steps, index).filter(|(button, _, _)| !held_buttons.contains(button))
 }
 
 #[cfg(windows)]
@@ -2176,11 +2871,13 @@ fn split_command_line(command_line: &str) -> Vec<String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        canonical_virtual_key, discard_recording_shortcut_steps, discard_trailing_mouse_actions,
-        is_keyboard_modifier, is_recording_shortcut_key, is_shift_key, is_text_modifier,
-        latched_signature_contains_vk, randomized_delay_ms, shifted_printable_character,
-        split_command_line, HookShared, RecorderState,
+        canonical_virtual_key, combinable_click_at, combined_click_at,
+        discard_recording_shortcut_steps, discard_trailing_mouse_actions, is_keyboard_modifier,
+        is_recording_shortcut_key, is_shift_key, is_text_modifier, latched_signature_contains_vk,
+        randomized_delay_ms, shifted_printable_character, split_command_line, HookShared,
+        RecorderState,
     };
+    use crate::MouseButton;
     use crate::{KeyAction, MacroStep};
     use std::collections::HashSet;
 
@@ -2358,5 +3055,62 @@ mod tests {
             .steps
             .iter()
             .all(|step| !matches!(step, MacroStep::MouseMove { .. })));
+    }
+
+    #[test]
+    fn combined_click_requires_an_adjacent_matching_triplet() {
+        let valid = vec![
+            MacroStep::MouseMove { x: 10, y: 20 },
+            MacroStep::MouseButton {
+                button: MouseButton::Left,
+                action: KeyAction::Down,
+                x: 10,
+                y: 20,
+            },
+            MacroStep::MouseButton {
+                button: MouseButton::Left,
+                action: KeyAction::Up,
+                x: 10,
+                y: 20,
+            },
+        ];
+        assert_eq!(
+            combined_click_at(&valid, 0),
+            Some((MouseButton::Left, 10, 20))
+        );
+
+        let mut delayed = valid.clone();
+        delayed.insert(
+            1,
+            MacroStep::Delay {
+                duration_ms: 10,
+                duration_max_ms: None,
+            },
+        );
+        assert_eq!(combined_click_at(&delayed, 0), None);
+
+        let mut drag = valid;
+        drag[2] = MacroStep::MouseMove { x: 30, y: 40 };
+        assert_eq!(combined_click_at(&drag, 0), None);
+
+        let mut held = HashSet::new();
+        held.insert(MouseButton::Left);
+        assert_eq!(combinable_click_at(&drag, 0, &held), None);
+        let valid = vec![
+            MacroStep::MouseMove { x: 10, y: 20 },
+            MacroStep::MouseButton {
+                button: MouseButton::Left,
+                action: KeyAction::Down,
+                x: 10,
+                y: 20,
+            },
+            MacroStep::MouseButton {
+                button: MouseButton::Left,
+                action: KeyAction::Up,
+                x: 10,
+                y: 20,
+            },
+        ];
+        assert_eq!(combinable_click_at(&valid, 0, &held), None);
     }
 }

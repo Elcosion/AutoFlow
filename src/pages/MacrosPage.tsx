@@ -14,6 +14,7 @@ import {
   newRuleId,
   macroSteps,
   type AutomationProgram,
+  type BehaviorPolicy,
   type MacroMode,
   type MacroRule,
   type MacroStep,
@@ -211,6 +212,10 @@ const copyMacro = (macro: MacroRule): MacroRule => ({
       : { ...macro.program },
 });
 
+const copyBehaviorPolicy = (policy: BehaviorPolicy): BehaviorPolicy => ({
+  ...policy,
+});
+
 const modeLabels: Record<MacroMode, string> = {
   once: "单次",
   repeat: "固定次数",
@@ -382,6 +387,33 @@ export function MacrosPage() {
   const selectedSteps = selected ? macroSteps(selected) : [];
   const selectedSourceKind =
     selected?.program.kind === "rhai" ? "advanced" : "compatible";
+  const hasCustomBehaviorPolicy = selected?.behaviorPolicy !== undefined;
+  const selectedBehaviorPolicy =
+    selected?.behaviorPolicy ?? config.behaviorPolicy;
+  const selectedBehaviorProfile = selectedBehaviorPolicy.profileId
+    ? config.behaviorProfilesV2.find(
+        (profile) => profile.id === selectedBehaviorPolicy.profileId,
+      )
+    : undefined;
+
+  const setBehaviorPolicyMode = (custom: boolean) => {
+    if (!selected) return;
+    updateDraft({
+      behaviorPolicy: custom
+        ? copyBehaviorPolicy(selected.behaviorPolicy ?? config.behaviorPolicy)
+        : undefined,
+    });
+  };
+
+  const updateBehaviorPolicy = (patch: Partial<BehaviorPolicy>) => {
+    if (!selected) return;
+    updateDraft({
+      behaviorPolicy: {
+        ...copyBehaviorPolicy(selected.behaviorPolicy ?? config.behaviorPolicy),
+        ...patch,
+      },
+    });
+  };
 
   useEffect(() => {
     if (!selected) return;
@@ -432,6 +464,14 @@ export function MacrosPage() {
   };
 
   const validateDraft = (candidate: MacroRule) => {
+    if (
+      candidate.behaviorPolicy?.profileId &&
+      !configRef.current.behaviorProfilesV2.some(
+        (profile) => profile.id === candidate.behaviorPolicy?.profileId,
+      )
+    ) {
+      return "自定义仿生策略绑定的 V2 Profile 不存在，请改为全局策略或选择现有 Profile";
+    }
     const candidateSteps =
       candidate.program.kind === "macro" ? candidate.program.steps : [];
     if (candidate.program.kind === "rhai") {
@@ -1333,6 +1373,125 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                         录制快捷键：{RECORDING_SHORTCUT_LABEL}
                         。快捷键本身、AutoFlow窗口内操作和首次聚焦目标窗口的动作不会录入宏。
                       </div>
+                    </div>
+                    <div className="form-section macro-behavior-policy-section">
+                      <label htmlFor="macro-behavior-policy-mode">仿生行为策略</label>
+                      <select
+                        id="macro-behavior-policy-mode"
+                        value={hasCustomBehaviorPolicy ? "custom" : "global"}
+                        onChange={(event) =>
+                          setBehaviorPolicyMode(event.target.value === "custom")
+                        }
+                      >
+                        <option value="global">使用全局默认策略</option>
+                        <option value="custom">使用此宏的自定义策略</option>
+                      </select>
+                      {!hasCustomBehaviorPolicy ? (
+                        <div className="form-help">
+                          当前宏会跟随行为页中的全局 enabled、档案和强度设置。
+                        </div>
+                      ) : (
+                        <div className="macro-behavior-policy-fields">
+                          <label className="recording-option">
+                            <input
+                              checked={selectedBehaviorPolicy.enabled}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({ enabled: event.target.checked })
+                              }
+                              type="checkbox"
+                            />
+                            <span>启用仿生输入</span>
+                          </label>
+                          <label>
+                            <span>Profile</span>
+                            <select
+                              value={selectedBehaviorPolicy.profileId ?? ""}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({
+                                  profileId: event.target.value || null,
+                                })
+                              }
+                            >
+                              <option value="">跟随全局当前档案</option>
+                              {config.behaviorProfilesV2.map((profile) => (
+                                <option key={profile.id} value={profile.id}>
+                                  {profile.name} · {profile.coverage.quality}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            <span>Timing {Math.round(selectedBehaviorPolicy.timingStrength * 100)}%</span>
+                            <input
+                              max="1" min="0" step="0.05" type="range"
+                              value={selectedBehaviorPolicy.timingStrength}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({ timingStrength: Number(event.target.value) })
+                              }
+                            />
+                          </label>
+                          <label>
+                            <span>Path {Math.round(selectedBehaviorPolicy.pointerPathStrength * 100)}%</span>
+                            <input
+                              max="1" min="0" step="0.05" type="range"
+                              value={selectedBehaviorPolicy.pointerPathStrength}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({ pointerPathStrength: Number(event.target.value) })
+                              }
+                            />
+                          </label>
+                          <label>
+                            <span>Pause {Math.round(selectedBehaviorPolicy.pauseStrength * 100)}%</span>
+                            <input
+                              max="1" min="0" step="0.05" type="range"
+                              value={selectedBehaviorPolicy.pauseStrength}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({ pauseStrength: Number(event.target.value) })
+                              }
+                            />
+                          </label>
+                          <label>
+                            <span>Correction {Math.round(selectedBehaviorPolicy.correctionStrength * 100)}%</span>
+                            <input
+                              max="1" min="0" step="0.05" type="range"
+                              value={selectedBehaviorPolicy.correctionStrength}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({ correctionStrength: Number(event.target.value) })
+                              }
+                            />
+                          </label>
+                          <label>
+                            <span>Speed {selectedBehaviorPolicy.speedScale.toFixed(2)}×</span>
+                            <input
+                              max="4" min="0.1" step="0.05" type="range"
+                              value={selectedBehaviorPolicy.speedScale}
+                              onChange={(event) =>
+                                updateBehaviorPolicy({ speedScale: Number(event.target.value) })
+                              }
+                            />
+                          </label>
+                          <label>
+                            <span>Seed（可选）</span>
+                            <input
+                              min="0"
+                              onChange={(event) => {
+                                const value = event.target.value.trim();
+                                updateBehaviorPolicy({
+                                  seed: value === "" ? undefined : Math.max(0, Math.floor(Number(value) || 0)),
+                                });
+                              }}
+                              placeholder="每次播放随机"
+                              type="number"
+                              value={selectedBehaviorPolicy.seed ?? ""}
+                            />
+                          </label>
+                          {selectedBehaviorPolicy.profileId && !selectedBehaviorProfile ? (
+                            <div className="form-help">绑定的 Profile 已不存在；保存前请选择现有 Profile 或改为跟随全局。</div>
+                          ) : selectedBehaviorProfile?.coverage.quality === "insufficient" ? (
+                            <div className="form-help">当前 Profile 样本不足，运行时会使用稳定 fallback；建议继续采集。</div>
+                          ) : null}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="step-toolbar">

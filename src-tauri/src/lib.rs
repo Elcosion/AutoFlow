@@ -5,6 +5,7 @@ use tauri::Manager;
 
 pub mod automation;
 mod autostart;
+mod behavior;
 mod commands;
 mod config;
 mod hook;
@@ -14,6 +15,11 @@ mod storage;
 pub(crate) const APP_NAME: &str = "AutoFlow";
 
 pub use automation::AutomationAsset;
+pub use behavior::v2::*;
+pub use behavior::{
+    BehaviorApi, BehaviorEvent, BehaviorProfile, BehaviorProfileFile, BehaviorRecordingResult,
+    BehaviorRecordingStatus, BiomimeticInput, BiomimeticInputFile, BiomimeticRuntime,
+};
 pub use config::{
     AppConfig, AutomationProgram, HotkeyAction, HotkeyRule, KeyAction, MacroMode, MacroRule,
     MacroStep, MacroTarget, MouseButton, TextExpansionRule,
@@ -27,6 +33,7 @@ static LOGGER: SimpleLogger = SimpleLogger;
 impl Log for SimpleLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= Level::Info
+            || (metadata.level() == Level::Debug && behavior_debug_logging_enabled())
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -36,6 +43,17 @@ impl Log for SimpleLogger {
     }
 
     fn flush(&self) {}
+}
+
+fn behavior_debug_logging_enabled() -> bool {
+    std::env::var("AUTOFLOW_BEHAVIOR_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,10 +206,44 @@ impl RuntimeState {
     pub(crate) fn macro_recording_status(&self) -> MacroRecordingStatus {
         self.hook.recording_status()
     }
+
+    pub(crate) fn start_behavior_recording(&self, name: String) -> Result<(), AppError> {
+        self.hook.start_behavior_recording(name)
+    }
+
+    pub(crate) fn stop_behavior_recording(&self) -> Result<BehaviorRecordingResult, AppError> {
+        self.hook.stop_behavior_recording()
+    }
+
+    pub(crate) fn behavior_recording_status(&self) -> BehaviorRecordingStatus {
+        self.hook.behavior_recording_status()
+    }
+
+    pub(crate) fn behavior_api(&self, profile_id: &str) -> Result<BehaviorApi, AppError> {
+        let config = self.config()?;
+        if let Some(profile) = config
+            .behavior_profiles_v2
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        {
+            return Ok(profile.generated_api());
+        }
+        let profile = config
+            .behavior_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| AppError::invalid("behavior_profile_not_found", "找不到行为档案"))?;
+        Ok(profile.generated_api())
+    }
 }
 
 fn init_logging() {
-    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
+    let maximum = if behavior_debug_logging_enabled() {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(maximum));
 }
 
 pub fn run() {
@@ -219,7 +271,16 @@ pub fn run() {
             commands::stop_macro,
             commands::is_macro_playing,
             commands::get_macro_playback_status,
-            commands::validate_rhai_source
+            commands::validate_rhai_source,
+            commands::start_behavior_recording,
+            commands::stop_behavior_recording,
+            commands::export_behavior_profile_v2,
+            commands::export_behavior_session_v2,
+            commands::delete_behavior_profile_v2,
+            commands::delete_behavior_session_v2,
+            commands::retrain_behavior_profile_v2,
+            commands::get_behavior_recording_status,
+            commands::generate_behavior_api
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();

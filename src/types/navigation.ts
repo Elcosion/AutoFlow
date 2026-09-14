@@ -1,5 +1,5 @@
 export type RouteId =
-  "home" | "hotkeys" | "text-expansion" | "macros" | "settings";
+  "home" | "hotkeys" | "text-expansion" | "macros" | "behavior" | "settings";
 
 export type NavItem = {
   id: RouteId;
@@ -18,5 +18,6 @@ export const navItems: NavItem[] = [
     icon: "Aa",
   },
   { id: "macros", label: "宏", description: "录制与编辑", icon: "◉" },
+  { id: "behavior", label: "仿生行为", description: "训练与生成", icon: "◒" },
   { id: "settings", label: "设置", description: "安全与偏好", icon: "⚙" },
 ];

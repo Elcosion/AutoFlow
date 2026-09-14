@@ -1,4 +1,10 @@
-import { useMemo, useRef, useState, type KeyboardEvent, type SyntheticEvent } from "react";
+import {
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type SyntheticEvent,
+} from "react";
 
 export const RHAI_API_NAMES = [
   "wait_ms",
@@ -12,6 +18,11 @@ export const RHAI_API_NAMES = [
   "click",
   "scroll",
   "type_text",
+  "bio_press",
+  "bio_move_to",
+  "bio_click",
+  "bio_type_text",
+  "bio_scroll",
   "is_cancelled",
   "active_window_title",
   "window_exists",
@@ -25,6 +36,11 @@ export const RHAI_API_NAMES = [
 
 export const RHAI_API_SIGNATURES: Record<string, string> = {
   click: "click(button, x, y)",
+  bio_press: "bio_press(key)",
+  bio_move_to: "bio_move_to(x, y)",
+  bio_click: "bio_click(button, x, y)",
+  bio_type_text: "bio_type_text(text)",
+  bio_scroll: "bio_scroll(deltaX, deltaY)",
   active_window_title: "active_window_title() -> String",
   window_exists: "window_exists(title)",
   window_rect: "window_rect(title) -> Map",
@@ -32,7 +48,8 @@ export const RHAI_API_SIGNATURES: Record<string, string> = {
   pixel_matches: "pixel_matches(x, y, r, g, b, tolerance)",
   wait_pixel: "wait_pixel(x, y, r, g, b, tolerance, timeoutMs, pollMs)",
   find_image: "find_image(assetId, x, y, width, height, threshold)",
-  wait_image: "wait_image(assetId, x, y, width, height, threshold, timeoutMs, pollMs)",
+  wait_image:
+    "wait_image(assetId, x, y, width, height, threshold, timeoutMs, pollMs)",
 };
 
 type RhaiEditorProps = {
@@ -58,14 +75,20 @@ function highlight(value: string): string {
   const escaped = escapeHtml(value);
   return escaped
     .replace(/(\/\/.*)$/gm, '<span class="rhai-token-comment">$1</span>')
-    .replace(/(&quot;(?:\\.|[^&]|&(?!quot;))*?&quot;)/g, '<span class="rhai-token-string">$1</span>')
+    .replace(
+      /(&quot;(?:\\.|[^&]|&(?!quot;))*?&quot;)/g,
+      '<span class="rhai-token-string">$1</span>',
+    )
     .replace(
       /\b(let|const|if|else|for|while|fn|return|true|false)\b/g,
       '<span class="rhai-token-keyword">$1</span>',
     )
-    .replace(/\b(-?\d+(?:\.\d+)?)\b/g, '<span class="rhai-token-number">$1</span>')
     .replace(
-      /\b(wait_ms|wait_random_ms|key_down|key_up|press|move_to|mouse_down|mouse_up|click|scroll|type_text|is_cancelled|active_window_title|window_exists|window_rect|wait_window|pixel_matches|wait_pixel|find_image|wait_image)(?=\s*\()/g,
+      /\b(-?\d+(?:\.\d+)?)\b/g,
+      '<span class="rhai-token-number">$1</span>',
+    )
+    .replace(
+      /\b(wait_ms|wait_random_ms|key_down|key_up|press|move_to|mouse_down|mouse_up|click|scroll|type_text|bio_press|bio_move_to|bio_click|bio_type_text|bio_scroll|is_cancelled|active_window_title|window_exists|window_rect|wait_window|pixel_matches|wait_pixel|find_image|wait_image)(?=\s*\()/g,
       '<span class="rhai-token-api">$1</span>',
     );
 }
@@ -112,7 +135,10 @@ export function RhaiEditor({
     if (!textarea) return;
     const position = textarea.selectionStart;
     const lineStart = textarea.value.lastIndexOf("\n", position - 1) + 1;
-    const partial = textarea.value.slice(lineStart, position).match(/[A-Za-z_][A-Za-z0-9_]*$/)?.[0] ?? "";
+    const partial =
+      textarea.value
+        .slice(lineStart, position)
+        .match(/[A-Za-z_][A-Za-z0-9_]*$/)?.[0] ?? "";
     const next = `${textarea.value.slice(0, position - partial.length)}${name}(${textarea.value.slice(position)}`;
     onChange(next);
     setSuggestions([]);
@@ -143,7 +169,8 @@ export function RhaiEditor({
     }
     if (event.key === "Enter") {
       const textarea = event.currentTarget;
-      const lineStart = value.lastIndexOf("\n", textarea.selectionStart - 1) + 1;
+      const lineStart =
+        value.lastIndexOf("\n", textarea.selectionStart - 1) + 1;
       const indentation = value.slice(lineStart).match(/^\s*/)?.[0] ?? "";
       const line = value.slice(lineStart, textarea.selectionStart);
       if (indentation || line.trimEnd().endsWith("{")) {
@@ -151,7 +178,9 @@ export function RhaiEditor({
         const extraIndent = line.trimEnd().endsWith("{") ? "  " : "";
         const insertion = `\n${indentation}${extraIndent}`;
         const start = textarea.selectionStart;
-        onChange(`${value.slice(0, start)}${insertion}${value.slice(textarea.selectionEnd)}`);
+        onChange(
+          `${value.slice(0, start)}${insertion}${value.slice(textarea.selectionEnd)}`,
+        );
         window.requestAnimationFrame(() => {
           const nextPosition = start + insertion.length;
           textarea.setSelectionRange(nextPosition, nextPosition);
@@ -163,8 +192,12 @@ export function RhaiEditor({
   return (
     <>
       <div className="rhai-editor-toolbar">
-        <button onClick={onCheck} type="button">检查语法</button>
-        <button onClick={onFormat} type="button">格式化</button>
+        <button onClick={onCheck} type="button">
+          检查语法
+        </button>
+        <button onClick={onFormat} type="button">
+          格式化
+        </button>
         <span>Ctrl+S 保存</span>
       </div>
       <div className="rhai-editor-shell">
@@ -202,7 +235,8 @@ export function RhaiEditor({
             onScroll={(event) => {
               if (highlightRef.current) {
                 highlightRef.current.scrollTop = event.currentTarget.scrollTop;
-                highlightRef.current.scrollLeft = event.currentTarget.scrollLeft;
+                highlightRef.current.scrollLeft =
+                  event.currentTarget.scrollLeft;
               }
             }}
             onSelect={updateCursor}
@@ -213,7 +247,12 @@ export function RhaiEditor({
           {suggestions.length > 0 ? (
             <div className="rhai-autocomplete" role="listbox">
               {suggestions.map((name) => (
-                <button key={name} onMouseDown={(event) => event.preventDefault()} onClick={() => replaceSuggestion(name)} type="button">
+                <button
+                  key={name}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => replaceSuggestion(name)}
+                  type="button"
+                >
                   {RHAI_API_SIGNATURES[name] ?? `${name}()`}
                 </button>
               ))}

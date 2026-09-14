@@ -4,6 +4,7 @@ import { normalizeRoute, routeHash } from "./lib/routes";
 import { HomePage } from "./pages/HomePage";
 import { HotkeysPage } from "./pages/HotkeysPage";
 import { MacrosPage } from "./pages/MacrosPage";
+import { BehaviorPage } from "./pages/BehaviorPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TextExpansionPage } from "./pages/TextExpansionPage";
 import type { RouteId } from "./types/navigation";
@@ -40,6 +41,8 @@ function pageForRoute(route: RouteId, onNavigate: (route: RouteId) => void) {
       return <TextExpansionPage />;
     case "macros":
       return <MacrosPage />;
+    case "behavior":
+      return <BehaviorPage />;
     case "settings":
       return <SettingsPage />;
     case "home":

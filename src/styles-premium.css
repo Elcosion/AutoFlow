@@ -5287,7 +5287,11 @@ button:focus-visible {
   border-right: 1px solid #e6efeb;
   color: #a9b9b4;
   background: #f5faf7;
-  font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font:
+    12px/1.65 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
   user-select: none;
 }
 
@@ -5320,7 +5324,11 @@ button:focus-visible {
   margin: 0;
   padding: 16px;
   border: 0;
-  font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font:
+    12px/1.65 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
   white-space: pre;
   tab-size: 2;
 }
@@ -5389,7 +5397,11 @@ button:focus-visible {
   color: #3e6559;
   background: transparent;
   text-align: left;
-  font: 11px ui-monospace, SFMono-Regular, Consolas, monospace;
+  font:
+    11px ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
   cursor: pointer;
 }
 
@@ -5487,7 +5499,11 @@ button:focus-visible {
   margin: 0;
   padding: 0 12px 12px;
   color: #475569;
-  font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font:
+    12px/1.65 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
   white-space: pre-wrap;
 }
 
@@ -5496,7 +5512,11 @@ button:focus-visible {
   padding: 16px;
   border: 1px solid rgba(79, 70, 229, 0.16);
   border-radius: 16px;
-  background: linear-gradient(135deg, rgba(248, 250, 252, 0.88), rgba(238, 242, 255, 0.58));
+  background: linear-gradient(
+    135deg,
+    rgba(248, 250, 252, 0.88),
+    rgba(238, 242, 255, 0.58)
+  );
 }
 
 .asset-manager-heading,
@@ -5554,7 +5574,8 @@ button:focus-visible {
   height: 72px;
   overflow: hidden;
   border-radius: 9px;
-  background: repeating-conic-gradient(#e2e8f0 0 25%, #f8fafc 0 50%) 50% / 12px 12px;
+  background: repeating-conic-gradient(#e2e8f0 0 25%, #f8fafc 0 50%) 50% / 12px
+    12px;
   color: #94a3b8;
   font-size: 10px;
   text-align: center;
@@ -5726,7 +5747,10 @@ button:focus-visible {
 .macro-reference-card code {
   overflow: hidden;
   color: #555555;
-  font: 10px/1.4 "Cascadia Mono", "Consolas", monospace;
+  font:
+    10px/1.4 "Cascadia Mono",
+    "Consolas",
+    monospace;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5745,4 +5769,334 @@ button:focus-visible {
 .macro-reference-add:hover {
   color: #ffffff;
   background: #176a5d;
+}
+
+.behavior-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.85fr);
+  gap: 18px;
+}
+
+.behavior-recording-card,
+.behavior-settings-card,
+.behavior-api-card {
+  min-width: 0;
+}
+
+.behavior-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  color: #7f9690;
+  border: 1px solid #d7e1df;
+  border-radius: 999px;
+  background: #f8fbfa;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.behavior-status i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9fb0ac;
+}
+
+.behavior-status.is-live {
+  color: #b44c43;
+  border-color: #efc4bf;
+  background: #fff8f7;
+}
+
+.behavior-status.is-live i {
+  background: #e56458;
+  box-shadow: 0 0 0 4px rgb(229 100 88 / 12%);
+}
+
+.behavior-recording-actions,
+.behavior-api-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.behavior-recording-actions .form-help {
+  flex: 1 1 240px;
+  margin: 0;
+}
+
+.behavior-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.behavior-metric-grid > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 10px;
+  border: 1px solid #e0e8e5;
+  border-radius: 8px;
+  background: #fbfdfc;
+}
+
+.behavior-metric-grid strong {
+  overflow: hidden;
+  color: #183d36;
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.behavior-metric-grid span,
+.behavior-list-heading span {
+  color: #8a9b97;
+  font-size: 10px;
+}
+
+.behavior-privacy-note {
+  margin-top: 18px;
+}
+
+.behavior-retention-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  color: #31534c;
+  border: 1px solid #e7cda7;
+  border-radius: 8px;
+  background: #fffaf2;
+  cursor: pointer;
+}
+
+.behavior-retention-toggle input,
+.behavior-profile-row > input {
+  accent-color: #2b8876;
+}
+
+.behavior-retention-toggle span {
+  display: grid;
+  gap: 3px;
+}
+
+.behavior-retention-toggle small {
+  color: #927653;
+  font-size: 10px;
+}
+
+.behavior-profile-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.behavior-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 4px;
+}
+
+.behavior-list-heading strong {
+  color: #31534c;
+  font-size: 12px;
+}
+
+.behavior-profile-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  border: 1px solid #e0e8e5;
+  border-radius: 8px;
+  background: #fbfdfc;
+}
+
+.behavior-profile-row > input {
+  flex: 0 0 auto;
+  width: 15px;
+  margin: 0 0 0 12px;
+}
+
+.behavior-profile-row.is-selected {
+  border-color: #77b8aa;
+  background: #f2fbf8;
+}
+
+.behavior-profile-row > button:not(.icon-button) {
+  display: grid;
+  flex: 1;
+  gap: 4px;
+  min-width: 0;
+  padding: 11px 12px;
+  color: #31534c;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.behavior-profile-row > button:not(.icon-button) strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.behavior-profile-row > button:not(.icon-button) span {
+  color: #879b96;
+  font-size: 10px;
+}
+
+.behavior-profile-row > div:first-child {
+  display: grid;
+  flex: 1;
+  gap: 4px;
+  min-width: 0;
+  padding: 11px 12px;
+}
+
+.behavior-profile-row > div:first-child span {
+  overflow: hidden;
+  color: #879b96;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.behavior-profile-row > .behavior-data-actions {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0 8px 0 0;
+}
+
+.behavior-profile-row .icon-button {
+  align-self: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 6px;
+  color: #a27a76;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+}
+
+.behavior-profile-row .icon-button:hover {
+  color: #c34f45;
+}
+
+.behavior-empty {
+  padding: 18px 12px;
+  color: #899b97;
+  border: 1px dashed #cfddda;
+  border-radius: 8px;
+  background: #fbfdfc;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.behavior-profile-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.behavior-profile-summary > div {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border-radius: 7px;
+  background: #f5faf8;
+}
+
+.behavior-profile-summary strong {
+  color: #28695d;
+  font-size: 12px;
+}
+
+.behavior-profile-summary span {
+  color: #8a9b97;
+  font-size: 9px;
+}
+
+.behavior-input-list {
+  margin-top: 18px;
+}
+
+.behavior-data-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.behavior-data-actions .form-help {
+  margin: 0;
+}
+
+.macro-behavior-policy-section {
+  grid-column: 1 / -1;
+}
+
+.macro-behavior-policy-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.macro-behavior-policy-fields > label {
+  display: grid;
+  gap: 5px;
+}
+
+.macro-behavior-policy-fields > label > span {
+  color: #59736d;
+  font-size: 10px;
+}
+
+@media (max-width: 760px) {
+  .macro-behavior-policy-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+.behavior-api-card {
+  margin-top: 18px;
+}
+
+.behavior-api-source {
+  overflow: auto;
+  max-height: 320px;
+  margin: 16px 0 0;
+  padding: 16px;
+  color: #d9f4eb;
+  border: 1px solid #284b43;
+  border-radius: 8px;
+  background: #142b27;
+  font:
+    12px/1.65 "Cascadia Mono",
+    "Consolas",
+    monospace;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 900px) {
+  .behavior-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 650px) {
+  .behavior-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }

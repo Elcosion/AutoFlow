@@ -33,6 +33,33 @@ pub trait AutomationInput: Send + Sync {
     fn move_to(&self, x: i32, y: i32) -> Result<(), String>;
     fn mouse_down(&self, button: &str, x: i32, y: i32) -> Result<(), String>;
     fn mouse_up(&self, button: &str, x: i32, y: i32) -> Result<(), String>;
+    fn click(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
+        self.move_to(x, y)?;
+        self.mouse_down(button, 0, 0)?;
+        self.mouse_up(button, 0, 0)
+    }
+    fn bio_move_to(
+        &self,
+        x: i32,
+        y: i32,
+        target_width: Option<f32>,
+        followed_by_click: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let _ = (target_width, followed_by_click, cancel);
+        self.move_to(x, y)
+    }
+    fn bio_click(
+        &self,
+        button: &str,
+        x: i32,
+        y: i32,
+        target_width: Option<f32>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.bio_move_to(x, y, target_width, true, cancel)?;
+        self.click(button, 0, 0)
+    }
     fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String>;
     fn type_text(&self, text: &str) -> Result<(), String>;
 }
@@ -221,6 +248,33 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     });
 
     let current = Arc::clone(&state);
+    engine.register_fn("bio_move_to", move |x: i64, y: i64| {
+        with_context(&current, |context| {
+            let (x, y) = checked_coordinates(x, y)?;
+            context.begin_action()?;
+            context
+                .input
+                .bio_move_to(x, y, None, false, context.cancel.as_ref())
+        })
+    });
+
+    let current = Arc::clone(&state);
+    engine.register_fn("bio_move_to", move |x: i64, y: i64, options: Map| {
+        with_context(&current, |context| {
+            let (x, y) = checked_coordinates(x, y)?;
+            let (target_width, followed_by_click) = parse_behavior_options(&options)?;
+            context.begin_action()?;
+            context.input.bio_move_to(
+                x,
+                y,
+                target_width,
+                followed_by_click,
+                context.cancel.as_ref(),
+            )
+        })
+    });
+
+    let current = Arc::clone(&state);
     engine.register_fn("mouse_down", move |button: String, x: i64, y: i64| {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
@@ -249,13 +303,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             validate_button(&button)?;
             context.begin_action()?;
-            context.input.mouse_down(&button, 0, 0)?;
-            context.pressed_mouse_buttons.insert(button.clone());
-            let result = context.input.mouse_up(&button, 0, 0);
-            if result.is_ok() {
-                context.pressed_mouse_buttons.remove(&button);
-            }
-            result
+            context.input.click(&button, 0, 0)
         })
     });
 
@@ -265,13 +313,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             let (x, y) = checked_coordinates(x, y)?;
             validate_button(&button)?;
             context.begin_action()?;
-            context.input.mouse_down(&button, x, y)?;
-            context.pressed_mouse_buttons.insert(button.clone());
-            let result = context.input.mouse_up(&button, x, y);
-            if result.is_ok() {
-                context.pressed_mouse_buttons.remove(&button);
-            }
-            result
+            context.input.click(&button, x, y)
         })
     });
 
@@ -281,15 +323,37 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             let (x, y) = checked_coordinates(x, y)?;
             context.begin_action()?;
             let button = "left".to_string();
-            context.input.mouse_down(&button, x, y)?;
-            context.pressed_mouse_buttons.insert(button.clone());
-            let result = context.input.mouse_up(&button, x, y);
-            if result.is_ok() {
-                context.pressed_mouse_buttons.remove(&button);
-            }
-            result
+            context.input.click(&button, x, y)
         })
     });
+
+    let current = Arc::clone(&state);
+    engine.register_fn("bio_click", move |button: String, x: i64, y: i64| {
+        with_context(&current, |context| {
+            let (x, y) = checked_coordinates(x, y)?;
+            validate_button(&button)?;
+            context.begin_action()?;
+            context
+                .input
+                .bio_click(&button, x, y, None, context.cancel.as_ref())
+        })
+    });
+
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "bio_click",
+        move |button: String, x: i64, y: i64, options: Map| {
+            with_context(&current, |context| {
+                let (x, y) = checked_coordinates(x, y)?;
+                validate_button(&button)?;
+                let (target_width, _) = parse_behavior_options(&options)?;
+                context.begin_action()?;
+                context
+                    .input
+                    .bio_click(&button, x, y, target_width, context.cancel.as_ref())
+            })
+        },
+    );
 
     let current = Arc::clone(&state);
     engine.register_fn("scroll", move |delta_x: i64, delta_y: i64| {
@@ -305,6 +369,37 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             if text.is_empty() {
                 return Err("type_text 的文本不能为空".to_string());
+            }
+            context.begin_action()?;
+            context.input.type_text(&text)
+        })
+    });
+
+    let current = Arc::clone(&state);
+    engine.register_fn("bio_type_text", move |text: String| {
+        with_context(&current, |context| {
+            if text.is_empty() {
+                return Err("bio_type_text 的文本不能为空".to_string());
+            }
+            context.begin_action()?;
+            context.input.type_text(&text)
+        })
+    });
+
+    let current = Arc::clone(&state);
+    engine.register_fn("bio_type_text", move |text: String, options: Map| {
+        with_context(&current, |context| {
+            if text.is_empty() {
+                return Err("bio_type_text 的文本不能为空".to_string());
+            }
+            if let Some(mode) = options.get("mode") {
+                let mode = mode
+                    .clone()
+                    .try_cast::<String>()
+                    .ok_or_else(|| "bio_type_text.options.mode 必须是字符串".to_string())?;
+                if mode != "normal" {
+                    return Err("bio_type_text 当前只支持 mode=normal".to_string());
+                }
             }
             context.begin_action()?;
             context.input.type_text(&text)
@@ -522,6 +617,48 @@ fn checked_point(x: i64, y: i64) -> Result<Point, String> {
         x: checked_integer(x).map_err(|error| format!("capture_region_invalid：{error}"))?,
         y: checked_integer(y).map_err(|error| format!("capture_region_invalid：{error}"))?,
     })
+}
+
+fn parse_behavior_options(options: &Map) -> Result<(Option<f32>, bool), String> {
+    let target_width = options
+        .get("target_width")
+        .map(|value| {
+            if value.is_int() {
+                value
+                    .as_int()
+                    .map(|value| value as f32)
+                    .map_err(|_| "bio_move_to.options.target_width 必须是数字".to_string())
+            } else if value.is_float() {
+                value
+                    .as_float()
+                    .map(|value| value as f32)
+                    .map_err(|_| "bio_move_to.options.target_width 必须是数字".to_string())
+            } else {
+                Err("bio_move_to.options.target_width 必须是数字".to_string())
+            }
+        })
+        .transpose()?;
+    if let Some(width) = target_width {
+        if !width.is_finite() || !(0.0..=10_000.0).contains(&width) {
+            return Err("bio_move_to.options.target_width 必须在 0 到 10000 之间".to_string());
+        }
+    }
+    let followed_by_click = options
+        .get("intent")
+        .map(|value| {
+            let intent = value
+                .clone()
+                .try_cast::<String>()
+                .ok_or_else(|| "bio_move_to.options.intent 必须是字符串".to_string())?;
+            match intent.as_str() {
+                "click" => Ok(true),
+                "move" => Ok(false),
+                _ => Err("bio_move_to.options.intent 只能是 move 或 click".to_string()),
+            }
+        })
+        .transpose()?
+        .unwrap_or(false);
+    Ok((target_width, followed_by_click))
 }
 
 fn checked_region(x: i64, y: i64, width: i64, height: i64) -> Result<ScreenRect, String> {
@@ -1221,6 +1358,22 @@ mod tests {
         let context = ExecutionContext::new(Arc::new(TestInput), cancel, 1.0, None);
         let error = run_rhai_script("key_down(\"A\");", context).expect_err("cancelled script");
         assert!(error.contains("F12"));
+    }
+
+    #[test]
+    fn native_biomimetic_api_accepts_action_context_maps() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context = ExecutionContext::new(Arc::new(TestInput), cancel, 1.0, None);
+        run_rhai_script(
+            r#"
+                bio_move_to(820, 430);
+                bio_move_to(820, 430, #{ target_width: 80, intent: "click" });
+                bio_click("left", 820, 430);
+                bio_type_text("demo", #{ mode: "normal" });
+            "#,
+            context,
+        )
+        .expect("native bio API should execute");
     }
 
     #[test]

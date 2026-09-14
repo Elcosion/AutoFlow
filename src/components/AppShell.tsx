@@ -48,76 +48,78 @@ export function AppShell({ route, onNavigate, children }: AppShellProps) {
   return (
     <div className="app-window">
       <WindowTitlebar />
-      <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-      <aside
-        className="sidebar"
-        onMouseEnter={() => {
-          if (navigationAutoCollapse) setSidebarCollapsed(false);
-        }}
-        onMouseLeave={() => {
-          if (navigationAutoCollapse) setSidebarCollapsed(true);
-        }}
+      <div
+        className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
       >
-        <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </div>
-          <div>
-            <div className="brand-name">AutoFlow</div>
-          </div>
-          <button
-            aria-label={sidebarCollapsed ? "展开导航栏" : "收起导航栏"}
-            aria-pressed={sidebarCollapsed}
-            className="sidebar-collapse-toggle"
-            onClick={() => setSidebarCollapsed((current) => !current)}
-            title={sidebarCollapsed ? "展开导航栏" : "收起导航栏"}
-            type="button"
-          >
-            {sidebarCollapsed ? "→" : "←"}
-          </button>
-        </div>
-        <nav className="main-nav" aria-label="主导航">
-          <div className="nav-label">工作台</div>
-          {navItems.slice(0, 4).map((item) => (
+        <aside
+          className="sidebar"
+          onMouseEnter={() => {
+            if (navigationAutoCollapse) setSidebarCollapsed(false);
+          }}
+          onMouseLeave={() => {
+            if (navigationAutoCollapse) setSidebarCollapsed(true);
+          }}
+        >
+          <div className="brand-block">
+            <div className="brand-mark" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <div>
+              <div className="brand-name">AutoFlow</div>
+            </div>
             <button
-              className={`nav-item ${route === item.id ? "is-active" : ""}`}
-              key={item.id}
-              onClick={() => onNavigate(item.id)}
+              aria-label={sidebarCollapsed ? "展开导航栏" : "收起导航栏"}
+              aria-pressed={sidebarCollapsed}
+              className="sidebar-collapse-toggle"
+              onClick={() => setSidebarCollapsed((current) => !current)}
+              title={sidebarCollapsed ? "展开导航栏" : "收起导航栏"}
+              type="button"
+            >
+              {sidebarCollapsed ? "→" : "←"}
+            </button>
+          </div>
+          <nav className="main-nav" aria-label="主导航">
+            <div className="nav-label">工作台</div>
+            {navItems.slice(0, 5).map((item) => (
+              <button
+                className={`nav-item ${route === item.id ? "is-active" : ""}`}
+                key={item.id}
+                onClick={() => onNavigate(item.id)}
+                type="button"
+              >
+                <span className="nav-icon" aria-hidden="true">
+                  {item.icon}
+                </span>
+                <span className="nav-copy">
+                  <span>{item.label}</span>
+                </span>
+              </button>
+            ))}
+            <div className="nav-label nav-label-settings">偏好</div>
+            <button
+              className={`nav-item ${route === "settings" ? "is-active" : ""}`}
+              onClick={() => onNavigate("settings")}
               type="button"
             >
               <span className="nav-icon" aria-hidden="true">
-                {item.icon}
+                ⚙
               </span>
               <span className="nav-copy">
-                <span>{item.label}</span>
+                <span>设置</span>
               </span>
             </button>
-          ))}
-          <div className="nav-label nav-label-settings">偏好</div>
-          <button
-            className={`nav-item ${route === "settings" ? "is-active" : ""}`}
-            onClick={() => onNavigate("settings")}
-            type="button"
-          >
-            <span className="nav-icon" aria-hidden="true">
-              ⚙
-            </span>
-            <span className="nav-copy">
-              <span>设置</span>
-            </span>
-          </button>
-        </nav>
-        <div className="sidebar-safety-action">
-          <button className="topbar-stop" onClick={stopNow} type="button">
-            <span>!</span> F12 停止
-          </button>
-        </div>
-      </aside>
-      <main className="main-content">
-        <div className="page-content">{children}</div>
-      </main>
+          </nav>
+          <div className="sidebar-safety-action">
+            <button className="topbar-stop" onClick={stopNow} type="button">
+              <span>!</span> F12 停止
+            </button>
+          </div>
+        </aside>
+        <main className="main-content">
+          <div className="page-content">{children}</div>
+        </main>
       </div>
     </div>
   );
