@@ -5,9 +5,7 @@ use crate::{
     BehaviorRecordingStatus, BehaviorSessionV2, MacroRecordingStatus, MacroRule, RuntimeState,
     SourceRetention, APP_NAME,
 };
-use serde::Serialize;
 use tauri::AppHandle;
-use tauri::Manager;
 use tauri::State;
 
 #[tauri::command]
@@ -25,8 +23,50 @@ pub fn ping() -> Result<String, AppError> {
 }
 
 #[tauri::command]
-pub fn get_config(state: State<'_, RuntimeState>) -> Result<AppConfig, AppError> {
-    state.config()
+pub fn get_config(app: AppHandle, state: State<'_, RuntimeState>) -> Result<AppConfig, AppError> {
+    let config = storage::load_config(&app)?;
+    state.replace_config(config.clone())?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn open_data_directory(
+    app: AppHandle,
+    subdirectory: Option<String>,
+) -> Result<String, AppError> {
+    let root = storage::managed_data_root(&app)?;
+    let directory = match subdirectory.as_deref() {
+        None => root,
+        Some(name @ ("profiles" | "sessions" | "scripts" | "images")) => root.join(name),
+        Some(_) => {
+            return Err(AppError::invalid(
+                "data_directory_invalid",
+                "不支持的数据子目录",
+            ));
+        }
+    };
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(&directory)
+            .spawn()
+            .map_err(|error| {
+                AppError::with_detail(
+                    "data_directory_open_failed",
+                    "无法打开 AutoFlow 数据文件夹",
+                    error.to_string(),
+                )
+            })?;
+        Ok(directory.to_string_lossy().into_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+        Err(AppError::invalid(
+            "data_directory_unsupported",
+            "当前平台暂不支持打开数据文件夹",
+        ))
+    }
 }
 
 #[tauri::command]
@@ -46,24 +86,13 @@ fn persist_config(
     let (config, _) = config.migrate()?;
     config.validate()?;
     crate::autostart::apply(config.launch_at_startup)?;
-    storage::save_config(app, &config)?;
+    let config = storage::save_config(app, &config)?;
     state.replace_config(config.clone())?;
     Ok(config)
 }
 
 fn asset_root(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|error| {
-            AppError::with_detail(
-                "asset_directory_failed",
-                "无法定位 AutoFlow 图像资源目录",
-                error.to_string(),
-            )
-        })?
-        .join("assets")
-        .join("images"))
+    storage::managed_image_directory(app)
 }
 
 fn map_vision_error(error: VisionError) -> AppError {
@@ -82,14 +111,18 @@ pub fn import_asset(
     let occupied = config
         .assets
         .iter()
-        .map(|asset| asset.id.clone())
+        .flat_map(|asset| [asset.id.clone(), asset.file_name.clone()])
         .collect::<Vec<_>>();
     let asset = import_asset_file(&asset_root(&app)?, &occupied, &name, &file_name, &bytes)
         .map_err(map_vision_error)?;
     let mut next = config;
     next.assets.push(asset.clone());
-    let _ = persist_config(&app, &state, next)?;
-    Ok(asset)
+    let saved = persist_config(&app, &state, next)?;
+    saved
+        .assets
+        .into_iter()
+        .find(|saved_asset| saved_asset.file_name == asset.file_name)
+        .ok_or_else(|| AppError::internal("图像资源保存后未出现在资源目录中"))
 }
 
 #[tauri::command]
@@ -112,24 +145,58 @@ pub fn rename_asset(
     app: AppHandle,
     state: State<'_, RuntimeState>,
     asset_id: String,
-    name: String,
+    file_name: String,
 ) -> Result<AutomationAsset, AppError> {
     let mut config = state.config()?;
-    let asset = config
+    let index = config
         .assets
-        .iter_mut()
-        .find(|asset| asset.id == asset_id)
+        .iter()
+        .position(|asset| asset.id == asset_id)
         .ok_or_else(|| AppError::invalid("asset_not_found", "找不到图像资源"))?;
-    let name = name.trim();
-    if name.is_empty() || name.chars().count() > 128 {
+    let file_name = file_name.trim();
+    if file_name.is_empty() || file_name.chars().count() > 128 {
         return Err(AppError::invalid(
             "asset_name_invalid",
-            "图像资源名称不能为空且不能超过 128 个字符",
+            "图像资源文件名不能为空且不能超过 128 个字符",
         ));
     }
-    asset.name = name.to_string();
-    let result = asset.clone();
-    persist_config(&app, &state, config)?;
+    let previous = config.assets[index].clone();
+    let previous_extension = std::path::Path::new(&previous.file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let next_extension = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !previous_extension.eq_ignore_ascii_case(next_extension) {
+        return Err(AppError::invalid(
+            "asset_extension_mismatch",
+            "重命名时必须保留原图像扩展名",
+        ));
+    }
+    if previous.file_name.eq_ignore_ascii_case(file_name) {
+        return Ok(previous);
+    }
+    let store = AssetStore::new(asset_root(&app)?);
+    store
+        .rename_file(&previous, file_name)
+        .map_err(map_vision_error)?;
+    config.assets[index].name = file_name.to_string();
+    config.assets[index].file_name = file_name.to_string();
+    for macro_rule in &mut config.macros {
+        if let crate::AutomationProgram::Rhai { source, .. } = &mut macro_rule.program {
+            *source = source.replace(
+                &format!("\"{}\"", previous.file_name),
+                &format!("\"{file_name}\""),
+            );
+        }
+    }
+    let result = config.assets[index].clone();
+    if let Err(error) = persist_config(&app, &state, config) {
+        let _ = store.rename_file(&result, &previous.file_name);
+        return Err(error);
+    }
     Ok(result)
 }
 
@@ -146,7 +213,8 @@ pub fn delete_asset(
     };
     let referenced = config.macros.iter().any(|macro_rule| {
         if let crate::AutomationProgram::Rhai { source, .. } = &macro_rule.program {
-            source.contains(&format!("\"{asset_id}\"")) || source.contains(&asset_id)
+            source.contains(&format!("\"{}\"", config.assets[index].file_name))
+                || source.contains(&format!("\"{asset_id}\""))
         } else {
             false
         }
@@ -213,6 +281,12 @@ pub fn get_macro_recording_status(
 
 #[tauri::command]
 pub fn play_macro(state: State<'_, RuntimeState>, macro_rule: MacroRule) -> Result<(), AppError> {
+    if let Some(message) = &macro_rule.import_error {
+        return Err(AppError::invalid(
+            "macro_import_invalid",
+            format!("该宏来自不合法文件，修复并保存后才能运行：{message}"),
+        ));
+    }
     state.play_macro(macro_rule)
 }
 
@@ -276,47 +350,6 @@ pub fn stop_behavior_recording(
     config.behavior_policy.profile_id = Some(profile.id.clone());
     let _ = persist_config(&app, &state, config)?;
     Ok(profile)
-}
-
-#[tauri::command]
-pub fn export_behavior_profile_v2(
-    state: State<'_, RuntimeState>,
-    profile_id: String,
-) -> Result<String, AppError> {
-    let config = state.config()?;
-    let profile = config
-        .behavior_profiles_v2
-        .iter()
-        .find(|profile| profile.id == profile_id)
-        .ok_or_else(|| AppError::invalid("behavior_v2_profile_not_found", "V2 行为档案不存在"))?;
-    pretty_json(
-        profile,
-        "behavior_v2_profile_encode_failed",
-        "V2 行为档案导出失败",
-    )
-}
-
-#[tauri::command]
-pub fn export_behavior_session_v2(
-    state: State<'_, RuntimeState>,
-    session_id: String,
-) -> Result<String, AppError> {
-    let config = state.config()?;
-    let session = config
-        .behavior_sessions_v2
-        .iter()
-        .find(|session| session.id == session_id)
-        .ok_or_else(|| {
-            AppError::invalid(
-                "behavior_v2_session_not_retained",
-                "该 V2 原始 Session 未保留在本机",
-            )
-        })?;
-    pretty_json(
-        session,
-        "behavior_v2_session_encode_failed",
-        "V2 原始 Session 导出失败",
-    )
 }
 
 #[tauri::command]
@@ -444,11 +477,6 @@ pub fn retrain_behavior_profile_v2(
     Ok(profile)
 }
 
-fn pretty_json<T: Serialize>(value: &T, code: &str, message: &str) -> Result<String, AppError> {
-    serde_json::to_string_pretty(value)
-        .map_err(|error| AppError::with_detail(code, message, error.to_string()))
-}
-
 fn clear_behavior_profile_references(config: &mut AppConfig, profile_id: &str) {
     config
         .behavior_profiles_v2
@@ -535,6 +563,7 @@ mod tests {
         config.macros.push(MacroRule {
             id: "macro-1".to_string(),
             name: "Macro".to_string(),
+            import_error: None,
             enabled: false,
             trigger_keys: vec![],
             mode: MacroMode::Once,

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { classifyMacroSource, macroToSource, parseMacroSource } from "./macroSource";
+import {
+  classifyMacroSource,
+  macroToSource,
+  parseMacroSource,
+} from "./macroSource";
 import { normalizeConfig } from "./tauri";
 import { RHAI_API_NAMES, RHAI_API_SIGNATURES } from "../components/RhaiEditor";
 import { isSupportedAssetFileName } from "../components/AssetManager";
@@ -19,7 +23,7 @@ const rhaiMacro: MacroRule = {
     kind: "rhai",
     apiVersion: 1,
     source:
-      'let title = active_window_title();\nwait_image("button", 0, 0, 400, 300, 0.9, 1000, 100);',
+      'let title = active_window_title();\nwait_image("button.png", 0, 0, 400, 300, 0.9, 1000, 100);',
   },
 };
 
@@ -29,6 +33,14 @@ describe("vision automation frontend contracts", () => {
     if (rhaiMacro.program.kind !== "rhai")
       throw new Error("expected Rhai macro");
     expect(macroToSource(rhaiMacro)).toBe(rhaiMacro.program.source);
+  });
+
+  it("classifies custom stop popups as advanced Rhai", () => {
+    expect(classifyMacroSource('stop_with_message("完成");')).toBe("advanced");
+    expect(RHAI_API_NAMES).toContain("stop_with_message");
+    expect(RHAI_API_SIGNATURES.stop_with_message).toContain(
+      "stop_with_message",
+    );
   });
 
   it("exposes all vision APIs with signatures for completion and help", () => {
@@ -66,7 +78,8 @@ describe("vision automation frontend contracts", () => {
         },
       ],
     });
-    expect(normalized.schemaVersion).toBe(5);
+    expect(normalized.schemaVersion).toBe(6);
+    expect(normalized.macroFiles).toEqual([]);
     expect(normalized.assets[0].fileName).toBe("asset_button_abc.png");
     expect(normalized.macros[0].program).toEqual({
       kind: "macro",
@@ -135,7 +148,9 @@ describe("vision automation frontend contracts", () => {
       speedScale: 4,
       seed: 12,
     });
-    expect(normalized.behaviorProfilesV2[0].modelConfig.minBucketSamples).toBe(3);
+    expect(normalized.behaviorProfilesV2[0].modelConfig.minBucketSamples).toBe(
+      3,
+    );
     expect(normalized.behaviorProfilesV2[0].pointerModel.buckets).toEqual([]);
   });
 
@@ -154,7 +169,7 @@ describe("vision automation frontend contracts", () => {
         seed: 9,
       },
     };
-    const parsed = parseMacroSource('move_to(10, 20);', policyMacro);
+    const parsed = parseMacroSource("move_to(10, 20);", policyMacro);
     expect(parsed.behaviorPolicy).toEqual(policyMacro.behaviorPolicy);
   });
 });

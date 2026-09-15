@@ -14,7 +14,7 @@ use crate::AppError;
 use serde::{de::Deserializer, Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub text_expansions: Vec<TextExpansionRule>,
     #[serde(default)]
     pub macros: Vec<MacroRule>,
+    #[serde(default)]
+    pub macro_files: Vec<MacroRuleFile>,
     #[serde(default)]
     pub assets: Vec<AutomationAsset>,
     #[serde(default)]
@@ -112,6 +114,8 @@ pub struct TextExpansionRule {
 pub struct MacroRule {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_error: Option<String>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -131,6 +135,24 @@ pub struct MacroRule {
     #[serde(default)]
     pub behavior_policy: Option<BehaviorPolicy>,
     pub program: AutomationProgram,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroRuleFile {
+    pub id: String,
+    pub name: String,
+    pub file_name: String,
+}
+
+impl MacroRuleFile {
+    pub fn from_macro(rule: &MacroRule, file_name: String) -> Self {
+        Self {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            file_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +180,8 @@ impl Default for AutomationProgram {
 struct MacroRuleWire {
     id: String,
     name: String,
+    #[serde(default)]
+    import_error: Option<String>,
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -194,6 +218,7 @@ impl<'de> Deserialize<'de> for MacroRule {
         Ok(Self {
             id: wire.id,
             name: wire.name,
+            import_error: wire.import_error,
             enabled: wire.enabled,
             trigger_keys: wire.trigger_keys,
             mode: wire.mode,
@@ -329,6 +354,7 @@ impl Default for AppConfig {
                 sensitive: false,
             }],
             macros: Vec::new(),
+            macro_files: Vec::new(),
             assets: Vec::new(),
             behavior_profiles: Vec::new(),
             behavior_profile_files: Vec::new(),
@@ -477,6 +503,9 @@ impl AppConfig {
         }
 
         for macro_rule in &self.macros {
+            if macro_rule.import_error.is_some() {
+                continue;
+            }
             if let Some(policy) = &macro_rule.behavior_policy {
                 policy.validate()?;
                 if let Some(profile_id) = &policy.profile_id {
@@ -584,6 +613,15 @@ impl AppConfig {
             if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
                 return Err(AppError::invalid("macro_missing_name", "宏需要填写名称"));
             }
+            if rule.import_error.is_some() {
+                if rule.enabled {
+                    return Err(AppError::invalid(
+                        "macro_import_invalid_enabled",
+                        "导入错误的宏必须保持停用，修复脚本后才能启用",
+                    ));
+                }
+                continue;
+            }
             if rule.speed <= 0.0 || !rule.speed.is_finite() {
                 return Err(AppError::invalid(
                     "macro_invalid_speed",
@@ -678,7 +716,7 @@ impl AppConfig {
                     "图像资源 ID 不能重复",
                 ));
             }
-            if !asset_file_names.insert(asset.file_name.clone()) {
+            if !asset_file_names.insert(asset.file_name.to_lowercase()) {
                 return Err(AppError::invalid(
                     "asset_duplicate_file",
                     "图像资源文件名不能重复",
@@ -801,6 +839,7 @@ mod tests {
         let macro_rule = MacroRule {
             id: "macro-a".to_string(),
             name: "宏 A".to_string(),
+            import_error: None,
             enabled: true,
             trigger_keys: vec!["Ctrl".to_string(), "F8".to_string()],
             mode: MacroMode::Once,
@@ -896,11 +935,33 @@ mod tests {
     }
 
     #[test]
+    fn schema_five_configs_gain_an_empty_macro_file_index() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 5,
+            "macros": [{
+                "id": "inline-macro",
+                "name": "Inline macro",
+                "steps": []
+            }]
+        }))
+        .expect("schema five config should deserialize");
+        assert!(config.macro_files.is_empty());
+        assert_eq!(config.macros.len(), 1);
+
+        let (config, migrated) = config.migrate().expect("schema five should migrate");
+        assert!(migrated);
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        let saved = serde_json::to_value(config).expect("migrated config should serialize");
+        assert_eq!(saved["macroFiles"], serde_json::json!([]));
+    }
+
+    #[test]
     fn rhai_program_requires_api_version_one_and_non_empty_source() {
         let mut config = AppConfig::default();
         config.macros.push(MacroRule {
             id: "rhai-macro".to_string(),
             name: "Rhai".to_string(),
+            import_error: None,
             enabled: false,
             trigger_keys: Vec::new(),
             mode: MacroMode::Once,
@@ -922,6 +983,35 @@ mod tests {
         assert_eq!(
             config.validate().expect_err("wrong API version").code,
             "rhai_api_version"
+        );
+    }
+
+    #[test]
+    fn invalid_imported_macro_must_stay_disabled_until_repaired() {
+        let mut config = AppConfig::default();
+        config.macros.push(MacroRule {
+            id: "invalid-import".to_string(),
+            name: "待修复".to_string(),
+            import_error: Some("JSON 格式不合法".to_string()),
+            enabled: false,
+            trigger_keys: Vec::new(),
+            mode: MacroMode::Once,
+            repeat_count: 1,
+            speed: 1.0,
+            record_mouse_move: true,
+            record_mouse_clicks: true,
+            target: None,
+            behavior_policy: None,
+            program: AutomationProgram::Rhai {
+                source: "broken".to_string(),
+                api_version: 1,
+            },
+        });
+        assert!(config.validate().is_ok());
+        config.macros[0].enabled = true;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "macro_import_invalid_enabled"
         );
     }
 
@@ -1003,6 +1093,7 @@ mod tests {
         let macro_rule = MacroRule {
             id: "policy-macro".to_string(),
             name: "Policy macro".to_string(),
+            import_error: None,
             enabled: false,
             trigger_keys: vec!["F8".to_string()],
             mode: MacroMode::Once,

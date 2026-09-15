@@ -25,7 +25,7 @@
 5. 修改名称、触发组合、步骤参数后，先点击“测试播放”。
 6. 确认结果正确后再点击“启用宏”。
 
-当前参考宏包括普通键鼠流程、随机等待、窗口内找图和像素等待。参考宏中的坐标、窗口标题、颜色和图像资源 ID 都是示例值，必须按实际目标修改。
+当前参考代码包括普通键鼠流程、随机等待、窗口内找图和像素等待。其中的坐标、窗口标题、颜色和图像文件名都是示例值，必须按实际目标修改。
 
 ### 2.2 新建空白宏
 
@@ -297,10 +297,10 @@ if wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200) {
 
 ### 7.5 图像查找 API
 
-| API                                                                         | 返回值 | 说明                     |
-| --------------------------------------------------------------------------- | ------ | ------------------------ |
-| `find_image(asset_id, x, y, width, height, threshold)`                      | Map    | 在指定区域查找一次       |
-| `wait_image(asset_id, x, y, width, height, threshold, timeout_ms, poll_ms)` | Map    | 轮询查找，直到找到或超时 |
+| API                                                                          | 返回值 | 说明                                 |
+| ---------------------------------------------------------------------------- | ------ | ------------------------------------ |
+| `find_image(file_name, x, y, width, height, threshold)`                      | Map    | 按完整文件名在指定区域查找一次       |
+| `wait_image(file_name, x, y, width, height, threshold, timeout_ms, poll_ms)` | Map    | 按完整文件名轮询查找，直到找到或超时 |
 
 返回 Map 包含：
 
@@ -326,7 +326,7 @@ let window = window_rect("记事本");
 
 if window.found {
     let result = wait_image(
-        "confirm_button",
+        "confirm_button.png",
         window.x,
         window.y,
         window.width,
@@ -344,13 +344,13 @@ if window.found {
 
 ## 8. 图像资源管理
 
-图像查找不能直接读取任意文件路径，必须先把图片导入 AutoFlow：
+图像查找不能直接读取任意文件路径。图片统一保存在 AutoFlow 的 `data/images` 文件夹：
 
 1. 打开宏的“源码”页签。
-2. 在“图像资源”区域点击“导入 PNG/JPEG”。
-3. 选择一张 PNG、JPG 或 JPEG 图片。
-4. 导入后点击资源卡片中的“复制 ID”。
-5. 把复制的 ID 填入 `find_image` 或 `wait_image` 的第一个参数。
+2. 在“图像资源”区域点击“导入 PNG/JPEG”，或者打开图像文件夹后直接复制图片进去。
+3. 选择或放入一张 PNG、JPG 或 JPEG 图片；直接添加文件后点击“刷新”。
+4. 点击资源卡片中的“复制文件名”。
+5. 把复制的完整文件名填入 `find_image` 或 `wait_image` 的第一个参数。必须包含 `.png`、`.jpg` 或 `.jpeg` 后缀。
 
 素材建议：
 
@@ -358,7 +358,7 @@ if window.found {
 - 素材应与实际显示缩放、主题、字体和窗口状态一致。
 - 优先在目标窗口范围内找图，不要直接搜索整个桌面。
 - `threshold` 范围为 `0.0`–`1.0`；可从 `0.90` 开始，误匹配时提高，找不到时适当降低。
-- 删除素材会使引用该资源 ID 的脚本失效。
+- 删除素材会使引用该文件名的脚本失效。
 
 ## 9. 视觉参数与多显示器
 
@@ -381,7 +381,7 @@ let title = "目标程序";
 if wait_window(title, 15000, 200) {
     let window = window_rect(title);
     let button = wait_image(
-        "submit_button",
+        "submit_button.png",
         window.x,
         window.y,
         window.width,
@@ -419,6 +419,27 @@ for round in 0..100 {
     wait_random_ms(800, 1200);
 }
 ```
+
+### 7.6 图像匹配高级选项
+
+`find_image` 和 `wait_image` 继续支持原有参数签名，也支持最后追加一个
+`options` Map：`mode` 可取 `"auto"`、`"exact"` 或 `"fast"`，
+`prefer_last` 控制是否优先复用上一命中区域，`max_candidates` 范围为
+1–32。例如：
+
+```rhai
+let result = find_image(
+    "confirm_button.png", 0, 0, 1920, 1080, 0.90,
+    #{ mode: "auto", prefer_last: true, max_candidates: 8 }
+);
+```
+
+`auto` 使用上一命中区域、1/2 分辨率金字塔和原图局部复核；粗匹配不确定
+时才执行并行全图 NCC。`exact` 直接执行并行全图 NCC，`fast` 不执行全图
+兜底。返回 Map 在原有 `found`、坐标、尺寸和 `score` 外还包含
+`total_ms`、`capture_ms`、`prepare_ms`、`coarse_ms`、`refine_ms`、
+`fallback_ms`、`candidate_count`、`previous_hit_used`、`fallback_used` 和
+`matcher_mode`；旧脚本不读取这些字段时行为不变。
 
 避免没有等待的无限循环。即使引擎有操作数限制，这类循环仍会快速消耗执行预算，也会让目标程序接收过多输入。
 
@@ -462,7 +483,7 @@ Rhai 脚本只能调用 AutoFlow 注册的 API，不能访问：
 
 ### 找图一直返回 `found = false`
 
-- 确认使用的是资源 ID，不是文件名或显示名称。
+- 确认使用的是包含扩展名的完整文件名，例如 `confirm_button.png`；后缀不能省略。
 - 确认素材没有被删除，预览中没有显示“文件不存在”。
 - 检查搜索区域是否覆盖目标图像。
 - 检查显示缩放、主题、亮暗模式和按钮状态是否与素材一致。

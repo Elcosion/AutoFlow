@@ -9,10 +9,9 @@ import {
 import {
   deleteBehaviorProfileV2,
   deleteBehaviorSessionV2,
-  exportBehaviorProfileV2,
-  exportBehaviorSessionV2,
   generateBehaviorApi,
   getBehaviorRecordingStatus,
+  openDataDirectory,
   retrainBehaviorProfileV2,
   startBehaviorRecording,
   stopBehaviorRecording,
@@ -47,12 +46,10 @@ function formatNumber(value: number): string {
   );
 }
 
-function qualityLabel(quality: BehaviorProfileV2["coverage"]["quality"]): string {
-  return quality === "good"
-    ? "良好"
-    : quality === "usable"
-      ? "可用"
-      : "不足";
+function qualityLabel(
+  quality: BehaviorProfileV2["coverage"]["quality"],
+): string {
+  return quality === "good" ? "良好" : quality === "usable" ? "可用" : "不足";
 }
 
 export function BehaviorPage() {
@@ -157,25 +154,6 @@ export function BehaviorPage() {
     }).then(() => showNotice("当前宏默认档案已切换"));
   };
 
-  const downloadText = (fileName: string, content: string) => {
-    const blob = new Blob([content], { type: "application/json;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  };
-
-  const exportProfile = async (profile: BehaviorProfileV2) => {
-    try {
-      downloadText(`${profile.id}.json`, await exportBehaviorProfileV2(profile.id));
-      showNotice("V2 Profile JSON 已导出");
-    } catch (reason) {
-      setError(toErrorMessage(reason));
-    }
-  };
-
   const deleteProfile = async (profile: BehaviorProfileV2) => {
     const inUse =
       config.activeBehaviorProfileV2Id === profile.id ||
@@ -191,18 +169,11 @@ export function BehaviorPage() {
       const next = await deleteBehaviorProfileV2(profile.id, true);
       await refresh();
       setSelectedId(
-        next.activeBehaviorProfileV2Id ?? next.behaviorProfilesV2[0]?.id ?? null,
+        next.activeBehaviorProfileV2Id ??
+          next.behaviorProfilesV2[0]?.id ??
+          null,
       );
       showNotice("V2 Profile 已删除");
-    } catch (reason) {
-      setError(toErrorMessage(reason));
-    }
-  };
-
-  const exportSession = async (sessionId: string) => {
-    try {
-      downloadText(`${sessionId}.json`, await exportBehaviorSessionV2(sessionId));
-      showNotice("原始 Session JSON 已导出");
     } catch (reason) {
       setError(toErrorMessage(reason));
     }
@@ -256,12 +227,30 @@ export function BehaviorPage() {
     }
   };
 
+  const openDataFolder = async () => {
+    try {
+      await openDataDirectory();
+      showNotice("已打开 profiles、sessions、scripts 数据目录");
+    } catch (reason) {
+      setError(toErrorMessage(reason));
+    }
+  };
+
   return (
     <div className="page-stack behavior-page">
       <PageHeader
         eyebrow="V2 行为训练"
         title="鼠标移动与点击模型"
-        description="保存原始训练会话，提取可解释的运动学特征，并按距离、方向和点击上下文生成轨迹。"
+        description="Profile 与保留的原始 Session 会自动保存到独立文件夹，无需手动导出。"
+        action={
+          <button
+            className="button button-secondary"
+            onClick={() => void openDataFolder()}
+            type="button"
+          >
+            打开数据文件夹
+          </button>
+        }
       />
 
       {error ? (
@@ -281,7 +270,9 @@ export function BehaviorPage() {
               <span className="editor-kicker">原始会话</span>
               <h2>{status.active ? "正在采集" : "采集一组训练数据"}</h2>
             </div>
-            <span className={`behavior-status ${status.active ? "is-live" : ""}`}>
+            <span
+              className={`behavior-status ${status.active ? "is-live" : ""}`}
+            >
               <i /> {status.active ? "采集中" : "空闲"}
             </span>
           </div>
@@ -298,7 +289,11 @@ export function BehaviorPage() {
           </div>
           <div className="behavior-recording-actions">
             {status.active ? (
-              <button className="button button-danger" onClick={() => void stop()} type="button">
+              <button
+                className="button button-danger"
+                onClick={() => void stop()}
+                type="button"
+              >
                 停止并训练 V2 档案
               </button>
             ) : (
@@ -311,7 +306,9 @@ export function BehaviorPage() {
                 开始采集
               </button>
             )}
-            <span className="form-help">建议包含多段移动、停顿、移动后点击和不同距离。</span>
+            <span className="form-help">
+              建议包含多段移动、停顿、移动后点击和不同距离。
+            </span>
           </div>
           <label className="behavior-retention-toggle">
             <input
@@ -321,18 +318,36 @@ export function BehaviorPage() {
               type="checkbox"
             />
             <span>
-              持久化原始行为会话（关闭后仍可训练 V2，只是不保留可复核 rawEvents）
+              持久化原始行为会话（关闭后仍可训练 V2，只是不保留可复核
+              rawEvents）
             </span>
           </label>
           <div className="behavior-metric-grid">
-            <div><strong>{formatDuration(status.durationMs)}</strong><span>会话时长</span></div>
-            <div><strong>{formatNumber(status.eventCount)}</strong><span>原始事件</span></div>
-            <div><strong>{formatNumber(status.mouseEvents)}</strong><span>鼠标事件</span></div>
-            <div><strong>{formatNumber(status.keyboardEvents)}</strong><span>键盘事件</span></div>
-            <div><strong>{formatNumber(status.wheelEvents)}</strong><span>滚轮事件</span></div>
+            <div>
+              <strong>{formatDuration(status.durationMs)}</strong>
+              <span>会话时长</span>
+            </div>
+            <div>
+              <strong>{formatNumber(status.eventCount)}</strong>
+              <span>原始事件</span>
+            </div>
+            <div>
+              <strong>{formatNumber(status.mouseEvents)}</strong>
+              <span>鼠标事件</span>
+            </div>
+            <div>
+              <strong>{formatNumber(status.keyboardEvents)}</strong>
+              <span>键盘事件</span>
+            </div>
+            <div>
+              <strong>{formatNumber(status.wheelEvents)}</strong>
+              <span>滚轮事件</span>
+            </div>
           </div>
           <p className="form-help behavior-privacy-note">
-            录制期间始终在有界内存中采集事件用于训练；此开关只决定是否将 V2 session 写入磁盘。BehaviorProfileV2 不包含 rawEvents。
+            录制期间始终在有界内存中采集事件用于训练；此开关只决定是否将 V2
+            session 写入 data/sessions。训练结果自动写入 data/profiles，且
+            BehaviorProfileV2 不包含 rawEvents。
           </p>
         </section>
 
@@ -346,49 +361,100 @@ export function BehaviorPage() {
               aria-pressed={config.behaviorPolicy.enabled}
               className={`large-toggle ${config.behaviorPolicy.enabled ? "on" : ""}`}
               disabled={!selectedProfile || status.active}
-              onClick={() => void updatePolicy({ enabled: !config.behaviorPolicy.enabled })}
+              onClick={() =>
+                void updatePolicy({ enabled: !config.behaviorPolicy.enabled })
+              }
               type="button"
-            ><i /></button>
+            >
+              <i />
+            </button>
           </div>
           <div className="form-section">
             <label>
-              <span>Timing strength：{Math.round(config.behaviorPolicy.timingStrength * 100)}%</span>
+              <span>
+                Timing strength：
+                {Math.round(config.behaviorPolicy.timingStrength * 100)}%
+              </span>
               <input
-                max="1" min="0" step="0.05" type="range"
+                max="1"
+                min="0"
+                step="0.05"
+                type="range"
                 value={config.behaviorPolicy.timingStrength}
-                onChange={(event) => void updatePolicy({ timingStrength: Number(event.target.value) })}
+                onChange={(event) =>
+                  void updatePolicy({
+                    timingStrength: Number(event.target.value),
+                  })
+                }
               />
             </label>
             <label>
-              <span>Pointer path strength：{Math.round(config.behaviorPolicy.pointerPathStrength * 100)}%</span>
+              <span>
+                Pointer path strength：
+                {Math.round(config.behaviorPolicy.pointerPathStrength * 100)}%
+              </span>
               <input
-                max="1" min="0" step="0.05" type="range"
+                max="1"
+                min="0"
+                step="0.05"
+                type="range"
                 value={config.behaviorPolicy.pointerPathStrength}
-                onChange={(event) => void updatePolicy({ pointerPathStrength: Number(event.target.value) })}
+                onChange={(event) =>
+                  void updatePolicy({
+                    pointerPathStrength: Number(event.target.value),
+                  })
+                }
               />
             </label>
             <label>
-              <span>Pause strength：{Math.round(config.behaviorPolicy.pauseStrength * 100)}%</span>
+              <span>
+                Pause strength：
+                {Math.round(config.behaviorPolicy.pauseStrength * 100)}%
+              </span>
               <input
-                max="1" min="0" step="0.05" type="range"
+                max="1"
+                min="0"
+                step="0.05"
+                type="range"
                 value={config.behaviorPolicy.pauseStrength}
-                onChange={(event) => void updatePolicy({ pauseStrength: Number(event.target.value) })}
+                onChange={(event) =>
+                  void updatePolicy({
+                    pauseStrength: Number(event.target.value),
+                  })
+                }
               />
             </label>
             <label>
-              <span>Correction strength：{Math.round(config.behaviorPolicy.correctionStrength * 100)}%</span>
+              <span>
+                Correction strength：
+                {Math.round(config.behaviorPolicy.correctionStrength * 100)}%
+              </span>
               <input
-                max="1" min="0" step="0.05" type="range"
+                max="1"
+                min="0"
+                step="0.05"
+                type="range"
                 value={config.behaviorPolicy.correctionStrength}
-                onChange={(event) => void updatePolicy({ correctionStrength: Number(event.target.value) })}
+                onChange={(event) =>
+                  void updatePolicy({
+                    correctionStrength: Number(event.target.value),
+                  })
+                }
               />
             </label>
             <label>
-              <span>Speed scale：{config.behaviorPolicy.speedScale.toFixed(2)}×</span>
+              <span>
+                Speed scale：{config.behaviorPolicy.speedScale.toFixed(2)}×
+              </span>
               <input
-                max="4" min="0.1" step="0.05" type="range"
+                max="4"
+                min="0.1"
+                step="0.05"
+                type="range"
                 value={config.behaviorPolicy.speedScale}
-                onChange={(event) => void updatePolicy({ speedScale: Number(event.target.value) })}
+                onChange={(event) =>
+                  void updatePolicy({ speedScale: Number(event.target.value) })
+                }
               />
             </label>
             <label>
@@ -399,7 +465,10 @@ export function BehaviorPage() {
                 onChange={(event) => {
                   const value = event.target.value.trim();
                   void updatePolicy({
-                    seed: value === "" ? undefined : Math.max(0, Math.floor(Number(value) || 0)),
+                    seed:
+                      value === ""
+                        ? undefined
+                        : Math.max(0, Math.floor(Number(value) || 0)),
                   });
                 }}
                 placeholder="session seed"
@@ -408,13 +477,24 @@ export function BehaviorPage() {
               />
             </label>
           </div>
-          <p className="form-help">0 强度保持原始输入路径；策略绑定在宏上时优先使用宏设置。targetWidth 仅是运行时目标宽度提示，本版训练采集尚未获得真实目标几何，因此训练 bucket 的宽度通常为 unknown。</p>
+          <p className="runtime-pointer-warning" role="note">
+            <strong>鼠标运行提示：</strong>
+            宏运行期间手动抢动鼠标会与自动轨迹相互干扰，导致速度、曲率和修正等仿生移动特征不稳定。动作之间移动鼠标会成为下一步的新起点；轨迹执行过程中请避免操作鼠标。
+          </p>
+          <p className="form-help">
+            0 强度保持原始输入路径；策略绑定在宏上时优先使用宏设置。targetWidth
+            仅是运行时目标宽度提示，本版训练采集尚未获得真实目标几何，因此训练
+            bucket 的宽度通常为 unknown。
+          </p>
           <div className="behavior-profile-list">
             <div className="behavior-list-heading">
-              <strong>V2 模型档案</strong><span>{config.behaviorProfilesV2.length} 个</span>
+              <strong>V2 模型档案</strong>
+              <span>{config.behaviorProfilesV2.length} 个</span>
             </div>
             {config.behaviorProfilesV2.length === 0 ? (
-              <div className="behavior-empty">完成一次采集后，V2 档案会显示在这里。</div>
+              <div className="behavior-empty">
+                完成一次采集后，V2 档案会显示在这里。
+              </div>
             ) : (
               config.behaviorProfilesV2.map((profile) => (
                 <button
@@ -424,7 +504,11 @@ export function BehaviorPage() {
                   type="button"
                 >
                   <strong>{profile.name}</strong>
-                  <span>{qualityLabel(profile.coverage.quality)} · {profile.coverage.validPointerEpisodeCount} 条有效轨迹 · {formatNumber(profile.coverage.rawEventCount)} 个事件</span>
+                  <span>
+                    {qualityLabel(profile.coverage.quality)} ·{" "}
+                    {profile.coverage.validPointerEpisodeCount} 条有效轨迹 ·{" "}
+                    {formatNumber(profile.coverage.rawEventCount)} 个事件
+                  </span>
                 </button>
               ))
             )}
@@ -437,35 +521,76 @@ export function BehaviorPage() {
           <div className="settings-card-heading">
             <div>
               <span className="editor-kicker">模型质量</span>
-              <h2>{selectedProfile.name} · {qualityLabel(selectedProfile.coverage.quality)}</h2>
+              <h2>
+                {selectedProfile.name} ·{" "}
+                {qualityLabel(selectedProfile.coverage.quality)}
+              </h2>
             </div>
             <span className="form-help">
-              {selectedProfile.sourceRetention === "persisted" ? "已保留原始 Session" : "仅保留去敏 Profile"} · 真实训练数据：{selectedProfile.coverage.validPointerEpisodeCount} 条
+              {selectedProfile.sourceRetention === "persisted"
+                ? "已保留原始 Session"
+                : "仅保留去敏 Profile"}{" "}
+              · 真实训练数据：
+              {selectedProfile.coverage.validPointerEpisodeCount} 条
             </span>
           </div>
           <div className="behavior-metric-grid">
-            <div><strong>{selectedProfile.coverage.pointerEpisodeCount}</strong><span>切分轨迹</span></div>
-            <div><strong>{selectedProfile.coverage.clickAssociatedPointerEpisodeCount}</strong><span>与点击关联轨迹</span></div>
-            <div><strong>{selectedProfile.coverage.clickEpisodeCount}</strong><span>点击片段</span></div>
-            <div><strong>{selectedProfile.coverage.bucketCoverage.length}</strong><span>距离/方向 buckets</span></div>
-            <div><strong>{selectedProfile.clickModel.buckets.length}</strong><span>点击时序 buckets</span></div>
-            <div><strong>{selectedProfile.coverage.discardedEventCount}</strong><span>丢弃事件</span></div>
+            <div>
+              <strong>{selectedProfile.coverage.pointerEpisodeCount}</strong>
+              <span>切分轨迹</span>
+            </div>
+            <div>
+              <strong>
+                {selectedProfile.coverage.clickAssociatedPointerEpisodeCount}
+              </strong>
+              <span>与点击关联轨迹</span>
+            </div>
+            <div>
+              <strong>{selectedProfile.coverage.clickEpisodeCount}</strong>
+              <span>点击片段</span>
+            </div>
+            <div>
+              <strong>{selectedProfile.coverage.bucketCoverage.length}</strong>
+              <span>距离/方向 buckets</span>
+            </div>
+            <div>
+              <strong>{selectedProfile.clickModel.buckets.length}</strong>
+              <span>点击时序 buckets</span>
+            </div>
+            <div>
+              <strong>{selectedProfile.coverage.discardedEventCount}</strong>
+              <span>丢弃事件</span>
+            </div>
           </div>
           <p className="form-help">
-            模型阈值：每个 bucket 至少 {selectedProfile.modelConfig.minBucketSamples} 个样本；质量等级按 {selectedProfile.modelConfig.minQualityEpisodes}/{selectedProfile.modelConfig.usableQualityEpisodes}/{selectedProfile.modelConfig.goodQualityEpisodes} 条有效轨迹计算。运行时 fallbackLevel 与 fallbackReason 只反映请求上下文，不会伪装成训练覆盖率。
+            模型阈值：每个 bucket 至少{" "}
+            {selectedProfile.modelConfig.minBucketSamples} 个样本；质量等级按{" "}
+            {selectedProfile.modelConfig.minQualityEpisodes}/
+            {selectedProfile.modelConfig.usableQualityEpisodes}/
+            {selectedProfile.modelConfig.goodQualityEpisodes}{" "}
+            条有效轨迹计算。运行时 fallbackLevel 与 fallbackReason
+            只反映请求上下文，不会伪装成训练覆盖率。
           </p>
           {qualityView ? (
             <p className="form-help">
-              充足样本覆盖：{qualityView.eligibleEpisodeCount}/{qualityView.validEpisodeCount} 条（{Math.round(qualityView.eligibleCoverage * 1000) / 10}%）；质量过滤轨迹：{selectedProfile.coverage.qualityFilteredPointerEpisodeCount} 条。
+              充足样本覆盖：{qualityView.eligibleEpisodeCount}/
+              {qualityView.validEpisodeCount} 条（
+              {Math.round(qualityView.eligibleCoverage * 1000) / 10}
+              %）；质量过滤轨迹：
+              {selectedProfile.coverage.qualityFilteredPointerEpisodeCount} 条。
             </p>
           ) : null}
           {targetWidthView ? (
             <p className="form-help">
-              {targetWidthView.message}。Profile 中不从屏幕尺寸、坐标或位移推测目标宽度。
+              {targetWidthView.message}。Profile
+              中不从屏幕尺寸、坐标或位移推测目标宽度。
             </p>
           ) : null}
           <div className="behavior-profile-list">
-            <div className="behavior-list-heading"><strong>Bucket coverage</strong><span>运行时默认回退不会计入训练覆盖率</span></div>
+            <div className="behavior-list-heading">
+              <strong>Bucket coverage</strong>
+              <span>运行时默认回退不会计入训练覆盖率</span>
+            </div>
             {selectedProfile.coverage.bucketCoverage.map((bucket) => (
               <div className="behavior-profile-row" key={bucket.bucket}>
                 <strong>{bucket.bucket}</strong>
@@ -476,8 +601,13 @@ export function BehaviorPage() {
                   );
                   return (
                     <span>
-                      {training.sampleCount}/{training.minimumSamples} 条样本 · {training.ready ? "样本充足" : "样本不足"} · {Math.round(bucket.coverage * 100)}% coverage · 预计{training.expectedFallback ? "需要" : "不需要"} fallback
-                      {training.fallbackReason ? ` · 原因：${training.fallbackReason}` : ""}
+                      {training.sampleCount}/{training.minimumSamples} 条样本 ·{" "}
+                      {training.ready ? "样本充足" : "样本不足"} ·{" "}
+                      {Math.round(bucket.coverage * 100)}% coverage · 预计
+                      {training.expectedFallback ? "需要" : "不需要"} fallback
+                      {training.fallbackReason
+                        ? ` · 原因：${training.fallbackReason}`
+                        : ""}
                     </span>
                   );
                 })()}
@@ -485,10 +615,22 @@ export function BehaviorPage() {
             ))}
           </div>
           <div className="behavior-profile-list">
-            <div className="behavior-list-heading"><strong>Click timing model</strong><span>{selectedProfile.clickModel.buckets.length} 个 button/context buckets</span></div>
+            <div className="behavior-list-heading">
+              <strong>Click timing model</strong>
+              <span>
+                {selectedProfile.clickModel.buckets.length} 个 button/context
+                buckets
+              </span>
+            </div>
             {selectedProfile.clickModel.buckets.map((bucket) => (
-              <div className="behavior-profile-row" key={`${bucket.button}-${bucket.followedByMove}`}>
-                <strong>{bucket.button} · afterMove={bucket.followedByMove ? "true" : "false"}</strong>
+              <div
+                className="behavior-profile-row"
+                key={`${bucket.button}-${bucket.followedByMove}`}
+              >
+                <strong>
+                  {bucket.button} · afterMove=
+                  {bucket.followedByMove ? "true" : "false"}
+                </strong>
                 {(() => {
                   const training = getBucketTrainingView(
                     bucket.validSampleCount,
@@ -496,8 +638,12 @@ export function BehaviorPage() {
                   );
                   return (
                     <span>
-                      {training.sampleCount}/{training.minimumSamples} 条样本 · {training.ready ? "样本充足" : "样本不足"} · 预计{training.expectedFallback ? "需要" : "不需要"} fallback
-                      {training.fallbackReason ? ` · 原因：${training.fallbackReason}` : ""}
+                      {training.sampleCount}/{training.minimumSamples} 条样本 ·{" "}
+                      {training.ready ? "样本充足" : "样本不足"} · 预计
+                      {training.expectedFallback ? "需要" : "不需要"} fallback
+                      {training.fallbackReason
+                        ? ` · 原因：${training.fallbackReason}`
+                        : ""}
                     </span>
                   );
                 })()}
@@ -506,14 +652,30 @@ export function BehaviorPage() {
           </div>
           {Object.keys(selectedProfile.coverage.discardedReasons).length > 0 ? (
             <p className="form-help">
-              丢弃原因：{Object.entries(selectedProfile.coverage.discardedReasons).map(([reason, count]) => `${reason}=${count}`).join("，")}
+              丢弃原因：
+              {Object.entries(selectedProfile.coverage.discardedReasons)
+                .map(([reason, count]) => `${reason}=${count}`)
+                .join("，")}
             </p>
           ) : null}
           <div className="behavior-data-actions">
-            <span className="form-help">运行时 fallback 会在结果中带有 fallbackReason。</span>
-            <button className="button button-secondary" onClick={() => void createApi()} type="button">生成 Rhai API</button>
-            <button className="button button-secondary" onClick={() => void exportProfile(selectedProfile)} type="button">导出 Profile</button>
-            <button className="danger-link" onClick={() => void deleteProfile(selectedProfile)} type="button">删除 Profile</button>
+            <span className="form-help">
+              运行时 fallback 会在结果中带有 fallbackReason。
+            </span>
+            <button
+              className="button button-secondary"
+              onClick={() => void createApi()}
+              type="button"
+            >
+              生成 Rhai API
+            </button>
+            <button
+              className="danger-link"
+              onClick={() => void deleteProfile(selectedProfile)}
+              type="button"
+            >
+              删除 Profile
+            </button>
           </div>
         </section>
       ) : null}
@@ -524,22 +686,41 @@ export function BehaviorPage() {
             <span className="editor-kicker">原始训练 Session</span>
             <h2>可复核数据 · {config.behaviorSessionsV2.length} 个</h2>
           </div>
-          <span className="form-help">仅显示持久化 raw events；关闭保留开关的录制不会出现在这里。</span>
+          <span className="form-help">
+            自动保存于 data/sessions；关闭保留开关的录制不会出现在这里。
+          </span>
         </div>
         {config.behaviorSessionsV2.length === 0 ? (
-          <div className="behavior-empty">当前没有保留的原始 Session。Profile 仍可以来自关闭持久化后的内存训练。</div>
+          <div className="behavior-empty">
+            当前没有保留的原始 Session。Profile
+            仍可以来自关闭持久化后的内存训练。
+          </div>
         ) : (
           <div className="behavior-profile-list">
             {config.behaviorSessionsV2.map((session) => (
               <div className="behavior-profile-row" key={session.id}>
                 <div>
                   <strong>{session.name}</strong>
-                  <span>{session.id} · {formatDuration(session.durationMs)} · {formatNumber(session.rawEvents.length)} 个 raw events</span>
+                  <span>
+                    {session.id} · {formatDuration(session.durationMs)} ·{" "}
+                    {formatNumber(session.rawEvents.length)} 个 raw events
+                  </span>
                 </div>
                 <div className="behavior-data-actions">
-                  <button className="button button-secondary" onClick={() => void exportSession(session.id)} type="button">导出</button>
-                  <button className="button button-secondary" onClick={() => void retrainSession(session.id)} type="button">重训</button>
-                  <button className="danger-link" onClick={() => void deleteSession(session.id)} type="button">删除</button>
+                  <button
+                    className="button button-secondary"
+                    onClick={() => void retrainSession(session.id)}
+                    type="button"
+                  >
+                    重训
+                  </button>
+                  <button
+                    className="danger-link"
+                    onClick={() => void deleteSession(session.id)}
+                    type="button"
+                  >
+                    删除
+                  </button>
                 </div>
               </div>
             ))}
@@ -551,7 +732,13 @@ export function BehaviorPage() {
         <section className="settings-card behavior-api-card">
           <div className="settings-card-heading">
             <h2>原生 Rhai V2 API</h2>
-            <button className="button button-primary" onClick={() => void copyApi()} type="button">复制</button>
+            <button
+              className="button button-primary"
+              onClick={() => void copyApi()}
+              type="button"
+            >
+              复制
+            </button>
           </div>
           <pre className="behavior-api-source">{api.source}</pre>
         </section>

@@ -22,7 +22,7 @@ pub use behavior::{
 };
 pub use config::{
     AppConfig, AutomationProgram, HotkeyAction, HotkeyRule, KeyAction, MacroMode, MacroRule,
-    MacroStep, MacroTarget, MouseButton, TextExpansionRule,
+    MacroRuleFile, MacroStep, MacroTarget, MouseButton, TextExpansionRule,
 };
 use hook::{HookService, MacroPlaybackStatus, MacroRecordingResult, MacroRecordingStatus};
 
@@ -108,7 +108,7 @@ impl RuntimeState {
         let vision = automation::VisionService::new(
             std::env::temp_dir()
                 .join("AutoFlow")
-                .join("assets")
+                .join("data")
                 .join("images"),
         );
         Ok(Self {
@@ -119,18 +119,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn configure_vision(&self, app: &tauri::AppHandle) -> Result<(), AppError> {
-        let root = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| {
-                AppError::with_detail(
-                    "asset_directory_failed",
-                    "无法定位 AutoFlow 图像资源目录",
-                    error.to_string(),
-                )
-            })?
-            .join("assets")
-            .join("images");
+        let root = storage::managed_image_directory(app)?;
         self.hook.set_vision(automation::VisionService::new(root))
     }
 
@@ -256,6 +245,7 @@ pub fn run() {
             commands::get_app_status,
             commands::ping,
             commands::get_config,
+            commands::open_data_directory,
             commands::save_config,
             commands::import_asset,
             commands::read_asset,
@@ -274,8 +264,6 @@ pub fn run() {
             commands::validate_rhai_source,
             commands::start_behavior_recording,
             commands::stop_behavior_recording,
-            commands::export_behavior_profile_v2,
-            commands::export_behavior_session_v2,
             commands::delete_behavior_profile_v2,
             commands::delete_behavior_session_v2,
             commands::retrain_behavior_profile_v2,

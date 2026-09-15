@@ -10,10 +10,14 @@ import { PageHeader } from "../components/PageHeader";
 import { RhaiEditor } from "../components/RhaiEditor";
 import { useAppConfig, toErrorMessage } from "../lib/config";
 import { useAutoSave } from "../lib/useAutoSave";
+import { shouldHydrateSourceDraft } from "../lib/sourceDraft";
+import {
+  RHAI_API_REFERENCE_SNIPPETS,
+  type RhaiReferenceSnippet,
+} from "../lib/rhaiCompletions";
 import {
   newRuleId,
   macroSteps,
-  type AutomationProgram,
   type BehaviorPolicy,
   type MacroMode,
   type MacroRule,
@@ -22,6 +26,7 @@ import {
 import {
   getMacroPlaybackStatus,
   getMacroRecordingStatus,
+  openDataDirectory,
   playMacro,
   startMacroRecording,
   setMacroRecordingOptions,
@@ -40,113 +45,184 @@ import {
 const macroSignature = (keys: string[]) =>
   keys.map((key) => key.trim().toUpperCase()).join("+");
 
+const uniqueMacroName = (existing: MacroRule[], baseName: string) => {
+  const used = new Set(
+    existing.map((macro) => macro.name.trim().toLocaleLowerCase()),
+  );
+  let suffix = 1;
+  while (true) {
+    const candidate = suffix === 1 ? baseName : `${baseName} (${suffix})`;
+    if (!used.has(candidate.toLocaleLowerCase())) return candidate;
+    suffix += 1;
+  }
+};
+
 const RECORDING_SHORTCUT_LABEL = "Ctrl + Shift + F9";
 type MacroEditorView = "visual" | "source";
 
-type MacroReference = {
-  id: string;
-  name: string;
-  kind: "compatible" | "advanced";
-  description: string;
-  preview: string;
-  program: AutomationProgram;
+type MacroUndoEntry = {
+  label: string;
+  macros: MacroRule[];
+  selectedId: string | null;
 };
 
-const macroReferences: MacroReference[] = [
+const rhaiReferenceSnippets: RhaiReferenceSnippet[] = [
+  {
+    id: "statement-let",
+    category: "基础语句",
+    name: "变量 let",
+    description: "声明一个可在后续步骤中复用的变量。",
+    code: `let value = 100; // value：变量名；100：参考初始值`,
+  },
+  {
+    id: "statement-if",
+    category: "基础语句",
+    name: "条件 if",
+    description: "条件成立时执行代码块。",
+    code: `let condition = true; // condition：需要判断的布尔条件
+if condition {
+  // 条件成立时执行
+}`,
+  },
+  {
+    id: "statement-if-else",
+    category: "基础语句",
+    name: "条件 if / else",
+    description: "分别处理条件成立和不成立的情况。",
+    code: `let condition = true; // condition：需要判断的布尔条件
+if condition {
+  // 条件成立时执行
+} else {
+  // 条件不成立时执行
+}`,
+  },
+  {
+    id: "statement-for",
+    category: "基础语句",
+    name: "计数循环 for",
+    description: "按指定次数重复执行代码块。",
+    code: `for index in 0..10 { // index：当前序号；0..10：循环范围
+  // 每次循环执行
+}`,
+  },
+  {
+    id: "statement-while",
+    category: "基础语句",
+    name: "条件循环 while",
+    description: "条件为真时持续执行，并展示安全退出写法。",
+    code: `let attempts = 0; // attempts：已尝试次数
+while attempts < 10 { // 10：最多尝试次数
+  attempts += 1;
+  wait_ms(200);
+}`,
+  },
+  {
+    id: "statement-loop",
+    category: "基础语句",
+    name: "循环 loop / break",
+    description: "持续循环，并在满足条件时安全退出。",
+    code: `let count = 0; // count：当前循环次数
+loop {
+  count += 1;
+  if count >= 10 { // 10：最大循环次数
+    break;
+  }
+}`,
+  },
+  {
+    id: "statement-function",
+    category: "基础语句",
+    name: "函数 fn / return",
+    description: "定义带参数和返回值的可复用函数。",
+    code: `fn double_value(value) { // value：函数参数
+  return value * 2; // 返回计算结果
+}
+
+let result = double_value(5); // result：函数返回值`,
+  },
+  ...RHAI_API_REFERENCE_SNIPPETS,
   {
     id: "copy-and-type",
+    category: "组合示例",
     name: "复制后输入文本",
-    kind: "compatible",
-    description: "模拟 Ctrl+C，等待片刻后输入一段示例文本。",
-    preview: "Ctrl+C → 等待 300 ms → 输入文本",
-    program: {
-      kind: "macro",
-      steps: [
-        { type: "key", key: "Ctrl", action: "down" },
-        { type: "key", key: "C", action: "down" },
-        { type: "key", key: "C", action: "up" },
-        { type: "key", key: "Ctrl", action: "up" },
-        { type: "delay", durationMs: 300 },
-        { type: "text", text: "AutoFlow 示例文本" },
-      ],
-    },
+    description: "模拟 Ctrl+C，等待片刻后输入文本。",
+    code: `let copy_key = "C"; // copy_key：复制快捷键
+let output_text = "AutoFlow 示例文本"; // output_text：要输入的内容
+
+key_down("Ctrl");
+press(copy_key);
+key_up("Ctrl");
+wait_ms(300); // 等待剪贴板稳定
+type_text(output_text);`,
   },
   {
     id: "click-and-wait",
+    category: "组合示例",
     name: "坐标点击并等待",
-    kind: "compatible",
-    description: "移动到示例坐标并点击一次，适合改成固定位置操作。",
-    preview: "移动到 (820, 430) → 左键点击 → 等待 300 ms",
-    program: {
-      kind: "macro",
-      steps: [
-        { type: "mouseMove", x: 820, y: 430 },
-        {
-          type: "mouseButton",
-          button: "left",
-          action: "down",
-          x: 820,
-          y: 430,
-        },
-        {
-          type: "mouseButton",
-          button: "left",
-          action: "up",
-          x: 820,
-          y: 430,
-        },
-        { type: "delay", durationMs: 300 },
-      ],
-    },
+    description: "移动到指定坐标、点击并等待。",
+    code: `let target_x = 820; // target_x：目标横坐标
+let target_y = 430; // target_y：目标纵坐标
+let button = "left"; // button：鼠标按钮
+
+move_to(target_x, target_y);
+click(button, target_x, target_y);
+wait_ms(300);`,
   },
   {
     id: "random-scroll",
+    category: "组合示例",
     name: "随机间隔滚轮",
-    kind: "compatible",
-    description: "以 300–800 ms 的随机间隔向下滚动一格。",
-    preview: "随机等待 300–800 ms → 滚轮 (0, -120)",
-    program: {
-      kind: "macro",
-      steps: [
-        { type: "delay", durationMs: 300, durationMaxMs: 800 },
-        { type: "wheel", deltaX: 0, deltaY: -120 },
-      ],
-    },
+    description: "以随机间隔向下滚动。",
+    code: `let min_delay = 300; // min_delay：最短等待毫秒数
+let max_delay = 800; // max_delay：最长等待毫秒数
+let scroll_y = -120; // scroll_y：垂直滚动量
+
+wait_random_ms(min_delay, max_delay);
+scroll(0, scroll_y);`,
+  },
+  {
+    id: "stop-message",
+    category: "组合示例",
+    name: "停止并弹窗提示",
+    description: "停止当前脚本并显示自定义标题和内容。",
+    code: `let dialog_title = "AutoFlow"; // dialog_title：弹窗标题
+let dialog_message = "任务已完成"; // dialog_message：提示内容
+stop_with_message(dialog_title, dialog_message);`,
   },
   {
     id: "window-image-click",
+    category: "组合示例",
     name: "窗口内查找图片并点击",
-    kind: "advanced",
-    description: "在指定窗口内查找素材图片，找到后点击图片中心。",
-    preview: "window_rect → find_image → click",
-    program: {
-      kind: "rhai",
-      apiVersion: 1,
-      source: `let window = window_rect("记事本");
+    description: "在指定窗口内查找素材图片并点击中心。",
+    code: `let window_title = "记事本"; // window_title：窗口标题关键字
+let image_file = "confirm_button.png"; // image_file：完整文件名，必须包含后缀
+let threshold = 0.90; // threshold：匹配阈值 0–1
+
+let window = window_rect(window_title);
 if window.found {
-  let result = find_image("confirm_button", window.x, window.y, window.width, window.height, 0.90);
-  if result.found { click("left", result.center_x, result.center_y); }
+  let result = find_image(image_file, window.x, window.y, window.width, window.height, threshold);
+  if result.found {
+    click("left", result.center_x, result.center_y);
+  }
 }`,
-    },
   },
   {
     id: "wait-pixel",
+    category: "组合示例",
     name: "等待像素颜色出现",
-    kind: "advanced",
-    description: "等待指定坐标接近目标颜色，适合等待页面或窗口状态变化。",
-    preview: "wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200)",
-    program: {
-      kind: "rhai",
-      apiVersion: 1,
-      source: "wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);",
-    },
+    description: "等待指定坐标接近目标颜色。",
+    code: `let x = 100; // x：屏幕横坐标
+let y = 200; // y：屏幕纵坐标
+let red = 32; // red：目标红色通道
+let green = 64; // green：目标绿色通道
+let blue = 128; // blue：目标蓝色通道
+let tolerance = 8; // tolerance：颜色容差
+let timeout_ms = 5000; // timeout_ms：最长等待毫秒数
+let poll_ms = 200; // poll_ms：轮询间隔毫秒数
+
+wait_pixel(x, y, red, green, blue, tolerance, timeout_ms, poll_ms);`,
   },
 ];
-
-const cloneProgram = (program: AutomationProgram): AutomationProgram =>
-  program.kind === "macro"
-    ? { kind: "macro", steps: program.steps.map((step) => ({ ...step })) }
-    : { ...program };
 
 const usesRecordingShortcut = (keys: string[]) => {
   const normalized = new Set(keys.map((key) => key.trim().toUpperCase()));
@@ -191,7 +267,7 @@ const blankMacro = (existing: MacroRule[]): MacroRule => {
   const triggerKeys = trigger.includes("+") ? trigger.split("+") : [trigger];
   return {
     id: newRuleId("macro"),
-    name: "新宏",
+    name: uniqueMacroName(existing, "新宏"),
     enabled: false,
     triggerKeys,
     mode: "once",
@@ -251,14 +327,18 @@ function stepTitle(step: MacroStep): string {
 }
 
 export function MacrosPage() {
-  const { config, loading, saving, error, setError, persist, refresh } = useAppConfig();
+  const { config, loading, saving, error, setError, persist, refresh } =
+    useAppConfig();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<MacroRule | null>(null);
   const [editorView, setEditorView] = useState<MacroEditorView>("visual");
   const [sourceText, setSourceText] = useState("");
+  const [sourceDirty, setSourceDirty] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [sourceErrorLine, setSourceErrorLine] = useState<number | null>(null);
-  const [sourceErrorColumn, setSourceErrorColumn] = useState<number | null>(null);
+  const [sourceErrorColumn, setSourceErrorColumn] = useState<number | null>(
+    null,
+  );
   const [recording, setRecording] = useState(false);
   const [recordingCaptureStarted, setRecordingCaptureStarted] = useState(false);
   const [recordingStepCount, setRecordingStepCount] = useState(0);
@@ -269,6 +349,8 @@ export function MacrosPage() {
   } | null>(null);
   const [playCountdown, setPlayCountdown] = useState<number | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [undoStack, setUndoStack] = useState<MacroUndoEntry[]>([]);
+  const [undoing, setUndoing] = useState(false);
   const [draggingStepIndex, setDraggingStepIndex] = useState<number | null>(
     null,
   );
@@ -283,6 +365,10 @@ export function MacrosPage() {
   const triggerCaptureActive = useRef(false);
   const playbackTimerRef = useRef<number | null>(null);
   const configRef = useRef(config);
+  const selectedIdRef = useRef(selectedId);
+  const undoStackRef = useRef(undoStack);
+  const undoLastMacroChangeRef = useRef<() => Promise<void>>(async () => {});
+  const editorMacroIdRef = useRef<string | null>(null);
   const recordingMacroIdRef = useRef<string | null>(null);
   const finishingRecordingRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -290,6 +376,14 @@ export function MacrosPage() {
   useEffect(() => {
     configRef.current = config;
   }, [config]);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
+    undoStackRef.current = undoStack;
+  }, [undoStack]);
 
   useEffect(
     () => () => {
@@ -314,10 +408,20 @@ export function MacrosPage() {
 
   useEffect(() => {
     const next = config.macros.find((macro) => macro.id === selectedId);
-    setEditorView(next?.program.kind === "rhai" ? "source" : "visual");
+    const previousMacroId = editorMacroIdRef.current;
+    if (!shouldHydrateSourceDraft(previousMacroId, selectedId, sourceDirty)) {
+      return;
+    }
+    if (previousMacroId !== selectedId) {
+      setEditorView(next?.program.kind === "rhai" ? "source" : "visual");
+      editorMacroIdRef.current = selectedId;
+    }
     setSourceText(next ? macroToSource(next) : "");
-    setSourceError(null);
-  }, [config.macros, selectedId]);
+    setSourceDirty(false);
+    setSourceError(next?.importError ?? null);
+    setSourceErrorLine(null);
+    setSourceErrorColumn(null);
+  }, [config.macros, selectedId, sourceDirty]);
 
   useEffect(() => {
     if (!playing) return;
@@ -385,8 +489,7 @@ export function MacrosPage() {
 
   const selected = draft;
   const selectedSteps = selected ? macroSteps(selected) : [];
-  const selectedSourceKind =
-    selected?.program.kind === "rhai" ? "advanced" : "compatible";
+  const selectedSourceKind = classifyMacroSource(sourceText);
   const hasCustomBehaviorPolicy = selected?.behaviorPolicy !== undefined;
   const selectedBehaviorPolicy =
     selected?.behaviorPolicy ?? config.behaviorPolicy;
@@ -428,10 +531,124 @@ export function MacrosPage() {
     window.setTimeout(() => setNotice(null), 1800);
   };
 
+  const pushMacroUndo = (entry: MacroUndoEntry) => {
+    setUndoStack((current) => {
+      const next = [...current, entry].slice(-50);
+      undoStackRef.current = next;
+      return next;
+    });
+  };
+
+  const persistMacroChange = async (
+    macros: MacroRule[],
+    label: string,
+    showSavedNotice = false,
+  ) => {
+    const currentConfig = configRef.current;
+    const previousMacros = currentConfig.macros.map(copyMacro);
+    const previousSelectedId = selectedIdRef.current;
+    if (JSON.stringify(previousMacros) === JSON.stringify(macros)) {
+      return currentConfig;
+    }
+    const savedConfig = await persist({ ...currentConfig, macros });
+    configRef.current = savedConfig;
+    pushMacroUndo({
+      label,
+      macros: previousMacros,
+      selectedId: previousSelectedId,
+    });
+    if (showSavedNotice) showNotice(label);
+    return savedConfig;
+  };
+
+  const undoLastMacroChange = async () => {
+    const entry = undoStackRef.current.at(-1);
+    if (!entry || undoing || saving) return;
+    setUndoing(true);
+    try {
+      await stopMacro();
+      const currentConfig = configRef.current;
+      const savedConfig = await persist({
+        ...currentConfig,
+        macros: entry.macros.map(copyMacro),
+      });
+      configRef.current = savedConfig;
+      setUndoStack((current) => {
+        const next = current.slice(0, -1);
+        undoStackRef.current = next;
+        return next;
+      });
+      const restoredId = savedConfig.macros.some(
+        (macro) => macro.id === entry.selectedId,
+      )
+        ? entry.selectedId
+        : (savedConfig.macros[0]?.id ?? null);
+      const restoredMacro = savedConfig.macros.find(
+        (macro) => macro.id === restoredId,
+      );
+      setSelectedId(restoredId);
+      setSelectedIds(new Set());
+      setDraft(restoredMacro ? copyMacro(restoredMacro) : null);
+      setSourceText(restoredMacro ? macroToSource(restoredMacro) : "");
+      setSourceDirty(false);
+      setSourceError(restoredMacro?.importError ?? null);
+      showNotice(`已撤销：${entry.label}`);
+    } catch (reason) {
+      setError(toErrorMessage(reason));
+    } finally {
+      setUndoing(false);
+    }
+  };
+
+  undoLastMacroChangeRef.current = undoLastMacroChange;
+
+  useEffect(() => {
+    const handleUndoShortcut = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        !(event.ctrlKey || event.metaKey) ||
+        event.shiftKey ||
+        event.key.toLowerCase() !== "z"
+      ) {
+        return;
+      }
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      void undoLastMacroChangeRef.current();
+    };
+    window.addEventListener("keydown", handleUndoShortcut);
+    return () => window.removeEventListener("keydown", handleUndoShortcut);
+  }, []);
+
+  const openScriptFolder = async () => {
+    try {
+      await openDataDirectory("scripts");
+      showNotice("已打开脚本文件夹");
+    } catch (reason) {
+      setError(toErrorMessage(reason));
+    }
+  };
+
+  const refreshScriptFolder = async () => {
+    try {
+      await refresh();
+      showNotice("已重新扫描脚本文件夹");
+    } catch (reason) {
+      setError(toErrorMessage(reason));
+    }
+  };
+
   const save = async (macros: MacroRule[], message: string) => {
     try {
-      await persist({ ...config, macros });
-      showNotice(message);
+      await persistMacroChange(macros, message, true);
     } catch {
       // The hook exposes the actionable error in the page.
     }
@@ -464,6 +681,7 @@ export function MacrosPage() {
   };
 
   const validateDraft = (candidate: MacroRule) => {
+    if (candidate.importError) return candidate.importError;
     if (
       candidate.behaviorPolicy?.profileId &&
       !configRef.current.behaviorProfilesV2.some(
@@ -498,6 +716,7 @@ export function MacrosPage() {
   const openSourceEditor = () => {
     if (!selected) return;
     setSourceText(macroToSource(selected));
+    setSourceDirty(false);
     setSourceError(null);
     setEditorView("source");
   };
@@ -539,34 +758,38 @@ export function MacrosPage() {
       setSourceError("高级脚本暂不自动格式化，请保留源码原样编辑。");
       setSourceErrorLine(null);
       setSourceErrorColumn(null);
-      return;
+      return undefined;
     }
     try {
       const candidate = parseMacroSource(sourceText, selected);
-      setSourceText(macroToSource(candidate));
       setSourceError(null);
       setSourceErrorLine(null);
       setSourceErrorColumn(null);
       showNotice("源码已格式化");
+      return macroToSource(candidate);
     } catch (reason) {
       showSourceError(reason);
+      return undefined;
     }
   };
 
-  const applySourceAndSwitch = async () => {
+  const applySourceAndSwitch = async (openVisualConfiguration = false) => {
     if (!selected) return;
     if (classifyMacroSource(sourceText) === "advanced") {
       if (selected.program.kind !== "rhai") {
         const confirmed = window.confirm(
-          "该源码包含循环、条件、变量或函数定义，无法转换为图形宏步骤。确认保存为高级 Rhai 脚本吗？保存后将保留源码，不能切回图形界面。",
+          "该源码包含循环、条件、变量或函数定义，无法转换为图形宏步骤。确认保存为高级 Rhai 脚本吗？保存后将保留源码；仍可进入配置界面调整触发与仿生策略，但不能编辑图形步骤。",
         );
         if (!confirmed) {
-          setSourceError("高级脚本未保存；如需图形宏，请删除循环、条件、变量和函数定义。");
+          setSourceError(
+            "高级脚本未保存；如需图形宏，请删除循环、条件、变量和函数定义。",
+          );
           return;
         }
       }
       const candidate: MacroRule = {
         ...selected,
+        importError: undefined,
         program: { kind: "rhai", source: sourceText, apiVersion: 1 },
       };
       const validationError = validateDraft(candidate);
@@ -580,20 +803,35 @@ export function MacrosPage() {
         const next = currentConfig.macros.map((macro) =>
           macro.id === candidate.id ? candidate : macro,
         );
-        const savedConfig = await persist({ ...currentConfig, macros: next });
+        const savedConfig = await persistMacroChange(
+          next,
+          "编辑高级 Rhai 脚本",
+        );
         const savedMacro = savedConfig.macros.find(
           (macro) => macro.id === candidate.id,
         );
         setDraft(copyMacro(savedMacro ?? candidate));
+        setSourceText(macroToSource(savedMacro ?? candidate));
+        setSourceDirty(false);
         setSourceError(null);
-        showNotice("高级 Rhai 脚本已保存");
+        setSourceErrorLine(null);
+        setSourceErrorColumn(null);
+        if (openVisualConfiguration) {
+          setEditorView("visual");
+          showNotice("高级 Rhai 脚本已保存，可调整宏配置");
+        } else {
+          showNotice("高级 Rhai 脚本已保存");
+        }
       } catch (reason) {
         showSourceError(reason);
       }
       return;
     }
     try {
-      const candidate = parseMacroSource(sourceText, selected);
+      const candidate = {
+        ...parseMacroSource(sourceText, selected),
+        importError: undefined,
+      };
       const validationError = validateDraft(candidate);
       if (validationError) {
         setSourceError(validationError);
@@ -603,12 +841,16 @@ export function MacrosPage() {
       const next = currentConfig.macros.map((macro) =>
         macro.id === candidate.id ? candidate : macro,
       );
-      const savedConfig = await persist({ ...currentConfig, macros: next });
+      const savedConfig = await persistMacroChange(next, "编辑宏源码");
       const savedMacro = savedConfig.macros.find(
         (macro) => macro.id === candidate.id,
       );
       setDraft(copyMacro(savedMacro ?? candidate));
+      setSourceText(macroToSource(savedMacro ?? candidate));
+      setSourceDirty(false);
       setSourceError(null);
+      setSourceErrorLine(null);
+      setSourceErrorColumn(null);
       setEditorView("visual");
       showNotice("源码已应用");
     } catch (reason) {
@@ -624,7 +866,9 @@ export function MacrosPage() {
     const next = config.macros.map((macro) =>
       macro.id === nextDraft.id ? nextDraft : macro,
     );
-    await persist({ ...config, macros: next });
+    const previous = config.macros.find((macro) => macro.id === nextDraft.id);
+    const label = previous?.name !== nextDraft.name ? "重命名宏" : "修改宏配置";
+    await persistMacroChange(next, label);
   });
 
   const addMacro = () => {
@@ -632,20 +876,6 @@ export function MacrosPage() {
     setSelectedId(macro.id);
     setDraft(macro);
     void save([...config.macros, macro], "已创建宏");
-  };
-
-  const addReferenceMacro = (reference: MacroReference) => {
-    const macro: MacroRule = {
-      ...blankMacro(config.macros),
-      name: `参考：${reference.name}`,
-      program: cloneProgram(reference.program),
-    };
-    setSelectedId(macro.id);
-    setSelectedIds(new Set());
-    setDraft(macro);
-    setEditorView(macro.program.kind === "rhai" ? "source" : "visual");
-    setSourceText(macroToSource(macro));
-    void save([...config.macros, macro], `已添加参考宏：${reference.name}`);
   };
 
   const removeSelected = () => {
@@ -691,6 +921,10 @@ export function MacrosPage() {
 
   const toggleMacro = (macro: MacroRule) => {
     const candidate = selected?.id === macro.id ? selected : macro;
+    if (candidate.importError) {
+      setError(`该宏文件不合法，修复源码后才能启用：${candidate.importError}`);
+      return;
+    }
     if (
       !candidate.enabled &&
       candidate.program.kind === "macro" &&
@@ -752,7 +986,9 @@ export function MacrosPage() {
   const deleteStep = (index: number) => {
     if (selected)
       updateDraft({
-        steps: macroSteps(selected).filter((_, itemIndex) => itemIndex !== index),
+        steps: macroSteps(selected).filter(
+          (_, itemIndex) => itemIndex !== index,
+        ),
       });
   };
 
@@ -768,10 +1004,10 @@ export function MacrosPage() {
       let macro = selected;
       if (!selected) {
         macro = blankMacro(configRef.current.macros);
-        await persist({
-          ...configRef.current,
-          macros: [...configRef.current.macros, macro],
-        });
+        await persistMacroChange(
+          [...configRef.current.macros, macro],
+          "创建录制宏",
+        );
         setSelectedId(macro.id);
         setDraft(macro);
       }
@@ -808,7 +1044,9 @@ export function MacrosPage() {
         throw new Error("找不到正在录制的宏，请重新开始录制");
       }
       const recordedSteps =
-        recordedMacro.program.kind === "macro" ? recordedMacro.program.steps : [];
+        recordedMacro.program.kind === "macro"
+          ? recordedMacro.program.steps
+          : [];
       const nextMacro = {
         ...recordedMacro,
         program: {
@@ -820,7 +1058,7 @@ export function MacrosPage() {
       const next = currentConfig.macros.map((macro) =>
         macro.id === nextMacro.id ? nextMacro : macro,
       );
-      await persist({ ...currentConfig, macros: next });
+      await persistMacroChange(next, "保存录制步骤");
       setDraft(copyMacro(nextMacro));
       recordingMacroIdRef.current = null;
       showNotice(`已录制并保存 ${recorded.steps.length} 个步骤`);
@@ -856,7 +1094,7 @@ export function MacrosPage() {
               const macros = [...configRef.current.macros, macro];
               setSelectedId(macro.id);
               setDraft(copyMacro(macro));
-              void persist({ ...configRef.current, macros }).catch((reason) =>
+              void persistMacroChange(macros, "创建录制宏").catch((reason) =>
                 setError(toErrorMessage(reason)),
               );
             } else {
@@ -888,6 +1126,10 @@ export function MacrosPage() {
   }, [recording, selected?.id]);
 
   const runSelected = async () => {
+    if (selected?.importError) {
+      setError(`该宏文件不合法，修复源码后才能运行：${selected.importError}`);
+      return;
+    }
     if (
       !selected ||
       (selected.program.kind === "macro" && selectedSteps.length === 0) ||
@@ -941,8 +1183,36 @@ export function MacrosPage() {
     <div className="page-stack">
       <PageHeader
         title="宏"
+        description="宏与高级 Rhai 脚本会自动保存到 data/scripts，每个宏对应一个独立文件。"
         action={
           <div className="header-actions">
+            <button
+              className="button button-secondary"
+              disabled={undoStack.length === 0 || saving || undoing}
+              onClick={() => void undoLastMacroChange()}
+              title={
+                undoStack.length > 0
+                  ? `撤销：${undoStack.at(-1)?.label}`
+                  : "暂无可撤销操作"
+              }
+              type="button"
+            >
+              ↶ {undoing ? "正在撤销" : "撤销"}
+            </button>
+            <button
+              className="button button-secondary"
+              onClick={() => void refreshScriptFolder()}
+              type="button"
+            >
+              刷新文件
+            </button>
+            <button
+              className="button button-secondary"
+              onClick={() => void openScriptFolder()}
+              type="button"
+            >
+              打开脚本文件夹
+            </button>
             <button
               className="button button-secondary"
               onClick={addMacro}
@@ -1028,35 +1298,6 @@ export function MacrosPage() {
               total={config.macros.length}
             />
           </div>
-          <section className="macro-reference-panel">
-            <div className="macro-reference-heading">
-              <div>
-                <strong>参考宏</strong>
-                <span>添加后可继续修改</span>
-              </div>
-            </div>
-            <div className="macro-reference-list">
-              {macroReferences.map((reference) => (
-                <article className="macro-reference-card" key={reference.id}>
-                  <div className="macro-reference-card-heading">
-                    <strong>{reference.name}</strong>
-                    <span className={`macro-reference-kind ${reference.kind}`}>
-                      {reference.kind === "advanced" ? "高级 Rhai" : "兼容宏"}
-                    </span>
-                  </div>
-                  <p>{reference.description}</p>
-                  <code>{reference.preview}</code>
-                  <button
-                    className="macro-reference-add"
-                    onClick={() => addReferenceMacro(reference)}
-                    type="button"
-                  >
-                    添加参考宏
-                  </button>
-                </article>
-              ))}
-            </div>
-          </section>
           {loading ? (
             <div className="panel-loading">正在读取本机配置…</div>
           ) : config.macros.length === 0 ? (
@@ -1094,12 +1335,20 @@ export function MacrosPage() {
                   <span className="rule-icon macro">▶</span>
                   <span className="rule-list-copy">
                     <strong>{macro.name}</strong>
+                    {macro.importError ? (
+                      <small className="macro-program-badge invalid">
+                        文件不合法
+                      </small>
+                    ) : null}
                     {macro.program.kind === "rhai" ? (
                       <small className="macro-program-badge">高级 Rhai</small>
                     ) : null}
                     <span>
-                      {macro.triggerKeys.join(" + ")} · {macro.program.kind === "macro" ? macro.program.steps.length : 0} 步
-                      · {modeLabels[macro.mode]}
+                      {macro.triggerKeys.join(" + ")} ·{" "}
+                      {macro.program.kind === "macro"
+                        ? macro.program.steps.length
+                        : 0}{" "}
+                      步 · {modeLabels[macro.mode]}
                     </span>
                   </span>
                   <button
@@ -1146,15 +1395,15 @@ export function MacrosPage() {
                 <button
                   aria-selected={editorView === "visual"}
                   className={editorView === "visual" ? "is-active" : ""}
-                  disabled={selected.program.kind === "rhai"}
+                  disabled={saving}
                   onClick={() => {
                     if (editorView === "visual") return;
-                    void applySourceAndSwitch();
+                    void applySourceAndSwitch(true);
                   }}
                   role="tab"
                   type="button"
                 >
-                  图形界面
+                  {selected.program.kind === "rhai" ? "配置界面" : "图形界面"}
                 </button>
                 <button
                   aria-selected={editorView === "source"}
@@ -1167,6 +1416,13 @@ export function MacrosPage() {
                   源码
                 </button>
               </div>
+              {selected.importError ? (
+                <div className="error-banner">
+                  <strong>导入文件不合法，当前宏已停用且不能运行。</strong>
+                  <span>{selected.importError}</span>
+                  <span>请进入源码页修改，语法检查通过后保存。</span>
+                </div>
+              ) : null}
               {editorView === "source" ? (
                 <section className="macro-source-editor">
                   <div className="rhai-source-heading">
@@ -1181,11 +1437,11 @@ export function MacrosPage() {
                     <button
                       className="button button-primary"
                       disabled={saving}
-                      onClick={() => void applySourceAndSwitch()}
+                      onClick={() => void applySourceAndSwitch(true)}
                       type="button"
                     >
                       {selectedSourceKind === "advanced"
-                        ? "保存高级脚本"
+                        ? "保存并进入配置界面"
                         : "应用并切回图形界面"}
                     </button>
                   </div>
@@ -1194,47 +1450,34 @@ export function MacrosPage() {
                     errorLine={sourceError ? sourceErrorLine : null}
                     onChange={(value) => {
                       setSourceText(value);
+                      setSourceDirty(true);
                       setSourceError(null);
                     }}
                     onCheck={checkSource}
                     onFormat={formatSource}
                     onSave={() => void applySourceAndSwitch()}
+                    snippets={rhaiReferenceSnippets}
                     value={sourceText}
                   />
                   <div className="rhai-source-help">
-                    <strong>AutoFlow API v1</strong>
-                    <span>
-                      窗口：active_window_title() · window_exists(title) ·
-                      window_rect(title) · wait_window(title, timeoutMs, pollMs)
-                    </span>
-                    <span>
-                      像素：pixel_matches(x, y, r, g, b, tolerance) ·
-                      wait_pixel(x, y, r, g, b, tolerance, timeoutMs, pollMs)
-                    </span>
-                    <span>
-                      图像：find_image(assetId, x, y, width, height, threshold) ·
-                      wait_image(assetId, x, y, width, height, threshold, timeoutMs, pollMs)
-                    </span>
-                    <span>
-                      输入：wait_ms(ms) · wait_random_ms(min, max) · key_down(key) ·
-                      key_up(key) · press(key) · move_to(x, y) · mouse_down(button, x, y) ·
-                      mouse_up(button, x, y) · click(button, x, y) · scroll(dx, dy) · type_text(text) · is_cancelled()
-                    </span>
+                    <div className="rhai-source-help-summary">
+                      <i aria-hidden="true" />
+                      <div>
+                        <strong>AutoFlow API v1 已就绪</strong>
+                        <span>
+                          右侧提供 {RHAI_API_REFERENCE_SNIPPETS.length} 个 API
+                          调用示例，可搜索并插入到光标位置。
+                        </span>
+                      </div>
+                    </div>
+                    <div className="rhai-source-help-tags">
+                      <span>安全沙箱</span>
+                      <span>支持 Ctrl+Z</span>
+                      <span>F12 随时停止</span>
+                    </div>
                     <small>
-                      兼容宏只允许上述动作调用；高级脚本可使用 let、if/else、for、while 和 fn，不能访问文件、网络、进程或系统命令。F12 可随时停止脚本。
+                      高级脚本可使用变量、条件、循环和函数，但不能访问文件、网络、进程或系统命令。
                     </small>
-                  </div>
-                  <div className="rhai-examples">
-                    <details>
-                      <summary>查看窗口、像素和图像查找示例</summary>
-                      <pre>{`let window = window_rect("记事本");
-if window.found {
-  let result = find_image("confirm_button", window.x, window.y, window.width, window.height, 0.90);
-  if result.found { click("left", result.center_x, result.center_y); }
-}
-
-wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
-                    </details>
                   </div>
                   <AssetManager
                     assets={config.assets}
@@ -1375,7 +1618,9 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                       </div>
                     </div>
                     <div className="form-section macro-behavior-policy-section">
-                      <label htmlFor="macro-behavior-policy-mode">仿生行为策略</label>
+                      <label htmlFor="macro-behavior-policy-mode">
+                        仿生行为策略
+                      </label>
                       <select
                         id="macro-behavior-policy-mode"
                         value={hasCustomBehaviorPolicy ? "custom" : "global"}
@@ -1396,7 +1641,9 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                             <input
                               checked={selectedBehaviorPolicy.enabled}
                               onChange={(event) =>
-                                updateBehaviorPolicy({ enabled: event.target.checked })
+                                updateBehaviorPolicy({
+                                  enabled: event.target.checked,
+                                })
                               }
                               type="checkbox"
                             />
@@ -1421,52 +1668,109 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                             </select>
                           </label>
                           <label>
-                            <span>Timing {Math.round(selectedBehaviorPolicy.timingStrength * 100)}%</span>
+                            <span>
+                              Timing{" "}
+                              {Math.round(
+                                selectedBehaviorPolicy.timingStrength * 100,
+                              )}
+                              %
+                            </span>
                             <input
-                              max="1" min="0" step="0.05" type="range"
+                              max="1"
+                              min="0"
+                              step="0.05"
+                              type="range"
                               value={selectedBehaviorPolicy.timingStrength}
                               onChange={(event) =>
-                                updateBehaviorPolicy({ timingStrength: Number(event.target.value) })
+                                updateBehaviorPolicy({
+                                  timingStrength: Number(event.target.value),
+                                })
                               }
                             />
                           </label>
                           <label>
-                            <span>Path {Math.round(selectedBehaviorPolicy.pointerPathStrength * 100)}%</span>
+                            <span>
+                              Path{" "}
+                              {Math.round(
+                                selectedBehaviorPolicy.pointerPathStrength *
+                                  100,
+                              )}
+                              %
+                            </span>
                             <input
-                              max="1" min="0" step="0.05" type="range"
+                              max="1"
+                              min="0"
+                              step="0.05"
+                              type="range"
                               value={selectedBehaviorPolicy.pointerPathStrength}
                               onChange={(event) =>
-                                updateBehaviorPolicy({ pointerPathStrength: Number(event.target.value) })
+                                updateBehaviorPolicy({
+                                  pointerPathStrength: Number(
+                                    event.target.value,
+                                  ),
+                                })
                               }
                             />
                           </label>
                           <label>
-                            <span>Pause {Math.round(selectedBehaviorPolicy.pauseStrength * 100)}%</span>
+                            <span>
+                              Pause{" "}
+                              {Math.round(
+                                selectedBehaviorPolicy.pauseStrength * 100,
+                              )}
+                              %
+                            </span>
                             <input
-                              max="1" min="0" step="0.05" type="range"
+                              max="1"
+                              min="0"
+                              step="0.05"
+                              type="range"
                               value={selectedBehaviorPolicy.pauseStrength}
                               onChange={(event) =>
-                                updateBehaviorPolicy({ pauseStrength: Number(event.target.value) })
+                                updateBehaviorPolicy({
+                                  pauseStrength: Number(event.target.value),
+                                })
                               }
                             />
                           </label>
                           <label>
-                            <span>Correction {Math.round(selectedBehaviorPolicy.correctionStrength * 100)}%</span>
+                            <span>
+                              Correction{" "}
+                              {Math.round(
+                                selectedBehaviorPolicy.correctionStrength * 100,
+                              )}
+                              %
+                            </span>
                             <input
-                              max="1" min="0" step="0.05" type="range"
+                              max="1"
+                              min="0"
+                              step="0.05"
+                              type="range"
                               value={selectedBehaviorPolicy.correctionStrength}
                               onChange={(event) =>
-                                updateBehaviorPolicy({ correctionStrength: Number(event.target.value) })
+                                updateBehaviorPolicy({
+                                  correctionStrength: Number(
+                                    event.target.value,
+                                  ),
+                                })
                               }
                             />
                           </label>
                           <label>
-                            <span>Speed {selectedBehaviorPolicy.speedScale.toFixed(2)}×</span>
+                            <span>
+                              Speed{" "}
+                              {selectedBehaviorPolicy.speedScale.toFixed(2)}×
+                            </span>
                             <input
-                              max="4" min="0.1" step="0.05" type="range"
+                              max="4"
+                              min="0.1"
+                              step="0.05"
+                              type="range"
                               value={selectedBehaviorPolicy.speedScale}
                               onChange={(event) =>
-                                updateBehaviorPolicy({ speedScale: Number(event.target.value) })
+                                updateBehaviorPolicy({
+                                  speedScale: Number(event.target.value),
+                                })
                               }
                             />
                           </label>
@@ -1477,7 +1781,13 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                               onChange={(event) => {
                                 const value = event.target.value.trim();
                                 updateBehaviorPolicy({
-                                  seed: value === "" ? undefined : Math.max(0, Math.floor(Number(value) || 0)),
+                                  seed:
+                                    value === ""
+                                      ? undefined
+                                      : Math.max(
+                                          0,
+                                          Math.floor(Number(value) || 0),
+                                        ),
                                 });
                               }}
                               placeholder="每次播放随机"
@@ -1485,371 +1795,422 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                               value={selectedBehaviorPolicy.seed ?? ""}
                             />
                           </label>
-                          {selectedBehaviorPolicy.profileId && !selectedBehaviorProfile ? (
-                            <div className="form-help">绑定的 Profile 已不存在；保存前请选择现有 Profile 或改为跟随全局。</div>
-                          ) : selectedBehaviorProfile?.coverage.quality === "insufficient" ? (
-                            <div className="form-help">当前 Profile 样本不足，运行时会使用稳定 fallback；建议继续采集。</div>
+                          {selectedBehaviorPolicy.profileId &&
+                          !selectedBehaviorProfile ? (
+                            <div className="form-help">
+                              绑定的 Profile 已不存在；保存前请选择现有 Profile
+                              或改为跟随全局。
+                            </div>
+                          ) : selectedBehaviorProfile?.coverage.quality ===
+                            "insufficient" ? (
+                            <div className="form-help">
+                              当前 Profile 样本不足，运行时会使用稳定
+                              fallback；建议继续采集。
+                            </div>
                           ) : null}
                         </div>
                       )}
+                      <p className="runtime-pointer-warning" role="note">
+                        <strong>鼠标运行提示：</strong>
+                        宏运行期间手动抢动鼠标会与自动轨迹相互干扰，导致速度、曲率和修正等仿生移动特征不稳定。动作之间移动鼠标会成为下一步的新起点；轨迹执行过程中请避免操作鼠标。
+                      </p>
                     </div>
                   </div>
-                  <div className="step-toolbar">
-                    <div>
-                      <strong>步骤列表</strong>
-                      <span>{selectedSteps.length} 步</span>
-                    </div>
-                    <div className="step-add-actions">
+                  {selected.program.kind === "rhai" ? (
+                    <div className="advanced-script-config-note">
+                      <div>
+                        <strong>高级 Rhai 脚本已保留</strong>
+                        <span>
+                          此界面只调整触发方式、运行参数和仿生行为策略，不会把脚本转换或覆盖为图形步骤。
+                        </span>
+                      </div>
                       <button
-                        onClick={() =>
-                          addStep({ type: "delay", durationMs: 300 })
-                        }
+                        className="button button-secondary"
+                        onClick={openSourceEditor}
                         type="button"
                       >
-                        ＋ 等待
-                      </button>
-                      <button
-                        onClick={() =>
-                          addStep({ type: "key", key: "Enter", action: "down" })
-                        }
-                        type="button"
-                      >
-                        ＋ 按键
-                      </button>
-                      <button
-                        onClick={() =>
-                          addStep({
-                            type: "mouseButton",
-                            button: "left",
-                            action: "down",
-                            x: 0,
-                            y: 0,
-                          })
-                        }
-                        type="button"
-                      >
-                        ＋ 点击
-                      </button>
-                      <button
-                        onClick={() => addStep({ type: "text", text: "" })}
-                        type="button"
-                      >
-                        ＋ 文本
-                      </button>
-                      <button
-                        onClick={() =>
-                          addStep({ type: "mouseMove", x: 0, y: 0 })
-                        }
-                        type="button"
-                      >
-                        ＋ 移动
-                      </button>
-                      <button
-                        onClick={() =>
-                          addStep({ type: "wheel", deltaX: 0, deltaY: -120 })
-                        }
-                        type="button"
-                      >
-                        ＋ 滚轮
+                        返回编辑脚本
                       </button>
                     </div>
-                  </div>
-                  <div className="macro-steps">
-                    {selectedSteps.length === 0 ? (
-                      <div className="macro-empty-steps">
-                        <span>01</span>
+                  ) : (
+                    <>
+                      <div className="step-toolbar">
                         <div>
-                          <strong>还没有步骤</strong>
-                          <small>点击开始录制，或从右上角手动添加。</small>
+                          <strong>步骤列表</strong>
+                          <span>{selectedSteps.length} 步</span>
+                        </div>
+                        <div className="step-add-actions">
+                          <button
+                            onClick={() =>
+                              addStep({ type: "delay", durationMs: 300 })
+                            }
+                            type="button"
+                          >
+                            ＋ 等待
+                          </button>
+                          <button
+                            onClick={() =>
+                              addStep({
+                                type: "key",
+                                key: "Enter",
+                                action: "down",
+                              })
+                            }
+                            type="button"
+                          >
+                            ＋ 按键
+                          </button>
+                          <button
+                            onClick={() =>
+                              addStep({
+                                type: "mouseButton",
+                                button: "left",
+                                action: "down",
+                                x: 0,
+                                y: 0,
+                              })
+                            }
+                            type="button"
+                          >
+                            ＋ 点击
+                          </button>
+                          <button
+                            onClick={() => addStep({ type: "text", text: "" })}
+                            type="button"
+                          >
+                            ＋ 文本
+                          </button>
+                          <button
+                            onClick={() =>
+                              addStep({ type: "mouseMove", x: 0, y: 0 })
+                            }
+                            type="button"
+                          >
+                            ＋ 移动
+                          </button>
+                          <button
+                            onClick={() =>
+                              addStep({
+                                type: "wheel",
+                                deltaX: 0,
+                                deltaY: -120,
+                              })
+                            }
+                            type="button"
+                          >
+                            ＋ 滚轮
+                          </button>
                         </div>
                       </div>
-                    ) : (
-                      selectedSteps.map((step, index) => (
-                        <div
-                          className={`macro-step-row ${
-                            step.type === "delay" ? "is-delay-step" : ""
-                          } ${draggingStepIndex === index ? "is-dragging" : ""} ${
-                            dragOverStepIndex === index &&
-                            draggingStepIndex !== index
-                              ? "is-drag-over"
-                              : ""
-                          }`}
-                          data-macro-step-index={index}
-                          key={`${selected.id}-${index}`}
-                        >
-                          <span
-                            aria-label="拖动排序"
-                            className="step-drag-handle"
-                            onPointerDown={(event) => {
-                              if (event.button !== 0) return;
-                              event.preventDefault();
-                              event.stopPropagation();
-                              dragStateRef.current = {
-                                fromIndex: index,
-                                pointerId: event.pointerId,
-                              };
-                              dragOverStepRef.current = index;
-                              setDraggingStepIndex(index);
-                              setDragOverStepIndex(index);
-                            }}
-                            role="button"
-                            tabIndex={0}
-                            title="拖动排序"
-                          >
-                            ⋮⋮
-                          </span>
-                          <span className="step-number">
-                            {String(index + 1).padStart(2, "0")}
-                          </span>
-                          <span className={`step-type step-type-${step.type}`}>
-                            {step.type === "delay"
-                              ? "时"
-                              : step.type === "key"
-                                ? "键"
-                                : step.type === "text"
-                                  ? "文"
-                                  : "鼠"}
-                          </span>
-                          <div className="step-main">
-                            <strong>{stepTitle(step)}</strong>
-                            {step.type === "delay" ? (
-                              <>
-                                <div className="delay-range-fields">
-                                  <div className="delay-range-input">
-                                    <input
-                                      aria-label="等待最小毫秒数"
-                                      type="number"
-                                      min={0}
-                                      value={step.durationMs}
+                      <div className="macro-steps">
+                        {selectedSteps.length === 0 ? (
+                          <div className="macro-empty-steps">
+                            <span>01</span>
+                            <div>
+                              <strong>还没有步骤</strong>
+                              <small>点击开始录制，或从右上角手动添加。</small>
+                            </div>
+                          </div>
+                        ) : (
+                          selectedSteps.map((step, index) => (
+                            <div
+                              className={`macro-step-row ${
+                                step.type === "delay" ? "is-delay-step" : ""
+                              } ${draggingStepIndex === index ? "is-dragging" : ""} ${
+                                dragOverStepIndex === index &&
+                                draggingStepIndex !== index
+                                  ? "is-drag-over"
+                                  : ""
+                              }`}
+                              data-macro-step-index={index}
+                              key={`${selected.id}-${index}`}
+                            >
+                              <span
+                                aria-label="拖动排序"
+                                className="step-drag-handle"
+                                onPointerDown={(event) => {
+                                  if (event.button !== 0) return;
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  dragStateRef.current = {
+                                    fromIndex: index,
+                                    pointerId: event.pointerId,
+                                  };
+                                  dragOverStepRef.current = index;
+                                  setDraggingStepIndex(index);
+                                  setDragOverStepIndex(index);
+                                }}
+                                role="button"
+                                tabIndex={0}
+                                title="拖动排序"
+                              >
+                                ⋮⋮
+                              </span>
+                              <span className="step-number">
+                                {String(index + 1).padStart(2, "0")}
+                              </span>
+                              <span
+                                className={`step-type step-type-${step.type}`}
+                              >
+                                {step.type === "delay"
+                                  ? "时"
+                                  : step.type === "key"
+                                    ? "键"
+                                    : step.type === "text"
+                                      ? "文"
+                                      : "鼠"}
+                              </span>
+                              <div className="step-main">
+                                <strong>{stepTitle(step)}</strong>
+                                {step.type === "delay" ? (
+                                  <>
+                                    <div className="delay-range-fields">
+                                      <div className="delay-range-input">
+                                        <input
+                                          aria-label="等待最小毫秒数"
+                                          type="number"
+                                          min={0}
+                                          value={step.durationMs}
+                                          onChange={(event) =>
+                                            updateStep(index, {
+                                              ...step,
+                                              durationMs: Math.max(
+                                                0,
+                                                Number(event.target.value) || 0,
+                                              ),
+                                            })
+                                          }
+                                          placeholder="固定时间"
+                                        />
+                                        <span className="delay-range-unit">
+                                          ms
+                                        </span>
+                                      </div>
+                                      <span className="delay-range-separator">
+                                        至
+                                      </span>
+                                      <div className="delay-range-input">
+                                        <input
+                                          aria-label="等待最大毫秒数，可选"
+                                          type="number"
+                                          min={0}
+                                          value={step.durationMaxMs ?? ""}
+                                          onChange={(event) => {
+                                            const value = event.target.value;
+                                            updateStep(index, {
+                                              ...step,
+                                              durationMaxMs:
+                                                value === ""
+                                                  ? undefined
+                                                  : Math.max(
+                                                      0,
+                                                      Number(value) || 0,
+                                                    ),
+                                            });
+                                          }}
+                                          placeholder="最大时间"
+                                        />
+                                        <span className="delay-range-unit">
+                                          ms
+                                        </span>
+                                      </div>
+                                    </div>
+                                    <small className="delay-range-help">
+                                      只填左侧为固定等待；填写右侧后每次从区间随机抽取。
+                                    </small>
+                                  </>
+                                ) : null}
+                                {step.type === "key" ? (
+                                  <div className="step-field-row">
+                                    <select
+                                      aria-label="按键动作"
+                                      value={step.action}
                                       onChange={(event) =>
                                         updateStep(index, {
                                           ...step,
-                                          durationMs: Math.max(
-                                            0,
-                                            Number(event.target.value) || 0,
-                                          ),
+                                          action: event.target.value as
+                                            "down" | "up",
                                         })
                                       }
-                                      placeholder="固定时间"
-                                    />
-                                    <span className="delay-range-unit">ms</span>
-                                  </div>
-                                  <span className="delay-range-separator">
-                                    至
-                                  </span>
-                                  <div className="delay-range-input">
+                                    >
+                                      <option value="down">按下</option>
+                                      <option value="up">释放</option>
+                                    </select>
                                     <input
-                                      aria-label="等待最大毫秒数，可选"
-                                      type="number"
-                                      min={0}
-                                      value={step.durationMaxMs ?? ""}
-                                      onChange={(event) => {
-                                        const value = event.target.value;
+                                      aria-label="按键名称"
+                                      value={step.key}
+                                      onChange={(event) =>
                                         updateStep(index, {
                                           ...step,
-                                          durationMaxMs:
-                                            value === ""
-                                              ? undefined
-                                              : Math.max(0, Number(value) || 0),
-                                        });
-                                      }}
-                                      placeholder="最大时间"
+                                          key: event.target.value,
+                                        })
+                                      }
                                     />
-                                    <span className="delay-range-unit">ms</span>
                                   </div>
-                                </div>
-                                <small className="delay-range-help">
-                                  只填左侧为固定等待；填写右侧后每次从区间随机抽取。
-                                </small>
-                              </>
-                            ) : null}
-                            {step.type === "key" ? (
-                              <div className="step-field-row">
-                                <select
-                                  aria-label="按键动作"
-                                  value={step.action}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      action: event.target.value as
-                                        "down" | "up",
-                                    })
-                                  }
+                                ) : null}
+                                {step.type === "mouseButton" ? (
+                                  <div className="step-field-grid">
+                                    <select
+                                      aria-label="鼠标按钮"
+                                      value={step.button}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          button: event.target
+                                            .value as typeof step.button,
+                                        })
+                                      }
+                                    >
+                                      <option value="left">左键</option>
+                                      <option value="right">右键</option>
+                                      <option value="middle">中键</option>
+                                      <option value="x1">侧键 1</option>
+                                      <option value="x2">侧键 2</option>
+                                    </select>
+                                    <select
+                                      aria-label="鼠标动作"
+                                      value={step.action}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          action: event.target.value as
+                                            "down" | "up",
+                                        })
+                                      }
+                                    >
+                                      <option value="down">按下</option>
+                                      <option value="up">释放</option>
+                                    </select>
+                                    <input
+                                      aria-label="鼠标 X 坐标"
+                                      type="number"
+                                      value={step.x}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          x: Number(event.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                    <input
+                                      aria-label="鼠标 Y 坐标"
+                                      type="number"
+                                      value={step.y}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          y: Number(event.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                ) : null}
+                                {step.type === "mouseMove" ? (
+                                  <div className="step-field-row">
+                                    <input
+                                      aria-label="移动 X 坐标"
+                                      type="number"
+                                      value={step.x}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          x: Number(event.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                    <input
+                                      aria-label="移动 Y 坐标"
+                                      type="number"
+                                      value={step.y}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          y: Number(event.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                ) : null}
+                                {step.type === "wheel" ? (
+                                  <div className="step-field-row">
+                                    <input
+                                      aria-label="水平滚动量"
+                                      type="number"
+                                      value={step.deltaX}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          deltaX:
+                                            Number(event.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                    <input
+                                      aria-label="垂直滚动量"
+                                      type="number"
+                                      value={step.deltaY}
+                                      onChange={(event) =>
+                                        updateStep(index, {
+                                          ...step,
+                                          deltaY:
+                                            Number(event.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                ) : null}
+                                {step.type === "text" ? (
+                                  <textarea
+                                    aria-label="输入文本"
+                                    rows={2}
+                                    value={step.text}
+                                    onChange={(event) =>
+                                      updateStep(index, {
+                                        ...step,
+                                        text: event.target.value,
+                                      })
+                                    }
+                                  />
+                                ) : null}
+                              </div>
+                              <div className="step-controls">
+                                <button
+                                  aria-label="上移步骤"
+                                  disabled={index === 0}
+                                  onClick={() => moveStep(index, -1)}
+                                  type="button"
                                 >
-                                  <option value="down">按下</option>
-                                  <option value="up">释放</option>
-                                </select>
-                                <input
-                                  aria-label="按键名称"
-                                  value={step.key}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      key: event.target.value,
-                                    })
-                                  }
-                                />
-                              </div>
-                            ) : null}
-                            {step.type === "mouseButton" ? (
-                              <div className="step-field-grid">
-                                <select
-                                  aria-label="鼠标按钮"
-                                  value={step.button}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      button: event.target
-                                        .value as typeof step.button,
-                                    })
-                                  }
+                                  ↑
+                                </button>
+                                <button
+                                  aria-label="下移步骤"
+                                  disabled={index === selectedSteps.length - 1}
+                                  onClick={() => moveStep(index, 1)}
+                                  type="button"
                                 >
-                                  <option value="left">左键</option>
-                                  <option value="right">右键</option>
-                                  <option value="middle">中键</option>
-                                  <option value="x1">侧键 1</option>
-                                  <option value="x2">侧键 2</option>
-                                </select>
-                                <select
-                                  aria-label="鼠标动作"
-                                  value={step.action}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      action: event.target.value as
-                                        "down" | "up",
-                                    })
-                                  }
+                                  ↓
+                                </button>
+                                <button
+                                  aria-label="复制步骤"
+                                  onClick={() => duplicateStep(index)}
+                                  type="button"
                                 >
-                                  <option value="down">按下</option>
-                                  <option value="up">释放</option>
-                                </select>
-                                <input
-                                  aria-label="鼠标 X 坐标"
-                                  type="number"
-                                  value={step.x}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      x: Number(event.target.value) || 0,
-                                    })
-                                  }
-                                />
-                                <input
-                                  aria-label="鼠标 Y 坐标"
-                                  type="number"
-                                  value={step.y}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      y: Number(event.target.value) || 0,
-                                    })
-                                  }
-                                />
+                                  ⧉
+                                </button>
+                                <button
+                                  aria-label="删除步骤"
+                                  onClick={() => deleteStep(index)}
+                                  type="button"
+                                >
+                                  ×
+                                </button>
                               </div>
-                            ) : null}
-                            {step.type === "mouseMove" ? (
-                              <div className="step-field-row">
-                                <input
-                                  aria-label="移动 X 坐标"
-                                  type="number"
-                                  value={step.x}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      x: Number(event.target.value) || 0,
-                                    })
-                                  }
-                                />
-                                <input
-                                  aria-label="移动 Y 坐标"
-                                  type="number"
-                                  value={step.y}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      y: Number(event.target.value) || 0,
-                                    })
-                                  }
-                                />
-                              </div>
-                            ) : null}
-                            {step.type === "wheel" ? (
-                              <div className="step-field-row">
-                                <input
-                                  aria-label="水平滚动量"
-                                  type="number"
-                                  value={step.deltaX}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      deltaX: Number(event.target.value) || 0,
-                                    })
-                                  }
-                                />
-                                <input
-                                  aria-label="垂直滚动量"
-                                  type="number"
-                                  value={step.deltaY}
-                                  onChange={(event) =>
-                                    updateStep(index, {
-                                      ...step,
-                                      deltaY: Number(event.target.value) || 0,
-                                    })
-                                  }
-                                />
-                              </div>
-                            ) : null}
-                            {step.type === "text" ? (
-                              <textarea
-                                aria-label="输入文本"
-                                rows={2}
-                                value={step.text}
-                                onChange={(event) =>
-                                  updateStep(index, {
-                                    ...step,
-                                    text: event.target.value,
-                                  })
-                                }
-                              />
-                            ) : null}
-                          </div>
-                          <div className="step-controls">
-                            <button
-                              aria-label="上移步骤"
-                              disabled={index === 0}
-                              onClick={() => moveStep(index, -1)}
-                              type="button"
-                            >
-                              ↑
-                            </button>
-                            <button
-                              aria-label="下移步骤"
-                              disabled={index === selectedSteps.length - 1}
-                              onClick={() => moveStep(index, 1)}
-                              type="button"
-                            >
-                              ↓
-                            </button>
-                            <button
-                              aria-label="复制步骤"
-                              onClick={() => duplicateStep(index)}
-                              type="button"
-                            >
-                              ⧉
-                            </button>
-                            <button
-                              aria-label="删除步骤"
-                              onClick={() => deleteStep(index)}
-                              type="button"
-                            >
-                              ×
-                            </button>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </>
+                  )}
                   <div className="editor-footer macro-editor-footer">
                     <div>
                       <span
@@ -1874,6 +2235,7 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                       ) : (
                         <button
                           className="button button-secondary"
+                          disabled={Boolean(selected.importError)}
                           onClick={() => void runSelected()}
                           type="button"
                         >
@@ -1882,6 +2244,7 @@ wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200);`}</pre>
                       )}
                       <button
                         className={`button ${selected.enabled ? "button-soft-danger" : "button-primary"}`}
+                        disabled={Boolean(selected.importError)}
                         onClick={() => toggleMacro(selected)}
                         type="button"
                       >

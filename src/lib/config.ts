@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { defaultConfig, type AppConfig } from "../types/config";
 import { getConfig, saveConfig } from "./tauri";
 
@@ -7,6 +7,8 @@ export function useAppConfig() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const savingRef = useRef(false);
+  const configRequestGenerationRef = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -25,24 +27,61 @@ export function useAppConfig() {
     };
   }, []);
 
+  useEffect(() => {
+    let timer: number | null = null;
+    const reloadExternalFiles = () => {
+      if (savingRef.current) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (savingRef.current) return;
+        const requestGeneration = configRequestGenerationRef.current;
+        void getConfig()
+          .then((nextConfig) => {
+            if (
+              !savingRef.current &&
+              configRequestGenerationRef.current === requestGeneration
+            ) {
+              setConfig(nextConfig);
+            }
+          })
+          .catch((reason: unknown) => setError(toErrorMessage(reason)));
+      }, 300);
+    };
+    window.addEventListener("focus", reloadExternalFiles);
+    return () => {
+      window.removeEventListener("focus", reloadExternalFiles);
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
   const persist = useCallback(async (nextConfig: AppConfig) => {
+    const requestGeneration = configRequestGenerationRef.current + 1;
+    configRequestGenerationRef.current = requestGeneration;
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
       const saved = await saveConfig(nextConfig);
-      setConfig(saved);
+      if (configRequestGenerationRef.current === requestGeneration) {
+        setConfig(saved);
+      }
       return saved;
     } catch (reason) {
       setError(toErrorMessage(reason));
       throw reason;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }, []);
 
   const refresh = useCallback(async () => {
+    const requestGeneration = configRequestGenerationRef.current + 1;
+    configRequestGenerationRef.current = requestGeneration;
     const nextConfig = await getConfig();
-    setConfig(nextConfig);
+    if (configRequestGenerationRef.current === requestGeneration) {
+      setConfig(nextConfig);
+    }
     return nextConfig;
   }, []);
 

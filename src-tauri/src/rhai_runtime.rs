@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use crate::automation::{
-    ImageMatch, Point, RgbColor, ScreenRect, VisionApi, VisionError, VisionPollBudget,
-    VisionPollOptions, WindowRectValue, MAX_WAIT_MS, MIN_POLL_MS,
+    MatcherMode, MatcherOptions, Point, RgbColor, ScreenRect, VisionApi, VisionError,
+    VisionPollBudget, VisionPollOptions, VisionSearchResult, WindowRectValue, MAX_WAIT_MS,
+    MIN_POLL_MS,
 };
 use crate::{MacroStep, MouseButton};
 use rhai::{Dynamic, Engine, EvalAltResult, Map, Position};
@@ -17,7 +18,19 @@ pub const MAX_RHAI_CALL_LEVELS: usize = 32;
 pub const MAX_RHAI_EXPR_DEPTH: usize = 64;
 pub const MAX_RHAI_STRING_SIZE: usize = 1_000_000;
 
-const CANCELLED: &str = "脚本已被 F12 停止";
+pub(crate) const CANCELLED: &str = "脚本已被 F12 停止";
+const SCRIPT_STOP_REQUESTED: &str = "__autoflow_stop_with_message__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptOutcome {
+    Completed,
+    StoppedWithMessage,
+}
+
+struct ScriptStopMessage {
+    title: String,
+    message: String,
+}
 
 pub trait AutomationInput: Send + Sync {
     fn wait_ms(&self, milliseconds: u64, speed: f32, cancel: &AtomicBool) -> Result<(), String>;
@@ -71,6 +84,7 @@ pub struct ExecutionContext {
     pub pressed_keys: HashSet<String>,
     pub pressed_mouse_buttons: HashSet<String>,
     pub error_state: Option<String>,
+    stop_message: Option<ScriptStopMessage>,
     input: Arc<dyn AutomationInput>,
     vision: Arc<dyn VisionApi>,
     budget: Arc<VisionPollBudget>,
@@ -86,7 +100,7 @@ impl ExecutionContext {
         let vision = crate::automation::VisionService::new(
             std::env::temp_dir()
                 .join("AutoFlow")
-                .join("assets")
+                .join("data")
                 .join("images"),
         );
         Self::new_with_vision(input, cancel, speed, progress, vision)
@@ -106,6 +120,7 @@ impl ExecutionContext {
             pressed_keys: HashSet::new(),
             pressed_mouse_buttons: HashSet::new(),
             error_state: None,
+            stop_message: None,
             input,
             vision,
             budget: Arc::new(VisionPollBudget::new(progress)),
@@ -163,6 +178,22 @@ where
 }
 
 fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "stop_with_message",
+        move |message: String| -> Result<(), Box<EvalAltResult>> {
+            request_script_stop(&current, "AutoFlow".to_string(), message)
+        },
+    );
+
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "stop_with_message",
+        move |title: String, message: String| -> Result<(), Box<EvalAltResult>> {
+            request_script_stop(&current, title, message)
+        },
+    );
+
     let current = Arc::clone(&state);
     engine.register_fn("wait_ms", move |milliseconds: i64| {
         with_context(&current, |context| {
@@ -523,7 +554,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     let current = Arc::clone(&state);
     engine.register_fn(
         "find_image",
-        move |asset_id: String,
+        move |file_name: String,
               region_x: i64,
               region_y: i64,
               region_width: i64,
@@ -536,8 +567,14 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 vision
-                    .find_image(&asset_id, region, threshold, &cancel)
-                    .map(image_match_map)
+                    .find_image_diagnostic(
+                        &file_name,
+                        region,
+                        threshold,
+                        &cancel,
+                        &MatcherOptions::default(),
+                    )
+                    .map(image_search_map)
                     .map_err(vision_error_message)
             })
         },
@@ -546,7 +583,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     let current = Arc::clone(&state);
     engine.register_fn(
         "wait_image",
-        move |asset_id: String,
+        move |file_name: String,
               region_x: i64,
               region_y: i64,
               region_width: i64,
@@ -564,13 +601,75 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
                 vision
-                    .wait_image(
-                        &asset_id,
+                    .wait_image_diagnostic(
+                        &file_name,
                         region,
                         threshold,
                         VisionPollOptions::new(timeout, poll, &cancel, &budget),
+                        &MatcherOptions::default(),
                     )
-                    .map(image_match_map)
+                    .map(image_search_map)
+                    .map_err(vision_error_message)
+            })
+        },
+    );
+
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "find_image",
+        move |file_name: String,
+              region_x: i64,
+              region_y: i64,
+              region_width: i64,
+              region_height: i64,
+              threshold: f64,
+              options: Map| {
+            with_context(&current, |context| {
+                let region = checked_region(region_x, region_y, region_width, region_height)?;
+                let threshold = checked_threshold(threshold)?;
+                let matcher_options = checked_match_options(&options)?;
+                context.begin_action()?;
+                let vision = Arc::clone(&context.vision);
+                let cancel = Arc::clone(&context.cancel);
+                vision
+                    .find_image_diagnostic(&file_name, region, threshold, &cancel, &matcher_options)
+                    .map(image_search_map)
+                    .map_err(vision_error_message)
+            })
+        },
+    );
+
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "wait_image",
+        move |file_name: String,
+              region_x: i64,
+              region_y: i64,
+              region_width: i64,
+              region_height: i64,
+              threshold: f64,
+              timeout_ms: i64,
+              poll_ms: i64,
+              options: Map| {
+            with_context(&current, |context| {
+                let region = checked_region(region_x, region_y, region_width, region_height)?;
+                let threshold = checked_threshold(threshold)?;
+                let timeout = checked_timeout(timeout_ms)?;
+                let poll = checked_poll(poll_ms)?;
+                let matcher_options = checked_match_options(&options)?;
+                context.begin_action()?;
+                let vision = Arc::clone(&context.vision);
+                let cancel = Arc::clone(&context.cancel);
+                let budget = Arc::clone(&context.budget);
+                vision
+                    .wait_image_diagnostic(
+                        &file_name,
+                        region,
+                        threshold,
+                        VisionPollOptions::new(timeout, poll, &cancel, &budget),
+                        &matcher_options,
+                    )
+                    .map(image_search_map)
                     .map_err(vision_error_message)
             })
         },
@@ -591,9 +690,9 @@ fn window_rect_map(value: WindowRectValue) -> Map {
     map
 }
 
-fn image_match_map(value: Option<ImageMatch>) -> Map {
+fn image_search_map(value: VisionSearchResult) -> Map {
     let mut map = Map::new();
-    if let Some(value) = value {
+    if let Some(value) = value.image {
         map.insert("found".into(), Dynamic::from(true));
         map.insert("x".into(), Dynamic::from(i64::from(value.x)));
         map.insert("y".into(), Dynamic::from(i64::from(value.y)));
@@ -609,7 +708,85 @@ fn image_match_map(value: Option<ImageMatch>) -> Map {
         }
         map.insert("score".into(), Dynamic::from(0.0_f64));
     }
+    map.insert(
+        "total_ms".into(),
+        Dynamic::from(value.diagnostics.total_ms as i64),
+    );
+    map.insert(
+        "capture_ms".into(),
+        Dynamic::from(value.diagnostics.capture_ms as i64),
+    );
+    map.insert(
+        "prepare_ms".into(),
+        Dynamic::from(value.diagnostics.prepare_ms as i64),
+    );
+    map.insert(
+        "coarse_ms".into(),
+        Dynamic::from(value.diagnostics.coarse_ms as i64),
+    );
+    map.insert(
+        "refine_ms".into(),
+        Dynamic::from(value.diagnostics.refine_ms as i64),
+    );
+    map.insert(
+        "fallback_ms".into(),
+        Dynamic::from(value.diagnostics.fallback_ms as i64),
+    );
+    map.insert(
+        "candidate_count".into(),
+        Dynamic::from(value.diagnostics.candidate_count as i64),
+    );
+    map.insert(
+        "previous_hit_used".into(),
+        Dynamic::from(value.diagnostics.previous_hit_used),
+    );
+    map.insert(
+        "fallback_used".into(),
+        Dynamic::from(value.diagnostics.fallback_used),
+    );
+    map.insert(
+        "matcher_mode".into(),
+        Dynamic::from(value.diagnostics.matcher_mode),
+    );
     map
+}
+
+fn checked_match_options(options: &Map) -> Result<MatcherOptions, String> {
+    let mut parsed = MatcherOptions::default();
+    if let Some(value) = options.get("mode") {
+        let Some(mode) = value.clone().try_cast::<String>() else {
+            return Err(
+                "vision_match_mode_invalid：mode 必须是字符串 auto、exact 或 fast".to_string(),
+            );
+        };
+        parsed.mode = match mode.trim().to_ascii_lowercase().as_str() {
+            "auto" => MatcherMode::Auto,
+            "exact" => MatcherMode::Exact,
+            "fast" => MatcherMode::Fast,
+            _ => {
+                return Err("vision_match_mode_invalid：mode 必须是 auto、exact 或 fast".to_string())
+            }
+        };
+    }
+    if let Some(value) = options.get("prefer_last") {
+        parsed.prefer_last = value
+            .clone()
+            .try_cast::<bool>()
+            .ok_or_else(|| "vision_match_options_invalid：prefer_last 必须是布尔值".to_string())?;
+    }
+    if let Some(value) = options.get("max_candidates") {
+        let count = value
+            .clone()
+            .try_cast::<i64>()
+            .ok_or_else(|| "vision_match_options_invalid：max_candidates 必须是整数".to_string())?;
+        parsed.max_candidates = usize::try_from(count).map_err(|_| {
+            "vision_match_options_invalid：max_candidates 必须在 1 到 32 之间".to_string()
+        })?;
+    }
+    parsed
+        .validate()
+        .map_err(|error| format!("{}：{}", error.code, error.message))?;
+    Ok(parsed)
 }
 
 fn checked_point(x: i64, y: i64) -> Result<Point, String> {
@@ -617,6 +794,36 @@ fn checked_point(x: i64, y: i64) -> Result<Point, String> {
         x: checked_integer(x).map_err(|error| format!("capture_region_invalid：{error}"))?,
         y: checked_integer(y).map_err(|error| format!("capture_region_invalid：{error}"))?,
     })
+}
+
+fn request_script_stop(
+    state: &Arc<Mutex<ExecutionContext>>,
+    title: String,
+    message: String,
+) -> Result<(), Box<EvalAltResult>> {
+    let title = title.trim();
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(runtime_error("stop_with_message 的提示内容不能为空"));
+    }
+    if title.chars().count() > 128 || message.chars().count() > 2_000 {
+        return Err(runtime_error(
+            "stop_with_message 的标题不能超过 128 字，内容不能超过 2000 字",
+        ));
+    }
+    let mut context = state
+        .lock()
+        .map_err(|_| runtime_error("执行上下文状态异常"))?;
+    context.begin_action().map_err(runtime_error)?;
+    context.stop_message = Some(ScriptStopMessage {
+        title: if title.is_empty() {
+            "AutoFlow".to_string()
+        } else {
+            title.to_string()
+        },
+        message: message.to_string(),
+    });
+    Err(runtime_error(SCRIPT_STOP_REQUESTED))
 }
 
 fn parse_behavior_options(options: &Map) -> Result<(Option<f32>, bool), String> {
@@ -741,7 +948,7 @@ fn configure_engine(engine: &mut Engine, cancel: Arc<AtomicBool>) {
     });
 }
 
-pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<(), String> {
+pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<ScriptOutcome, String> {
     let cancel = Arc::clone(&context.cancel);
     let state = Arc::new(Mutex::new(context));
     let mut engine = Engine::new();
@@ -751,12 +958,17 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<(), St
     let result = engine.eval_ast::<Dynamic>(&ast);
     let mut context = state.lock().map_err(|_| "执行上下文状态异常".to_string())?;
     context.release_all();
+    if let Some(stop_message) = context.stop_message.take() {
+        drop(context);
+        show_script_message(&stop_message.title, &stop_message.message);
+        return Ok(ScriptOutcome::StoppedWithMessage);
+    }
     match result {
         Ok(_) => {
             if context.cancel.load(Ordering::SeqCst) {
                 Err(CANCELLED.to_string())
             } else {
-                Ok(())
+                Ok(ScriptOutcome::Completed)
             }
         }
         Err(error) => {
@@ -769,6 +981,43 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<(), St
             }
         }
     }
+}
+
+#[cfg(all(windows, not(test)))]
+pub(crate) fn show_script_message(title: &str, message: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, MessageBoxW, MB_ICONINFORMATION, MB_OK,
+        MB_SETFOREGROUND, MB_TOPMOST,
+    };
+
+    let title = HSTRING::from(title);
+    let message = HSTRING::from(message);
+    unsafe {
+        // Macro playback runs on a background worker. Joining its input queue to
+        // the current foreground thread gives Windows enough context to activate
+        // the dialog instead of only flashing it behind another application.
+        let current_thread_id = GetCurrentThreadId();
+        let foreground_thread_id = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let attached = foreground_thread_id != 0
+            && foreground_thread_id != current_thread_id
+            && AttachThreadInput(current_thread_id, foreground_thread_id, true).as_bool();
+        let _ = MessageBoxW(
+            None,
+            &message,
+            &title,
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+        if attached {
+            let _ = AttachThreadInput(current_thread_id, foreground_thread_id, false);
+        }
+    }
+}
+
+#[cfg(any(not(windows), test))]
+pub(crate) fn show_script_message(title: &str, message: &str) {
+    log::info!("脚本提示 [{title}]: {message}");
 }
 
 pub fn validate_rhai_source(source: &str) -> Result<(), String> {
@@ -1361,6 +1610,27 @@ mod tests {
     }
 
     #[test]
+    fn stop_with_message_ends_script_as_a_successful_user_stop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context = ExecutionContext::new(Arc::new(TestInput), cancel, 1.0, None);
+        let outcome = run_rhai_script(
+            r#"key_down("A"); stop_with_message("完成", "任务已经结束"); press("B");"#,
+            context,
+        )
+        .expect("custom stop should not be reported as a runtime failure");
+        assert_eq!(outcome, ScriptOutcome::StoppedWithMessage);
+    }
+
+    #[test]
+    fn stop_with_message_rejects_empty_content() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context = ExecutionContext::new(Arc::new(TestInput), cancel, 1.0, None);
+        let error = run_rhai_script(r#"stop_with_message(" ");"#, context)
+            .expect_err("empty popup content should be rejected");
+        assert!(error.contains("提示内容不能为空"));
+    }
+
+    #[test]
     fn native_biomimetic_api_accepts_action_context_maps() {
         let cancel = Arc::new(AtomicBool::new(false));
         let context = ExecutionContext::new(Arc::new(TestInput), cancel, 1.0, None);
@@ -1380,5 +1650,65 @@ mod tests {
     fn forbidden_capabilities_are_rejected() {
         assert!(validate_rhai_source("import \"fs\";").is_err());
         assert!(validate_rhai_source("let value = eval(\"press('A')\");").is_err());
+    }
+
+    #[test]
+    fn image_match_options_validate_modes_and_candidate_count() {
+        let mut options = Map::new();
+        options.insert("mode".into(), Dynamic::from("fast"));
+        options.insert("prefer_last".into(), Dynamic::from(false));
+        options.insert("max_candidates".into(), Dynamic::from(4_i64));
+        let parsed = checked_match_options(&options).expect("valid image options");
+        assert_eq!(parsed.mode, MatcherMode::Fast);
+        assert!(!parsed.prefer_last);
+        assert_eq!(parsed.max_candidates, 4);
+
+        let mut invalid_mode = Map::new();
+        invalid_mode.insert("mode".into(), Dynamic::from("turbo"));
+        let error = checked_match_options(&invalid_mode).expect_err("invalid mode");
+        assert!(error.contains("vision_match_mode_invalid"));
+
+        let mut invalid_count = Map::new();
+        invalid_count.insert("max_candidates".into(), Dynamic::from(0_i64));
+        let error = checked_match_options(&invalid_count).expect_err("invalid candidate count");
+        assert!(error.contains("vision_match_options_invalid"));
+
+        let context = ExecutionContext::new(
+            Arc::new(TestInput),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        let error = run_rhai_script(
+            r#"find_image("missing.png", 0, 0, 100, 100, 0.9, #{ mode: "turbo" });"#,
+            context,
+        )
+        .expect_err("Rhai image options overload");
+        assert!(error.contains("vision_match_mode_invalid"));
+    }
+
+    #[test]
+    fn image_result_map_contains_compatible_diagnostics() {
+        let result = VisionSearchResult {
+            image: None,
+            diagnostics: crate::automation::VisionDiagnostics::for_mode(MatcherMode::Auto),
+        };
+        let map = image_search_map(result);
+        for key in [
+            "found",
+            "score",
+            "total_ms",
+            "capture_ms",
+            "prepare_ms",
+            "coarse_ms",
+            "refine_ms",
+            "fallback_ms",
+            "candidate_count",
+            "previous_hit_used",
+            "fallback_used",
+            "matcher_mode",
+        ] {
+            assert!(map.contains_key(key), "missing diagnostic key: {key}");
+        }
     }
 }

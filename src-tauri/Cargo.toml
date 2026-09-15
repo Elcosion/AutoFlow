@@ -27,7 +27,7 @@ tauri = { version = "2", features = [] }
 rhai = "1.23"
 sha2 = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-imageproc = { version = "0.27.0", default-features = false }
+imageproc = { version = "0.27.0", default-features = false, features = ["rayon"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2.0.1"

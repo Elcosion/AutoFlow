@@ -61,6 +61,7 @@ export type AutomationAsset = {
 export type MacroRule = {
   id: string;
   name: string;
+  importError?: string;
   enabled: boolean;
   triggerKeys: string[];
   mode: MacroMode;
@@ -71,6 +72,12 @@ export type MacroRule = {
   target?: MacroTarget;
   behaviorPolicy?: BehaviorPolicy;
   program: AutomationProgram;
+};
+
+export type MacroRuleFile = {
+  id: string;
+  name: string;
+  fileName: string;
 };
 
 export type BehaviorDistribution = {
@@ -278,6 +285,7 @@ export type AppConfig = {
   hotkeys: HotkeyRule[];
   textExpansions: TextExpansionRule[];
   macros: MacroRule[];
+  macroFiles: MacroRuleFile[];
   assets: AutomationAsset[];
   behaviorProfiles: BehaviorProfile[];
   biomimeticInputs: BiomimeticInput[];
@@ -294,7 +302,7 @@ export type AppConfig = {
 };
 
 export const defaultConfig: AppConfig = {
-  schemaVersion: 5,
+  schemaVersion: 6,
   globalEnabled: true,
   emergencyStop: "F12",
   navigationAutoCollapse: false,
@@ -327,6 +335,7 @@ export const defaultConfig: AppConfig = {
     },
   ],
   macros: [],
+  macroFiles: [],
   assets: [],
   behaviorProfiles: [],
   biomimeticInputs: [],

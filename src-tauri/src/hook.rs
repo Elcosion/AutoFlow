@@ -6,7 +6,8 @@ use crate::behavior::{
 };
 #[cfg(windows)]
 use crate::rhai_runtime::{
-    run_rhai_script, validate_rhai_source, AutomationInput, ExecutionContext,
+    run_rhai_script, show_script_message, validate_rhai_source, AutomationInput, ExecutionContext,
+    ScriptOutcome, CANCELLED,
 };
 use crate::{
     AppConfig, AppError, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep,
@@ -82,18 +83,23 @@ impl HookService {
     }
 
     pub fn update_config(&self, config: AppConfig) -> Result<(), AppError> {
-        let mut current = self
-            .shared
-            .config
-            .lock()
-            .map_err(|_| AppError::internal("输入服务状态异常，请重启 AutoFlow"))?;
         let assets = config.assets.clone();
-        *current = config;
+        {
+            let mut current = self
+                .shared
+                .config
+                .lock()
+                .map_err(|_| AppError::internal("输入服务状态异常，请重启 AutoFlow"))?;
+            *current = config;
+        }
         if let Ok(vision) = self.shared.vision.lock() {
             vision.set_assets(&assets);
         }
         #[cfg(windows)]
-        self.shared.clear_transient_state();
+        {
+            self.shared.clear_transient_state();
+            self.shared.request_native_hotkey_refresh();
+        }
         Ok(())
     }
 
@@ -321,6 +327,8 @@ struct HookShared {
     shutdown: AtomicBool,
     #[cfg(windows)]
     native_clicker_hotkey_registered: AtomicBool,
+    #[cfg(windows)]
+    native_macro_hotkeys: Mutex<HashMap<i32, String>>,
 }
 
 impl HookShared {
@@ -348,6 +356,25 @@ impl HookShared {
             shutdown: AtomicBool::new(false),
             #[cfg(windows)]
             native_clicker_hotkey_registered: AtomicBool::new(false),
+            #[cfg(windows)]
+            native_macro_hotkeys: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn request_native_hotkey_refresh(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+
+        let thread_id = self.thread_id.load(Ordering::SeqCst);
+        if thread_id != 0 {
+            let _ = unsafe {
+                PostThreadMessageW(
+                    thread_id,
+                    REFRESH_NATIVE_HOTKEYS_MESSAGE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                )
+            };
         }
     }
 
@@ -711,6 +738,7 @@ impl HookShared {
         playback.total_steps = total_steps;
         playback.last_error = None;
         let shared = Arc::clone(self);
+        let trigger_keys = macro_rule.trigger_keys.clone();
         thread::Builder::new()
             .name("autoflow-macro-playback".to_string())
             .spawn(move || {
@@ -718,14 +746,22 @@ impl HookShared {
                 // injecting the first recorded event.
                 thread::sleep(Duration::from_millis(120));
                 let result = play_macro_thread(&shared, &macro_rule, &stop);
-                restore_previous_window_if_own_process(restore_window);
+                let playback_error = result.as_ref().err().cloned();
                 if let Ok(mut playback) = shared.playback.lock() {
                     playback.running = false;
                     playback.stop = None;
                     playback.restore_window = None;
                     if let Err(error) = result {
+                        log::warn!("宏“{}”运行失败: {error}", macro_rule.name);
                         playback.last_error = Some(error);
                     }
+                }
+                shared.release_macro_trigger_state(&trigger_keys);
+                restore_previous_window_if_own_process(restore_window);
+                if let Some(error) =
+                    playback_error.filter(|error| should_show_playback_error(error))
+                {
+                    show_script_message(&format!("{} · 运行失败", macro_rule.name), &error);
                 }
             })
             .map_err(|error| {
@@ -744,6 +780,23 @@ impl HookShared {
                 stop.store(true, Ordering::SeqCst);
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn release_macro_trigger_state(&self, trigger_keys: &[String]) {
+        let Some(trigger_vks) = macro_trigger_vks(trigger_keys) else {
+            return;
+        };
+        let Ok(mut pressed) = self.pressed.lock() else {
+            return;
+        };
+        let Ok(mut latched) = self.latched_hotkeys.lock() else {
+            return;
+        };
+        clear_released_macro_trigger_state(&mut pressed, &mut latched, &trigger_vks, |vk| unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+            GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0
+        });
     }
 
     #[cfg(windows)]
@@ -981,6 +1034,7 @@ fn hook_thread(shared: Arc<HookShared>) {
     if !native_clicker_hotkey {
         log::warn!("Ctrl+F8 原生热键注册失败，将使用兼容监听方式");
     }
+    refresh_native_macro_hotkeys(&shared);
 
     let mut message = MSG::default();
     loop {
@@ -995,6 +1049,14 @@ fn hook_thread(shared: Arc<HookShared>) {
             process_native_clicker_hotkey(&shared);
             continue;
         }
+        if message.message == REFRESH_NATIVE_HOTKEYS_MESSAGE {
+            refresh_native_macro_hotkeys(&shared);
+            continue;
+        }
+        if message.message == WM_HOTKEY {
+            process_native_macro_hotkey(&shared, message.wParam.0 as i32);
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -1006,6 +1068,7 @@ fn hook_thread(shared: Arc<HookShared>) {
     if native_clicker_hotkey {
         let _ = unsafe { UnregisterHotKey(None, CLICKER_HOTKEY_ID) };
     }
+    unregister_native_macro_hotkeys(&shared);
     shared
         .native_clicker_hotkey_registered
         .store(false, Ordering::SeqCst);
@@ -1069,6 +1132,10 @@ unsafe extern "system" fn keyboard_hook(
         // recording it ends capture and leaves the result available for the
         // UI's “停止录制” button to save; otherwise it remains the emergency
         // stop for playback and other active rules.
+        // clear_transient_state acquires `pressed` again, so the keyboard hook
+        // must release its guard first. Keeping it here deadlocks the hook and
+        // leaves all subsequent macro shortcuts unresponsive.
+        drop(pressed);
         if shared.is_recording() {
             shared.finish_recording();
         } else {
@@ -1123,7 +1190,7 @@ unsafe extern "system" fn keyboard_hook(
         return CallNextHookEx(None, code, message, data);
     }
 
-    if process_macro_key_down(shared, &config, vk, &pressed) {
+    if process_macro_key_down(shared, &config, was_pressed, &pressed) {
         return LRESULT(1);
     }
 
@@ -1775,18 +1842,26 @@ fn key_name_from_vk(vk: u32) -> String {
 fn process_macro_key_down(
     shared: &Arc<HookShared>,
     config: &AppConfig,
-    _vk: u32,
+    was_pressed: bool,
     pressed: &HashSet<u32>,
 ) -> bool {
     if shared.is_recording() {
         return false;
     }
+    let native_macro_ids = shared
+        .native_macro_hotkeys
+        .lock()
+        .map(|registered| registered.values().cloned().collect::<HashSet<_>>())
+        .unwrap_or_default();
     for rule in config.macros.iter().filter(|rule| rule.enabled) {
         if shared
             .native_clicker_hotkey_registered
             .load(Ordering::SeqCst)
             && is_native_clicker_rule(rule)
         {
+            continue;
+        }
+        if native_macro_ids.contains(&rule.id) {
             continue;
         }
         let trigger_vks = rule
@@ -1800,14 +1875,12 @@ fn process_macro_key_down(
         {
             continue;
         }
-        let signature = format!(
-            "macro+{}",
-            trigger_vks
-                .iter()
-                .map(|key| key.to_string())
-                .collect::<Vec<_>>()
-                .join("+")
-        );
+        if was_pressed {
+            return true;
+        }
+        let Some(signature) = macro_latch_signature(&rule.trigger_keys) else {
+            continue;
+        };
         let Ok(mut latched) = shared.latched_hotkeys.lock() else {
             continue;
         };
@@ -1823,6 +1896,58 @@ fn process_macro_key_down(
         return true;
     }
     false
+}
+
+#[cfg(windows)]
+fn macro_latch_signature(trigger_keys: &[String]) -> Option<String> {
+    let trigger_vks = macro_trigger_vks(trigger_keys)?;
+    Some(format!(
+        "macro+{}",
+        trigger_vks
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>()
+            .join("+")
+    ))
+}
+
+#[cfg(windows)]
+fn macro_trigger_vks(trigger_keys: &[String]) -> Option<Vec<u32>> {
+    let trigger_vks = trigger_keys
+        .iter()
+        .map(|key| key_to_vk(key))
+        .collect::<Option<Vec<_>>>()?;
+    (!trigger_vks.is_empty()).then_some(trigger_vks)
+}
+
+#[cfg(windows)]
+fn clear_released_macro_trigger_state(
+    pressed: &mut HashSet<u32>,
+    latched: &mut HashSet<String>,
+    trigger_vks: &[u32],
+    is_physically_down: impl Fn(u32) -> bool,
+) -> bool {
+    if trigger_vks.iter().copied().any(is_physically_down) {
+        return false;
+    }
+    for vk in trigger_vks {
+        pressed.remove(vk);
+    }
+    let signature = format!(
+        "macro+{}",
+        trigger_vks
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    latched.remove(&signature);
+    true
+}
+
+#[cfg(windows)]
+fn should_show_playback_error(error: &str) -> bool {
+    error != CANCELLED
 }
 
 #[cfg(windows)]
@@ -1845,6 +1970,134 @@ static HOOK_SHARED: std::sync::OnceLock<Arc<HookShared>> = std::sync::OnceLock::
 
 #[cfg(windows)]
 const CLICKER_HOTKEY_ID: i32 = 0x4155;
+
+#[cfg(windows)]
+const NATIVE_MACRO_HOTKEY_ID_START: i32 = 0x5000;
+
+#[cfg(windows)]
+const REFRESH_NATIVE_HOTKEYS_MESSAGE: u32 = 0x8041;
+
+#[cfg(windows)]
+fn native_hotkey_spec(trigger_keys: &[String]) -> Option<(u32, u32)> {
+    let mut modifiers = 0u32;
+    let mut primary_key = None;
+    for key in trigger_keys {
+        match key_to_vk(key)? {
+            0x10 => modifiers |= 0x0004,
+            0x11 => modifiers |= 0x0002,
+            0x12 => modifiers |= 0x0001,
+            0x5B => modifiers |= 0x0008,
+            key => {
+                if primary_key.is_some() {
+                    return None;
+                }
+                primary_key = Some(key);
+            }
+        }
+    }
+    primary_key.map(|key| (modifiers, key))
+}
+
+#[cfg(windows)]
+fn refresh_native_macro_hotkeys(shared: &HookShared) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+    };
+
+    let Ok(config) = shared.config.lock().map(|config| config.clone()) else {
+        return;
+    };
+    let Ok(mut registered) = shared.native_macro_hotkeys.lock() else {
+        return;
+    };
+    for hotkey_id in registered.keys().copied().collect::<Vec<_>>() {
+        let _ = unsafe { UnregisterHotKey(None, hotkey_id) };
+    }
+    registered.clear();
+
+    let emergency_vk = key_to_vk(&config.emergency_stop);
+    let mut hotkey_id = NATIVE_MACRO_HOTKEY_ID_START;
+    for rule in config.macros.iter().filter(|rule| {
+        rule.enabled
+            && !matches!(rule.mode, MacroMode::Hold)
+            && !is_native_clicker_rule(rule)
+            && rule.import_error.is_none()
+    }) {
+        let Some((modifiers, primary_key)) = native_hotkey_spec(&rule.trigger_keys) else {
+            continue;
+        };
+        if rule.trigger_keys.len() == 1 && emergency_vk == Some(primary_key) {
+            continue;
+        }
+        let succeeded = unsafe {
+            RegisterHotKey(
+                None,
+                hotkey_id,
+                HOT_KEY_MODIFIERS(modifiers | MOD_NOREPEAT.0),
+                primary_key,
+            )
+        }
+        .is_ok();
+        if succeeded {
+            registered.insert(hotkey_id, rule.id.clone());
+            hotkey_id = hotkey_id.saturating_add(1);
+        } else {
+            log::warn!("宏“{}”的原生快捷键注册失败，将使用兼容监听方式", rule.name);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unregister_native_macro_hotkeys(shared: &HookShared) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
+
+    let Ok(mut registered) = shared.native_macro_hotkeys.lock() else {
+        return;
+    };
+    for hotkey_id in registered.keys().copied().collect::<Vec<_>>() {
+        let _ = unsafe { UnregisterHotKey(None, hotkey_id) };
+    }
+    registered.clear();
+}
+
+#[cfg(windows)]
+fn process_native_macro_hotkey(shared: &Arc<HookShared>, hotkey_id: i32) {
+    if shared.is_recording() {
+        return;
+    }
+    let macro_id = shared
+        .native_macro_hotkeys
+        .lock()
+        .ok()
+        .and_then(|registered| registered.get(&hotkey_id).cloned());
+    let Some(macro_id) = macro_id else {
+        return;
+    };
+    let Ok(config) = shared.config.lock().map(|config| config.clone()) else {
+        return;
+    };
+    if !config.global_enabled {
+        return;
+    }
+    let Some(rule) = config
+        .macros
+        .iter()
+        .find(|rule| rule.enabled && rule.id == macro_id)
+    else {
+        return;
+    };
+    if matches!(rule.mode, MacroMode::Toggle) && shared.is_playback_running() {
+        shared.stop_playback();
+    } else if let Err(error) = shared.start_playback(rule.clone()) {
+        shared.set_playback_error(error.message.clone());
+        log::warn!("宏“{}”原生快捷键触发失败: {}", rule.name, error.message);
+        let title = format!("{} · 启动失败", rule.name);
+        let message = error.message;
+        let _ = thread::Builder::new()
+            .name("autoflow-macro-error-dialog".to_string())
+            .spawn(move || show_script_message(&title, &message));
+    }
+}
 
 #[cfg(windows)]
 fn is_native_clicker_rule(rule: &MacroRule) -> bool {
@@ -2046,11 +2299,11 @@ fn play_macro_thread(
     let mut held_keys = HashSet::new();
     let mut held_buttons = HashSet::new();
 
-    loop {
+    let playback_result = loop {
         if stop.load(Ordering::SeqCst) {
-            break;
+            break Ok(());
         }
-        if !play_automation_program(
+        let iteration_result = play_automation_program(
             shared,
             macro_rule,
             macro_rule.speed,
@@ -2058,14 +2311,17 @@ fn play_macro_thread(
             &mut held_keys,
             &mut held_buttons,
             behavior.clone(),
-        )? {
-            break;
+        );
+        match iteration_result {
+            Ok(true) => {}
+            Ok(false) => break Ok(()),
+            Err(error) => break Err(error),
         }
         iterations += 1;
         if max_iterations.is_some_and(|max| iterations >= max) {
-            break;
+            break Ok(());
         }
-    }
+    };
 
     for vk in held_keys.drain() {
         let _ = send_key(vk, false);
@@ -2073,7 +2329,7 @@ fn play_macro_thread(
     for button in held_buttons.drain() {
         let _ = send_mouse_button(button, KeyAction::Up);
     }
-    Ok(())
+    playback_result
 }
 
 #[cfg(windows)]
@@ -2104,6 +2360,18 @@ impl WindowsAutomationInput {
         }
     }
 
+    fn synchronized_cursor_position(&self) -> Option<(i32, i32)> {
+        let cached = self.cursor.lock().ok().and_then(|cursor| *cursor);
+        let current = current_cursor_position();
+        let start = resolve_cursor_start(current, cached);
+        if current.is_some() {
+            if let Ok(mut cursor) = self.cursor.lock() {
+                *cursor = current;
+            }
+        }
+        start
+    }
+
     fn move_to_raw_with_cancel(
         &self,
         x: i32,
@@ -2126,7 +2394,7 @@ impl WindowsAutomationInput {
         y: i32,
         cancel: Option<&AtomicBool>,
     ) -> Result<(), String> {
-        let start = self.cursor.lock().ok().and_then(|cursor| *cursor);
+        let start = self.synchronized_cursor_position();
         let Some(behavior) = &self.behavior else {
             if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
                 return Err("脚本已被 F12 停止".to_string());
@@ -2198,7 +2466,7 @@ impl WindowsAutomationInput {
         let Some(behavior) = &self.behavior else {
             return self.move_to_raw_with_cancel(x, y, Some(cancel));
         };
-        let start = self.cursor.lock().ok().and_then(|cursor| *cursor);
+        let start = self.synchronized_cursor_position();
         let Some(start) = start else {
             return self.move_to_raw_with_cancel(x, y, Some(cancel));
         };
@@ -2446,6 +2714,14 @@ fn current_cursor_position() -> Option<(i32, i32)> {
 }
 
 #[cfg(windows)]
+fn resolve_cursor_start(
+    current: Option<(i32, i32)>,
+    cached: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
+    current.or(cached)
+}
+
+#[cfg(windows)]
 fn play_automation_program(
     shared: &Arc<HookShared>,
     macro_rule: &MacroRule,
@@ -2489,7 +2765,8 @@ fn play_automation_program(
                 Some(progress),
                 vision,
             );
-            run_rhai_script(source, context).map(|_| true)
+            run_rhai_script(source, context)
+                .map(|outcome| matches!(outcome, ScriptOutcome::Completed))
         }
     }
 }
@@ -2871,11 +3148,12 @@ fn split_command_line(command_line: &str) -> Vec<String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        canonical_virtual_key, combinable_click_at, combined_click_at,
-        discard_recording_shortcut_steps, discard_trailing_mouse_actions, is_keyboard_modifier,
-        is_recording_shortcut_key, is_shift_key, is_text_modifier, latched_signature_contains_vk,
-        randomized_delay_ms, shifted_printable_character, split_command_line, HookShared,
-        RecorderState,
+        canonical_virtual_key, clear_released_macro_trigger_state, combinable_click_at,
+        combined_click_at, discard_recording_shortcut_steps, discard_trailing_mouse_actions,
+        is_keyboard_modifier, is_recording_shortcut_key, is_shift_key, is_text_modifier,
+        latched_signature_contains_vk, native_hotkey_spec, randomized_delay_ms,
+        resolve_cursor_start, shifted_printable_character, should_show_playback_error,
+        split_command_line, HookShared, RecorderState,
     };
     use crate::MouseButton;
     use crate::{KeyAction, MacroStep};
@@ -2914,6 +3192,15 @@ mod tests {
             let value = randomized_delay_ms(120, Some(360));
             assert!((120..=360).contains(&value));
         }
+    }
+
+    #[test]
+    fn live_cursor_position_takes_priority_over_cached_automation_endpoint() {
+        assert_eq!(
+            resolve_cursor_start(Some((420, 260)), Some((100, 80))),
+            Some((420, 260))
+        );
+        assert_eq!(resolve_cursor_start(None, Some((100, 80))), Some((100, 80)));
     }
 
     #[test]
@@ -2968,13 +3255,67 @@ mod tests {
     }
 
     #[test]
+    fn completed_macro_reconciles_stale_pressed_and_latched_trigger_state() {
+        let trigger_vks = [0x77_u32];
+        let signature = "macro+119".to_string();
+        let mut pressed = HashSet::from(trigger_vks);
+        let mut latched = HashSet::from([signature.clone()]);
+
+        assert!(clear_released_macro_trigger_state(
+            &mut pressed,
+            &mut latched,
+            &trigger_vks,
+            |_| false,
+        ));
+        assert!(!pressed.contains(&0x77));
+        assert!(!latched.contains(&signature));
+    }
+
+    #[test]
+    fn completed_macro_keeps_trigger_state_while_key_is_physically_held() {
+        let trigger_vks = [0x77_u32];
+        let signature = "macro+119".to_string();
+        let mut pressed = HashSet::from(trigger_vks);
+        let mut latched = HashSet::from([signature.clone()]);
+
+        assert!(!clear_released_macro_trigger_state(
+            &mut pressed,
+            &mut latched,
+            &trigger_vks,
+            |_| true,
+        ));
+        assert!(pressed.contains(&0x77));
+        assert!(latched.contains(&signature));
+    }
+
+    #[test]
+    fn playback_errors_are_visible_but_f12_cancellation_stays_silent() {
+        assert!(should_show_playback_error("找不到图像文件"));
+        assert!(!should_show_playback_error(crate::rhai_runtime::CANCELLED));
+    }
+
+    #[test]
+    fn native_hotkey_specs_support_single_function_keys_and_modifier_combos() {
+        assert_eq!(native_hotkey_spec(&["F9".to_string()]), Some((0, 0x78)));
+        assert_eq!(
+            native_hotkey_spec(&["Ctrl".to_string(), "F9".to_string()]),
+            Some((0x0002, 0x78))
+        );
+        assert_eq!(native_hotkey_spec(&["Ctrl".to_string()]), None);
+        assert_eq!(
+            native_hotkey_spec(&["F8".to_string(), "F9".to_string()]),
+            None
+        );
+    }
+
+    #[test]
     fn stopping_by_click_removes_trailing_mouse_input() {
         let shared = HookShared::new(
             crate::AppConfig::default(),
             crate::automation::VisionService::new(
                 std::env::temp_dir()
                     .join("AutoFlow")
-                    .join("assets")
+                    .join("data")
                     .join("images"),
             ),
         );

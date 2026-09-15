@@ -350,6 +350,7 @@ impl WindowsCaptureBackend {
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or_else(|| VisionError::new("capture_region_invalid", "捕获区域尺寸溢出"))?;
         let mut pixels = vec![0u8; expected];
+        let mut valid_regions = Vec::new();
         for tile in tiles {
             if cancel.load(Ordering::SeqCst) {
                 return Err(VisionError::cancelled());
@@ -361,8 +362,9 @@ impl WindowsCaptureBackend {
                 cancel,
             )?;
             copy_frame_into_region(&frame, region, &mut pixels)?;
+            valid_regions.push(tile.region);
         }
-        CaptureFrame::from_bgra(
+        CaptureFrame::from_bgra_with_valid_regions(
             Point {
                 x: region.x,
                 y: region.y,
@@ -370,6 +372,7 @@ impl WindowsCaptureBackend {
             region.width,
             region.height,
             pixels,
+            valid_regions,
         )
     }
 
@@ -596,22 +599,12 @@ fn monitor_tiles(region: ScreenRect) -> Result<Vec<MonitorTile>, VisionError> {
         ));
     }
     tiles.sort_by_key(|tile| (tile.region.y, tile.region.x));
-    let requested_pixels = u64::from(region.width) * u64::from(region.height);
-    let covered_pixels: u64 = tiles
-        .iter()
-        .map(|tile| u64::from(tile.region.width) * u64::from(tile.region.height))
-        .sum();
-    if tiles.is_empty() || covered_pixels < requested_pixels {
+    if tiles.is_empty() {
         if let Some(tile) = monitor_tile_from_point(region)? {
-            tiles.clear();
             tiles.push(tile);
         }
     }
-    let covered_pixels: u64 = tiles
-        .iter()
-        .map(|tile| u64::from(tile.region.width) * u64::from(tile.region.height))
-        .sum();
-    if tiles.is_empty() || covered_pixels < requested_pixels {
+    if tiles.is_empty() {
         return Err(VisionError::new(
             "capture_region_invalid",
             "捕获区域不在可用显示器范围内",

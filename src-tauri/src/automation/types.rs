@@ -15,13 +15,14 @@ pub const MAX_TEMPLATE_WIDTH: u32 = 2_048;
 pub const MAX_TEMPLATE_HEIGHT: u32 = 2_048;
 pub const MAX_TEMPLATE_PIXELS: u64 = 4_194_304;
 pub const MAX_CACHED_TEMPLATES: usize = 64;
+pub const MAX_CACHED_TEMPLATE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ASSET_NAME_LENGTH: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(pub isize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreenRect {
     pub x: i32,
@@ -163,7 +164,7 @@ impl WindowRectValue {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationAsset {
     pub id: String,
@@ -208,6 +209,7 @@ pub struct CaptureFrame {
     pub width: u32,
     pub height: u32,
     pixels_bgra: Arc<[u8]>,
+    valid_regions: Arc<[ScreenRect]>,
 }
 
 impl Clone for CaptureFrame {
@@ -217,6 +219,7 @@ impl Clone for CaptureFrame {
             width: self.width,
             height: self.height,
             pixels_bgra: Arc::clone(&self.pixels_bgra),
+            valid_regions: Arc::clone(&self.valid_regions),
         }
     }
 }
@@ -227,6 +230,17 @@ impl CaptureFrame {
         width: u32,
         height: u32,
         pixels: Vec<u8>,
+    ) -> Result<Self, VisionError> {
+        let region = ScreenRect::from_parts(origin.x, origin.y, width, height);
+        Self::from_bgra_with_valid_regions(origin, width, height, pixels, vec![region])
+    }
+
+    pub(crate) fn from_bgra_with_valid_regions(
+        origin: Point,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        valid_regions: Vec<ScreenRect>,
     ) -> Result<Self, VisionError> {
         let expected = usize::try_from(width)
             .ok()
@@ -243,11 +257,17 @@ impl CaptureFrame {
                 "捕获帧尺寸或像素数据无效",
             ));
         }
+        let frame_region = ScreenRect::from_parts(origin.x, origin.y, width, height);
+        let valid_regions = valid_regions
+            .into_iter()
+            .filter_map(|region| region.intersection(&frame_region))
+            .collect::<Vec<_>>();
         Ok(Self {
             origin,
             width,
             height,
             pixels_bgra: pixels.into(),
+            valid_regions: valid_regions.into(),
         })
     }
 
@@ -313,7 +333,12 @@ impl CaptureFrame {
             })?;
             pixels.extend_from_slice(slice);
         }
-        Self::from_bgra(
+        let valid_regions = self
+            .valid_regions
+            .iter()
+            .filter_map(|valid| valid.intersection(&region))
+            .collect::<Vec<_>>();
+        Self::from_bgra_with_valid_regions(
             Point {
                 x: region.x,
                 y: region.y,
@@ -321,11 +346,86 @@ impl CaptureFrame {
             region.width,
             region.height,
             pixels,
+            valid_regions,
         )
     }
 
     pub fn pixels_bgra(&self) -> &[u8] {
         &self.pixels_bgra
+    }
+
+    pub fn valid_regions(&self) -> &[ScreenRect] {
+        &self.valid_regions
+    }
+
+    pub fn is_region_fully_valid(&self, region: ScreenRect) -> bool {
+        if region.width == 0 || region.height == 0 {
+            return false;
+        }
+        let Ok(frame_region) =
+            ScreenRect::new(self.origin.x, self.origin.y, self.width, self.height)
+        else {
+            return false;
+        };
+        if !frame_region.contains(&region).unwrap_or(false) {
+            return false;
+        }
+
+        let Ok(region_bottom) = region.bottom_i64() else {
+            return false;
+        };
+        let mut y_breaks = vec![i64::from(region.y), region_bottom];
+        for valid in self.valid_regions.iter() {
+            let top = i64::from(valid.y).max(i64::from(region.y));
+            let bottom = valid.bottom_i64().unwrap_or(i64::MIN).min(region_bottom);
+            if top < bottom {
+                y_breaks.push(top);
+                y_breaks.push(bottom);
+            }
+        }
+        y_breaks.sort_unstable();
+        y_breaks.dedup();
+        let region_left = i64::from(region.x);
+        let region_right = region.right_i64().unwrap_or(i64::MIN);
+
+        for pair in y_breaks.windows(2) {
+            let top = pair[0];
+            let bottom = pair[1];
+            if top >= bottom {
+                continue;
+            }
+            let mut spans = self
+                .valid_regions
+                .iter()
+                .filter_map(|valid| {
+                    let valid_bottom = valid.bottom_i64().ok()?;
+                    if i64::from(valid.y) <= top && valid_bottom >= bottom {
+                        Some((
+                            i64::from(valid.x).max(region_left),
+                            valid.right_i64().ok()?.min(region_right),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .filter(|(left, right)| left < right)
+                .collect::<Vec<_>>();
+            spans.sort_unstable_by_key(|(left, _)| *left);
+            let mut covered_until = region_left;
+            for (left, right) in spans {
+                if left > covered_until {
+                    return false;
+                }
+                covered_until = covered_until.max(right);
+                if covered_until >= region_right {
+                    break;
+                }
+            }
+            if covered_until < region_right {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -372,6 +472,145 @@ pub trait VisionMatcher: Send + Sync {
         template: &CaptureFrame,
         threshold: f32,
     ) -> Result<Option<ImageMatch>, VisionError>;
+
+    fn find_template_with_options(
+        &self,
+        frame: &CaptureFrame,
+        template: &CaptureFrame,
+        threshold: f32,
+        options: &MatcherOptions,
+    ) -> Result<MatcherResult, VisionError> {
+        let started = std::time::Instant::now();
+        let image = self.find_template(frame, template, threshold)?;
+        let mut diagnostics = VisionDiagnostics::for_mode(options.mode);
+        diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        Ok(MatcherResult { image, diagnostics })
+    }
+
+    fn find_prepared_template(
+        &self,
+        frame: &CaptureFrame,
+        template: &CaptureFrame,
+        _prepared: Option<&super::vision::PreparedTemplate>,
+        threshold: f32,
+        options: &MatcherOptions,
+    ) -> Result<MatcherResult, VisionError> {
+        self.find_template_with_options(frame, template, threshold, options)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum MatcherMode {
+    #[default]
+    Auto,
+    Exact,
+    Fast,
+}
+
+impl MatcherMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Exact => "exact",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatcherOptions {
+    pub mode: MatcherMode,
+    pub prefer_last: bool,
+    pub max_candidates: usize,
+}
+
+impl Default for MatcherOptions {
+    fn default() -> Self {
+        Self {
+            mode: MatcherMode::Auto,
+            prefer_last: true,
+            max_candidates: 8,
+        }
+    }
+}
+
+impl MatcherOptions {
+    pub fn validate(&self) -> Result<(), VisionError> {
+        if !(1..=32).contains(&self.max_candidates) {
+            return Err(VisionError::new(
+                "vision_match_options_invalid",
+                "候选数量必须在 1 到 32 之间",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionDiagnostics {
+    pub total_ms: u64,
+    pub capture_ms: u64,
+    pub prepare_ms: u64,
+    pub coarse_ms: u64,
+    pub refine_ms: u64,
+    pub fallback_ms: u64,
+    pub candidate_count: usize,
+    pub coarse_score: f32,
+    pub refined_score: f32,
+    pub previous_hit_used: bool,
+    pub fallback_used: bool,
+    pub matcher_mode: String,
+}
+
+impl Default for VisionDiagnostics {
+    fn default() -> Self {
+        Self::for_mode(MatcherMode::Auto)
+    }
+}
+
+impl VisionDiagnostics {
+    pub fn for_mode(mode: MatcherMode) -> Self {
+        Self {
+            total_ms: 0,
+            capture_ms: 0,
+            prepare_ms: 0,
+            coarse_ms: 0,
+            refine_ms: 0,
+            fallback_ms: 0,
+            candidate_count: 0,
+            coarse_score: 0.0,
+            refined_score: 0.0,
+            previous_hit_used: false,
+            fallback_used: false,
+            matcher_mode: mode.as_str().to_string(),
+        }
+    }
+
+    pub fn add_attempt(&mut self, other: &Self) {
+        self.capture_ms = self.capture_ms.saturating_add(other.capture_ms);
+        self.prepare_ms = self.prepare_ms.saturating_add(other.prepare_ms);
+        self.coarse_ms = self.coarse_ms.saturating_add(other.coarse_ms);
+        self.refine_ms = self.refine_ms.saturating_add(other.refine_ms);
+        self.fallback_ms = self.fallback_ms.saturating_add(other.fallback_ms);
+        self.candidate_count = self.candidate_count.max(other.candidate_count);
+        self.coarse_score = self.coarse_score.max(other.coarse_score);
+        self.refined_score = self.refined_score.max(other.refined_score);
+        self.previous_hit_used |= other.previous_hit_used;
+        self.fallback_used |= other.fallback_used;
+        self.matcher_mode = other.matcher_mode.clone();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatcherResult {
+    pub image: Option<ImageMatch>,
+    pub diagnostics: VisionDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionSearchResult {
+    pub image: Option<ImageMatch>,
+    pub diagnostics: VisionDiagnostics,
 }
 
 pub trait VisionApi: Send + Sync {
@@ -399,18 +638,48 @@ pub trait VisionApi: Send + Sync {
     ) -> Result<bool, VisionError>;
     fn find_image(
         &self,
-        asset_id: &str,
+        file_name: &str,
         region: ScreenRect,
         threshold: f32,
         cancel: &AtomicBool,
     ) -> Result<Option<ImageMatch>, VisionError>;
+
+    fn find_image_diagnostic(
+        &self,
+        file_name: &str,
+        region: ScreenRect,
+        threshold: f32,
+        cancel: &AtomicBool,
+        options: &MatcherOptions,
+    ) -> Result<VisionSearchResult, VisionError> {
+        let started = std::time::Instant::now();
+        let image = self.find_image(file_name, region, threshold, cancel)?;
+        let mut diagnostics = VisionDiagnostics::for_mode(options.mode);
+        diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        Ok(VisionSearchResult { image, diagnostics })
+    }
     fn wait_image(
         &self,
-        asset_id: &str,
+        file_name: &str,
         region: ScreenRect,
         threshold: f32,
         options: VisionPollOptions<'_>,
     ) -> Result<Option<ImageMatch>, VisionError>;
+
+    fn wait_image_diagnostic(
+        &self,
+        file_name: &str,
+        region: ScreenRect,
+        threshold: f32,
+        options: VisionPollOptions<'_>,
+        matcher_options: &MatcherOptions,
+    ) -> Result<VisionSearchResult, VisionError> {
+        let started = std::time::Instant::now();
+        let image = self.wait_image(file_name, region, threshold, options)?;
+        let mut diagnostics = VisionDiagnostics::for_mode(matcher_options.mode);
+        diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        Ok(VisionSearchResult { image, diagnostics })
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -174,12 +174,7 @@ export function normalizeBehaviorPolicy(
       0,
       1,
     ),
-    speedScale: numberInRange(
-      policy.speedScale,
-      fallback.speedScale,
-      0.1,
-      4,
-    ),
+    speedScale: numberInRange(policy.speedScale, fallback.speedScale, 0.1, 4),
     ...(seed === undefined ? {} : { seed }),
   };
 }
@@ -313,9 +308,7 @@ export function normalizeConfig(value: Partial<AppConfig>): AppConfig {
             : "good";
         const bucketCoverage = Array.isArray(profile.coverage.bucketCoverage)
           ? profile.coverage.bucketCoverage.map((bucket) => {
-              const validSampleCount = Number.isFinite(
-                bucket.validSampleCount,
-              )
+              const validSampleCount = Number.isFinite(bucket.validSampleCount)
                 ? Math.max(0, Math.floor(bucket.validSampleCount))
                 : 0;
               const trainingReady =
@@ -358,7 +351,9 @@ export function normalizeConfig(value: Partial<AppConfig>): AppConfig {
             clickAssociatedPointerEpisodeCount:
               typeof profile.coverage.clickAssociatedPointerEpisodeCount ===
                 "number" &&
-              Number.isFinite(profile.coverage.clickAssociatedPointerEpisodeCount)
+              Number.isFinite(
+                profile.coverage.clickAssociatedPointerEpisodeCount,
+              )
                 ? profile.coverage.clickAssociatedPointerEpisodeCount
                 : 0,
             bucketCoverage,
@@ -368,19 +363,22 @@ export function normalizeConfig(value: Partial<AppConfig>): AppConfig {
             qualityFilteredPointerEpisodeCount:
               typeof profile.coverage.qualityFilteredPointerEpisodeCount ===
                 "number" &&
-              Number.isFinite(profile.coverage.qualityFilteredPointerEpisodeCount)
+              Number.isFinite(
+                profile.coverage.qualityFilteredPointerEpisodeCount,
+              )
                 ? profile.coverage.qualityFilteredPointerEpisodeCount
                 : 0,
           },
         };
       })
     : defaultConfig.behaviorProfilesV2;
-  const policyValue = value.behaviorPolicy as Partial<BehaviorPolicy> | undefined;
+  const policyValue = value.behaviorPolicy as
+    Partial<BehaviorPolicy> | undefined;
   const behaviorPolicy = normalizeBehaviorPolicy(policyValue);
   return {
     ...defaultConfig,
     ...value,
-    schemaVersion: 5,
+    schemaVersion: 6,
     hotkeys: Array.isArray(value.hotkeys)
       ? value.hotkeys
       : defaultConfig.hotkeys,
@@ -580,18 +578,18 @@ export async function generateBehaviorApi(
   return invoke<BehaviorApi>("generate_behavior_api", { profileId });
 }
 
-export async function exportBehaviorProfileV2(profileId: string): Promise<string> {
-  if (!isTauriRuntime()) {
-    throw new Error("V2 行为档案导出需要在 Windows 桌面端运行");
-  }
-  return invoke<string>("export_behavior_profile_v2", { profileId });
-}
+export type ManagedDataDirectory =
+  "profiles" | "sessions" | "scripts" | "images";
 
-export async function exportBehaviorSessionV2(sessionId: string): Promise<string> {
+export async function openDataDirectory(
+  subdirectory?: ManagedDataDirectory,
+): Promise<string> {
   if (!isTauriRuntime()) {
-    throw new Error("V2 原始 Session 导出需要在 Windows 桌面端运行");
+    throw new Error("数据文件夹需要在 Windows 桌面端打开");
   }
-  return invoke<string>("export_behavior_session_v2", { sessionId });
+  return invoke<string>("open_data_directory", {
+    subdirectory: subdirectory ?? null,
+  });
 }
 
 export async function deleteBehaviorProfileV2(
@@ -660,12 +658,12 @@ export async function readAsset(assetId: string): Promise<Uint8Array> {
 
 export async function renameAsset(
   assetId: string,
-  name: string,
+  fileName: string,
 ): Promise<AutomationAsset> {
   if (!isTauriRuntime()) {
     throw new Error("图像资源管理需要在 Windows 桌面端运行");
   }
-  return invoke<AutomationAsset>("rename_asset", { assetId, name });
+  return invoke<AutomationAsset>("rename_asset", { assetId, fileName });
 }
 
 export async function deleteAsset(

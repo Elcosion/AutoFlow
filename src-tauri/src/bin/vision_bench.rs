@@ -1,4 +1,4 @@
-use autoflow_lib::automation::run_vision_diagnostic;
+use autoflow_lib::automation::{run_vision_benchmark, run_vision_diagnostic};
 use std::time::Duration;
 
 fn duration_seconds() -> u64 {
@@ -16,7 +16,11 @@ fn duration_seconds() -> u64 {
 }
 
 fn main() {
-    let seconds = duration_seconds();
-    println!("AutoFlow vision diagnostic; trend duration={}s", seconds);
-    println!("{}", run_vision_diagnostic(Duration::from_secs(seconds)));
+    println!("AutoFlow pure-memory vision benchmark");
+    println!("{}", run_vision_benchmark());
+    if std::env::args().any(|argument| argument == "--capture-diagnostic") {
+        let seconds = duration_seconds();
+        println!("AutoFlow capture diagnostic; trend duration={}s", seconds);
+        println!("{}", run_vision_diagnostic(Duration::from_secs(seconds)));
+    }
 }
