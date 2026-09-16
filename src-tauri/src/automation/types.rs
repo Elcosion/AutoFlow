@@ -487,6 +487,7 @@ pub trait VisionMatcher: Send + Sync {
         let image = self.find_template(frame, template, threshold)?;
         let mut diagnostics = VisionDiagnostics::for_mode(options.mode);
         diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        diagnostics.single_match_ms = diagnostics.total_ms;
         Ok(MatcherResult { image, diagnostics })
     }
 
@@ -541,7 +542,7 @@ impl Default for MatcherOptions {
             prefer_last: true,
             max_candidates: 8,
             scale_min: 0.67,
-            scale_max: 1.5,
+            scale_max: 2.0,
             scale_step: None,
             preferred_scale: None,
         }
@@ -625,7 +626,7 @@ impl MatcherOptions {
             }
             push_scale_candidate(&mut candidates, self.scale_max);
         } else {
-            for scale in [0.67, 0.80, 0.83, 1.0, 1.20, 1.25, 1.50] {
+            for scale in [0.67, 0.80, 0.83, 1.0, 1.20, 1.25, 1.50, 1.75, 2.0] {
                 if (self.scale_min..=self.scale_max).contains(&scale) {
                     push_scale_candidate(&mut candidates, scale);
                 }
@@ -683,6 +684,17 @@ pub struct VisionDiagnostics {
     pub scale_search_ms: u64,
     pub matched_width: u32,
     pub matched_height: u32,
+    pub robust_verify_used: bool,
+    pub robust_verify_ms: u64,
+    pub robust_score: Option<f32>,
+    pub valid_tile_count: usize,
+    pub discarded_tile_count: usize,
+    pub alpha_mask_used: bool,
+    pub anchor_recovery_used: bool,
+    pub anchor_candidate_count: usize,
+    pub preferred_scale_hit: bool,
+    pub single_match_ms: u64,
+    pub wait_total_ms: u64,
 }
 
 impl Default for VisionDiagnostics {
@@ -711,6 +723,17 @@ impl VisionDiagnostics {
             scale_search_ms: 0,
             matched_width: 0,
             matched_height: 0,
+            robust_verify_used: false,
+            robust_verify_ms: 0,
+            robust_score: None,
+            valid_tile_count: 0,
+            discarded_tile_count: 0,
+            alpha_mask_used: false,
+            anchor_recovery_used: false,
+            anchor_candidate_count: 0,
+            preferred_scale_hit: false,
+            single_match_ms: 0,
+            wait_total_ms: 0,
         }
     }
 
@@ -730,6 +753,21 @@ impl VisionDiagnostics {
             self.scale_candidates = other.scale_candidates.clone();
         }
         self.scale_search_ms = self.scale_search_ms.saturating_add(other.scale_search_ms);
+        self.robust_verify_used |= other.robust_verify_used;
+        self.robust_verify_ms = self.robust_verify_ms.saturating_add(other.robust_verify_ms);
+        self.valid_tile_count = self.valid_tile_count.max(other.valid_tile_count);
+        self.discarded_tile_count = self.discarded_tile_count.max(other.discarded_tile_count);
+        self.alpha_mask_used |= other.alpha_mask_used;
+        self.anchor_recovery_used |= other.anchor_recovery_used;
+        self.anchor_candidate_count = self
+            .anchor_candidate_count
+            .saturating_add(other.anchor_candidate_count);
+        self.preferred_scale_hit |= other.preferred_scale_hit;
+        self.single_match_ms = self.single_match_ms.max(other.single_match_ms);
+        self.wait_total_ms = self.wait_total_ms.max(other.wait_total_ms);
+        if other.robust_score.is_some() {
+            self.robust_score = other.robust_score;
+        }
         if other.matched_scale.is_some() {
             self.matched_scale = other.matched_scale;
             self.matched_width = other.matched_width;
@@ -793,6 +831,7 @@ pub trait VisionApi: Send + Sync {
         let image = self.find_image(file_name, region, threshold, cancel)?;
         let mut diagnostics = VisionDiagnostics::for_mode(options.mode);
         diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        diagnostics.single_match_ms = diagnostics.total_ms;
         Ok(VisionSearchResult { image, diagnostics })
     }
     fn wait_image(
@@ -815,6 +854,7 @@ pub trait VisionApi: Send + Sync {
         let image = self.wait_image(file_name, region, threshold, options)?;
         let mut diagnostics = VisionDiagnostics::for_mode(matcher_options.mode);
         diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        diagnostics.wait_total_ms = diagnostics.total_ms;
         Ok(VisionSearchResult { image, diagnostics })
     }
 }
@@ -917,7 +957,7 @@ mod tests {
         let options = MatcherOptions::default();
         assert_eq!(
             options.scale_candidates().expect("default scales"),
-            vec![0.67, 0.8, 0.83, 1.0, 1.2, 1.25, 1.5]
+            vec![0.67, 0.8, 0.83, 1.0, 1.2, 1.25, 1.5, 1.75, 2.0]
         );
         let mut stepped = MatcherOptions {
             scale_min: 0.8,

@@ -68,14 +68,21 @@ The optional image-search map uses `mode: "auto"`, `"exact"`, or `"fast"`,
 `scale_max` are finite values from `0.5` to `2.0`, with `scale_min <=
 scale_max`; an optional positive `scale_step` is also bounded by the maximum
 candidate count. When omitted, `auto` and `fast` search the common Windows
-DPI candidates `0.67, 0.80, 0.83, 1.00, 1.20, 1.25, 1.50` (within the selected
-range).
+DPI candidates `0.67, 0.80, 0.83, 1.00, 1.20, 1.25, 1.50, 1.75, 2.00`
+(within the selected range). The default range is `0.67`–`2.00`; candidate
+generation remains bounded.
 
-`auto` checks the previous position and successful scale, performs bounded
-multi-scale coarse matching, refines candidates with the corresponding
-original-resolution scaled template, and may use a controlled full-resolution
-fallback when the result is uncertain. `fast` performs the same multi-scale
-coarse pass and local refinement but never runs that full-area fallback.
+`auto` checks the previous position, successful scale and actual dimensions,
+performs bounded multi-scale coarse matching, and refines candidates with the
+corresponding original-resolution scaled template. Its final verification
+combines full-template NCC with a 3x3 robust spatial score: low-information
+tiles are ignored, at most the worst tile is discarded, and spatially
+separated passing tiles are required. If ordinary candidates are still
+uncertain, `auto` may run bounded anchor recovery using at most two stable
+tiles, a few scales and a hard candidate cap; every recovery candidate is then
+checked again with the full spatial/robust verifier. `fast` performs the same
+multi-scale coarse pass and local refinement but never runs anchor or
+full-area recovery.
 `exact` deliberately keeps the fixed 1.0 full-resolution NCC baseline and does
 not perform cross-scale matching. Invalid values return a stable Chinese
 validation error. The default calls keep their original signatures and default
@@ -85,10 +92,15 @@ Image result maps retain `found`, coordinates, dimensions and `score`, and add
 `total_ms`, `capture_ms`, `prepare_ms`, `coarse_ms`, `refine_ms`,
 `fallback_ms`, `candidate_count`, `previous_hit_used`, `fallback_used`, and
 `matcher_mode`, plus `matched_scale`, `scale_candidates`, `scale_search_ms`,
-`matched_width`, and `matched_height`. On a miss, `matched_scale` is the Rhai
-unit value `()` and the matched dimensions are `0`; on a hit, width and height
-are the actual scaled template dimensions. These fields are diagnostic only
-and do not change old scripts.
+`matched_width`, `matched_height`, `robust_verify_used`, `robust_verify_ms`,
+`robust_score`, `valid_tile_count`, `discarded_tile_count`, `alpha_mask_used`,
+`anchor_recovery_used`, `anchor_candidate_count`, `preferred_scale_hit`,
+`single_match_ms`, and `wait_total_ms`. On a miss, `matched_scale` and
+`robust_score` are the Rhai unit value `()` and the matched dimensions are `0`;
+a miss never fabricates a scale or robust score. On a hit, width and height
+are the actual scaled template dimensions. `wait_total_ms` measures the
+complete wait operation; `single_match_ms` measures one search attempt. These
+fields are diagnostic only and do not change old scripts.
 
 Wait values are non-negative integers, coordinates and wheel values are i32,
 buttons are `left`, `right`, `middle`, `x1` or `x2`, and text/key arguments are
@@ -112,8 +124,14 @@ complete file name, including the `.png`, `.jpg`, or `.jpeg` extension; omitting
 the extension is not supported. It cannot open arbitrary paths. PNG/JPEG bytes are validated,
 the canonical path is checked against the managed directory, templates are
 decoded lazily and cached as a prepared grayscale template plus bounded,
-on-demand scaled grayscale templates. Scaled entries are keyed by resource,
-file fingerprint, requested scale and actual scaled dimensions. Cache entries
+on-demand scaled grayscale templates. If a PNG contains any non-opaque alpha,
+alpha-zero pixels are ignored during final verification and partially
+transparent pixels are weighted by alpha; opaque RGB/RGBA images keep the
+existing behavior. The grayscale template and alpha channel are resized to
+the same actual dimensions. This is an optional interpretation of the PNG;
+no separate mask file is required and users do not need to author one.
+Scaled entries are keyed by resource, file fingerprint, requested scale and
+actual scaled dimensions. Cache entries
 invalidate when the resource file name, metadata or SHA-256 changes, and a
 catalog refresh or deletion clears the corresponding prepared/scaled cache;
 the cache is bounded to 64 base entries and 64 MiB, with at most 16 scaled

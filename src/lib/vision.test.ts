@@ -65,8 +65,11 @@ describe("vision automation frontend contracts", () => {
       (snippet) =>
         snippet.apiName === "find_image" && snippet.name.includes("options"),
     );
-    expect(findImage?.code).toContain("scale_min: 0.65");
-    expect(findImage?.code).toContain("scale_max: 1.60");
+    expect(findImage?.code).toContain("scale_min: 0.67");
+    expect(findImage?.code).toContain("scale_max: 2.00");
+    expect(findImage?.code).toContain("robust_score");
+    expect(findImage?.code).toContain("anchor_recovery_used");
+    expect(findImage?.code).toContain("single_match_ms");
     expect(findImage?.code).toContain("不是百分数");
   });
 

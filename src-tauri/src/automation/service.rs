@@ -311,6 +311,7 @@ impl VisionService {
                                     diagnostics.matched_scale.unwrap_or(1.0),
                                 );
                                 diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                                diagnostics.single_match_ms = diagnostics.total_ms;
                                 return Ok(VisionSearchResult {
                                     image: Some(image),
                                     diagnostics,
@@ -345,6 +346,7 @@ impl VisionService {
         if let Some(image) = result.image {
             self.remember_last_match(&key, &image, diagnostics.matched_scale.unwrap_or(1.0));
             diagnostics.total_ms = started.elapsed().as_millis() as u64;
+            diagnostics.single_match_ms = diagnostics.total_ms;
             return Ok(VisionSearchResult {
                 image: Some(image),
                 diagnostics,
@@ -355,6 +357,7 @@ impl VisionService {
         // treating an old coordinate and size as authoritative.
         self.forget_last_match(&key);
         diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        diagnostics.single_match_ms = diagnostics.total_ms;
         Ok(VisionSearchResult {
             image: None,
             diagnostics,
@@ -594,6 +597,7 @@ impl VisionApi for VisionService {
                     diagnostics.previous_hit_used |= attempt.diagnostics.previous_hit_used;
                     if let Some(found) = attempt.image {
                         diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                        diagnostics.wait_total_ms = diagnostics.total_ms;
                         return Ok(VisionSearchResult {
                             image: Some(found),
                             diagnostics,
@@ -605,6 +609,7 @@ impl VisionApi for VisionService {
                 {
                     if Instant::now() >= deadline {
                         diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                        diagnostics.wait_total_ms = diagnostics.total_ms;
                         return Ok(VisionSearchResult {
                             image: None,
                             diagnostics,
@@ -618,6 +623,7 @@ impl VisionApi for VisionService {
             }
             if Instant::now() >= deadline {
                 diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                diagnostics.wait_total_ms = diagnostics.total_ms;
                 return Ok(VisionSearchResult {
                     image: None,
                     diagnostics,
@@ -1256,6 +1262,22 @@ mod tests {
             )
             .expect("image wait")
             .is_some());
+        let diagnostic = service
+            .wait_image_diagnostic(
+                &asset.file_name,
+                ScreenRect::from_parts(0, 0, 2, 2),
+                0.99,
+                VisionPollOptions::new(
+                    Duration::ZERO,
+                    Duration::from_millis(50),
+                    &cancel,
+                    &VisionPollBudget::new(None),
+                ),
+                &MatcherOptions::default(),
+            )
+            .expect("diagnostic image wait");
+        assert!(diagnostic.image.is_some());
+        assert!(diagnostic.diagnostics.wait_total_ms >= diagnostic.diagnostics.single_match_ms);
 
         let mismatch = CaptureFrame::from_bgra(
             Point { x: 0, y: 0 },
@@ -1525,6 +1547,146 @@ mod tests {
             moved_result.diagnostics.scale_candidates.first(),
             Some(&1.5)
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn high_scale_repeats_use_previous_position_and_scale() {
+        let root = std::env::temp_dir().join(format!(
+            "autoflow-vision-high-scale-last-match-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let rgba = vision_template_pixels();
+        let template = CaptureFrame::from_bgra(
+            Point { x: 0, y: 0 },
+            24,
+            24,
+            rgba.iter()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                .collect(),
+        )
+        .expect("template frame");
+        let requested = ScreenRect::from_parts(0, 0, 512, 256);
+        let target = (350, 180);
+        let scale_175 = scaled_screen_frame(target, 1.75, &template, 512, 256);
+        let scale_200 = scaled_screen_frame(target, 2.0, &template, 512, 256);
+        let first_last = LastMatch {
+            x: target.0 as i32,
+            y: target.1 as i32,
+            width: 42,
+            height: 42,
+            scale: 1.75,
+            last_used: Instant::now(),
+        };
+        let first_roi = previous_match_region(requested, first_last).expect("1.75 ROI");
+        let repeat_175_roi = scale_175.crop(first_roi).expect("repeat 1.75 ROI");
+        let changed_roi = scale_200.crop(first_roi).expect("changed scale ROI");
+        let changed_last = LastMatch {
+            x: target.0 as i32,
+            y: target.1 as i32,
+            width: 48,
+            height: 48,
+            scale: 2.0,
+            last_used: Instant::now(),
+        };
+        let repeat_200_roi = scale_200
+            .crop(previous_match_region(requested, changed_last).expect("2.0 ROI"))
+            .expect("repeat 2.0 ROI");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with_sequence(
+            vec![scale_175, repeat_175_roi, changed_roi, repeat_200_roi],
+            Arc::clone(&calls),
+            root.clone(),
+        );
+        let asset = super::super::assets::import_asset_file(
+            &root,
+            &[],
+            "button",
+            "button.png",
+            &png_image(24, 24, &rgba),
+        )
+        .expect("asset import");
+        service.set_assets(std::slice::from_ref(&asset));
+        let cancel = AtomicBool::new(false);
+
+        let first = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("1.75 first");
+        assert_eq!(
+            first
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((42, 42))
+        );
+        assert!((first.diagnostics.matched_scale.expect("1.75") - 1.75).abs() < 0.01);
+
+        let repeat = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("1.75 repeat");
+        assert_eq!(
+            repeat
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((42, 42))
+        );
+        assert!(repeat.diagnostics.previous_hit_used);
+        assert!(repeat.diagnostics.preferred_scale_hit);
+
+        let changed = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("2.0 scale change");
+        assert_eq!(
+            changed
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((48, 48))
+        );
+        assert!((changed.diagnostics.matched_scale.expect("2.0") - 2.0).abs() < 0.01);
+        assert!(!changed.diagnostics.preferred_scale_hit);
+
+        let repeat_200 = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("2.0 repeat");
+        assert_eq!(
+            repeat_200
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((48, 48))
+        );
+        assert!(repeat_200.diagnostics.previous_hit_used);
+        assert!(repeat_200.diagnostics.preferred_scale_hit);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         let _ = fs::remove_dir_all(root);
     }

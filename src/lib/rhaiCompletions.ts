@@ -453,13 +453,15 @@ RHAI_API_OVERLOAD_REFERENCE_SNIPPETS.push(
   0.90,
   #{
     mode: "auto", // auto / exact / fast
-    scale_min: 0.65, // 最小倍率（不是百分数）
-    scale_max: 1.60, // 最大倍率（不是百分数）
+    scale_min: 0.67, // 最小倍率（不是百分数）
+    scale_max: 2.00, // 最大倍率（不是百分数）
     // scale_step: 0.10, // 可选；候选数量最多 16 个
     prefer_last: true,
     max_candidates: 8
   }
-);`,
+);
+// result diagnostics include robust_score, alpha_mask_used, anchor_recovery_used,
+// preferred_scale_hit, single_match_ms and wait_total_ms. A miss uses ().`,
   },
   {
     id: "api-wait_image-options",
@@ -479,12 +481,13 @@ RHAI_API_OVERLOAD_REFERENCE_SNIPPETS.push(
   200,
   #{
     mode: "auto", // auto / exact / fast
-    scale_min: 0.65, // 最小倍率（不是百分数）
-    scale_max: 1.60, // 最大倍率（不是百分数）
+    scale_min: 0.67, // 最小倍率（不是百分数）
+    scale_max: 2.00, // 最大倍率（不是百分数）
     prefer_last: true,
     max_candidates: 8
   }
-);`,
+);
+// wait_total_ms is the complete wait duration; single_match_ms is one attempt.`,
   },
 );
 

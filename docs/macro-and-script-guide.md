@@ -433,8 +433,8 @@ let result = find_image(
     "confirm_button.png", 0, 0, 1920, 1080, 0.90,
     #{
         mode: "auto",
-        scale_min: 0.65,
-        scale_max: 1.60,
+        scale_min: 0.67,
+        scale_max: 2.00,
         prefer_last: true,
         max_candidates: 8
     }
@@ -442,20 +442,30 @@ let result = find_image(
 ```
 
 未指定尺度时，`auto` 和 `fast` 默认覆盖常见 Windows DPI 倍率：
-`0.67`、`0.80`、`0.83`、`1.00`、`1.20`、`1.25`、`1.50`（并受自定义范围
-限制）。`auto` 使用上一命中位置和尺度、多尺度低分辨率粗匹配、跨位置/尺度
-候选筛选及对应缩放模板的原图局部复核；结果不确定时才执行受控的全区域 NCC
-fallback。`fast` 保留多尺度粗匹配和局部复核，但不执行全区域 fallback。
+`0.67`、`0.80`、`0.83`、`1.00`、`1.20`、`1.25`、`1.50`、`1.75`、`2.00`
+（并受自定义范围限制）。`auto` 使用上一命中位置、尺度和实际尺寸，多尺度低
+分辨率粗匹配、跨位置/尺度候选筛选及对应缩放模板的原图局部复核。最终复核
+还会计算 3×3 局部鲁棒分数：忽略低方差/低梯度块，最多丢弃最差一个块，并要求
+多个空间分离的有效块通过；必要时才执行有硬上限的 anchor recovery 和全区域
+fallback。`fast` 保留多尺度粗匹配和局部复核，但不执行 recovery 或全区域 fallback。
 `exact` 固定使用 1.0 倍全分辨率 NCC，明确不负责跨尺度匹配。
 
 返回 Map 在原有 `found`、坐标、尺寸和 `score` 外还包含
 `total_ms`、`capture_ms`、`prepare_ms`、`coarse_ms`、`refine_ms`、
 `fallback_ms`、`candidate_count`、`previous_hit_used`、`fallback_used`、
 `matcher_mode`、`matched_scale`、`scale_candidates`、`scale_search_ms`、
-`matched_width` 和 `matched_height`。命中时 `matched_width`/`matched_height`
-是实际缩放模板尺寸，未命中时 `matched_scale` 为 Rhai 空值 `()`，尺寸为
-`0`。旧脚本不读取这些字段时行为不变；图片仍必须使用 `data/images` 中的
-完整文件名，资源扩展名规则不变。
+`matched_width`、`matched_height`、`robust_verify_used`、`robust_verify_ms`、
+`robust_score`、`valid_tile_count`、`discarded_tile_count`、`alpha_mask_used`、
+`anchor_recovery_used`、`anchor_candidate_count`、`preferred_scale_hit`、
+`single_match_ms` 和 `wait_total_ms`。命中时 `matched_width`/`matched_height`
+是实际缩放模板尺寸，未命中时 `matched_scale` 和 `robust_score` 为 Rhai
+空值 `()`，尺寸为 `0`，不会伪造诊断值。旧脚本不读取这些字段时行为不变；
+图片仍必须使用 `data/images` 中的完整文件名，资源扩展名规则不变。
+
+PNG 的 alpha 通道是可选遮罩：alpha 为 0 的像素不参与最终复核，半透明像素按
+alpha 加权；普通不透明 RGB/RGBA 图像保持原有行为。缩放时灰度图和 alpha 使用
+相同实际尺寸，不需要另建 mask 文件。需要忽略 Windows 快捷方式角标时，可让该
+区域成为透明区域；本轮不要求用户制作遮罩编辑器。
 
 避免没有等待的无限循环。即使引擎有操作数限制，这类循环仍会快速消耗执行预算，也会让目标程序接收过多输入。
 

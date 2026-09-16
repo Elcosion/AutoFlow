@@ -72,6 +72,14 @@ pub fn run_vision_benchmark() -> String {
         scale_target(1.50),
         &template,
     );
+    let scale_175 = scaled_case(
+        "scale-1.75-hit",
+        1.75,
+        0xA11CE,
+        scale_target(1.75),
+        &template,
+    );
+    let scale_200 = scaled_case("scale-2.00-hit", 2.0, 0xA11CE, scale_target(2.0), &template);
     let moved = scaled_case("scale-moved-hit", 1.25, 0xBEEF, MOVED_TO, &template);
     let changed = scaled_case(
         "scale-changed-hit",
@@ -86,6 +94,23 @@ pub fn run_vision_benchmark() -> String {
         expected: None,
         expected_scale: None,
     };
+    let changed_bottom_left = changed_bottom_left_case(
+        "changed-bottom-left-hit",
+        1.75,
+        0xBADC0DE,
+        scale_target(1.75),
+        &template,
+    );
+    let changed_bottom_left_moved = changed_bottom_left_case(
+        "changed-bottom-left-moved-hit",
+        2.0,
+        0xBADC0DE,
+        MOVED_TO,
+        &template,
+    );
+    let similar_distractor = similar_distractor_case(&template);
+    let robust_miss = robust_miss_case(&template);
+    let anchor_recovery = anchor_recovery_case(&template);
 
     let mut report = String::new();
     report.push_str("vision_benchmark=synthetic\n");
@@ -102,7 +127,14 @@ pub fn run_vision_benchmark() -> String {
         &scale_100,
         &scale_125,
         &scale_150,
+        &scale_175,
+        &scale_200,
         &multiscale_miss,
+        &changed_bottom_left,
+        &changed_bottom_left_moved,
+        &similar_distractor,
+        &robust_miss,
+        &anchor_recovery,
     ] {
         append_case(
             &mut report,
@@ -135,6 +167,8 @@ pub fn run_vision_benchmark() -> String {
     original_repeat_result.diagnostics.previous_hit_used = true;
     original_repeat_result.diagnostics.total_ms =
         original_repeat_started.elapsed().as_millis() as u64;
+    original_repeat_result.diagnostics.single_match_ms =
+        original_repeat_result.diagnostics.total_ms;
     let original_repeat = BenchCase {
         name: "repeat-hit",
         frame: hit.frame.clone(),
@@ -180,6 +214,7 @@ pub fn run_vision_benchmark() -> String {
         .expect("repeat optimized match");
     repeat_result.diagnostics.previous_hit_used = true;
     repeat_result.diagnostics.total_ms = repeat_started.elapsed().as_millis() as u64;
+    repeat_result.diagnostics.single_match_ms = repeat_result.diagnostics.total_ms;
     append_result(
         &mut report,
         &matcher,
@@ -214,6 +249,7 @@ pub fn run_vision_benchmark() -> String {
     moved_result.diagnostics.add_attempt(&previous.diagnostics);
     moved_result.diagnostics.previous_hit_used = true;
     moved_result.diagnostics.total_ms = moved_started.elapsed().as_millis() as u64;
+    moved_result.diagnostics.single_match_ms = moved_result.diagnostics.total_ms;
     append_result(
         &mut report,
         &matcher,
@@ -242,6 +278,7 @@ pub fn run_vision_benchmark() -> String {
         .expect("changed previous match");
     changed_result.diagnostics.previous_hit_used = true;
     changed_result.diagnostics.total_ms = changed_started.elapsed().as_millis() as u64;
+    changed_result.diagnostics.single_match_ms = changed_result.diagnostics.total_ms;
     append_result(
         &mut report,
         &matcher,
@@ -250,6 +287,33 @@ pub fn run_vision_benchmark() -> String {
         &changed,
         changed_result,
         0,
+    );
+
+    append_repeat_case(&mut report, &matcher, &prepared, &options, &scale_175, 1.75);
+    append_repeat_case(&mut report, &matcher, &prepared, &options, &scale_200, 2.0);
+
+    let alpha_template = alpha_masked_template(&template);
+    let alpha_prepared = PreparedTemplate::from_frame(
+        "benchmark-alpha-template",
+        "benchmark-alpha.png",
+        "synthetic-alpha-fixed-seed",
+        Arc::new(alpha_template.clone()),
+    )
+    .expect("alpha template preparation");
+    let alpha_case = BenchCase {
+        name: "alpha-masked-hit",
+        frame: alpha_masked_frame(0xA11CE, scale_target(1.0), &alpha_template),
+        expected: Some(scale_target(1.0)),
+        expected_scale: Some(1.0),
+    };
+    append_case(
+        &mut report,
+        &matcher,
+        &alpha_prepared,
+        &options,
+        &alpha_case,
+        prepare_ms,
+        false,
     );
 
     report
@@ -278,7 +342,55 @@ fn append_case(
     result.diagnostics.prepare_ms = prepare_ms;
     result.diagnostics.previous_hit_used = previous_hit_used;
     result.diagnostics.total_ms = started.elapsed().as_millis() as u64;
+    result.diagnostics.single_match_ms = result.diagnostics.total_ms;
     append_result(report, matcher, prepared, options, case, result, prepare_ms);
+}
+
+fn append_repeat_case(
+    report: &mut String,
+    matcher: &ImageProcVisionMatcher,
+    prepared: &PreparedTemplate,
+    options: &MatcherOptions,
+    case: &BenchCase,
+    scale: f32,
+) {
+    let target = case.expected.expect("repeat target");
+    let repeat_region = previous_region(target, scaled_dimensions(scale));
+    let repeat_frame = case.frame.crop(repeat_region).expect("repeat ROI");
+    let mut repeat_options = options.clone();
+    repeat_options.preferred_scale = Some(scale);
+    let started = Instant::now();
+    let mut result = matcher
+        .find_prepared_template(
+            &repeat_frame,
+            prepared.frame(),
+            Some(prepared),
+            THRESHOLD,
+            &repeat_options,
+        )
+        .expect("repeat optimized match");
+    result.diagnostics.previous_hit_used = true;
+    result.diagnostics.total_ms = started.elapsed().as_millis() as u64;
+    result.diagnostics.single_match_ms = result.diagnostics.total_ms;
+    let repeat_case = BenchCase {
+        name: if (scale - 1.75).abs() < 0.001 {
+            "scale-1.75-repeat"
+        } else {
+            "scale-2.00-repeat"
+        },
+        frame: case.frame.clone(),
+        expected: case.expected,
+        expected_scale: case.expected_scale,
+    };
+    append_result(
+        report,
+        matcher,
+        prepared,
+        &repeat_options,
+        &repeat_case,
+        result,
+        0,
+    );
 }
 
 fn append_result(
@@ -329,7 +441,7 @@ fn append_result(
         .map(|image| format!("{:.6}", image.score))
         .unwrap_or_else(|| "none".to_string());
     report.push_str(&format!(
-        "case={} expected_xy={} optimized_xy={},{} expected_scale={} matched_scale={} baseline_match_ms={} baseline_xy={},{} total_match_ms={} scale_search_ms={} capture_ms={} prepare_ms={} coarse_match_ms={} refine_match_ms={} fallback_match_ms={} candidate_count={} scale_candidates={} previous_hit_used={} fallback_used={} matcher_mode={} options_max_candidates={} matched_width={} matched_height={} score={}\n",
+        "case={} expected_xy={} optimized_xy={},{} expected_scale={} matched_scale={} baseline_match_ms={} baseline_xy={},{} total_match_ms={} single_match_ms={} scale_search_ms={} capture_ms={} prepare_ms={} coarse_match_ms={} refine_match_ms={} robust_verify_ms={} fallback_match_ms={} coarse_score={:.6} refined_score={:.6} robust_score={} valid_tile_count={} discarded_tile_count={} alpha_mask_used={} anchor_recovery_used={} anchor_candidate_count={} preferred_scale_hit={} candidate_count={} scale_candidates={} previous_hit_used={} fallback_used={} matcher_mode={} options_max_candidates={} matched_width={} matched_height={} wait_total_ms={} score={}\n",
         case.name,
         expected,
         optimized_x,
@@ -340,12 +452,26 @@ fn append_result(
         baseline_x,
         baseline_y,
         diagnostics.total_ms,
+        diagnostics.single_match_ms,
         diagnostics.scale_search_ms,
         diagnostics.capture_ms,
         diagnostics.prepare_ms,
         diagnostics.coarse_ms,
         diagnostics.refine_ms,
+        diagnostics.robust_verify_ms,
         diagnostics.fallback_ms,
+        diagnostics.coarse_score,
+        diagnostics.refined_score,
+        diagnostics
+            .robust_score
+            .map(|score| format!("{score:.6}"))
+            .unwrap_or_else(|| "none".to_string()),
+        diagnostics.valid_tile_count,
+        diagnostics.discarded_tile_count,
+        diagnostics.alpha_mask_used,
+        diagnostics.anchor_recovery_used,
+        diagnostics.anchor_candidate_count,
+        diagnostics.preferred_scale_hit,
         diagnostics.candidate_count,
         scale_candidates,
         diagnostics.previous_hit_used,
@@ -354,6 +480,7 @@ fn append_result(
         options.max_candidates,
         diagnostics.matched_width,
         diagnostics.matched_height,
+        diagnostics.wait_total_ms,
         score,
     ));
 }
@@ -383,6 +510,145 @@ fn scaled_case(
         expected: Some(target),
         expected_scale: Some(scale),
     }
+}
+
+fn changed_bottom_left_case(
+    name: &'static str,
+    scale: f32,
+    seed: u32,
+    target: (u32, u32),
+    template: &CaptureFrame,
+) -> BenchCase {
+    let base = scaled_synthetic_frame(seed, target, scale, template);
+    let (width, height) = scaled_dimensions(scale);
+    let changed_left = width.saturating_mul(2) / 3;
+    let changed_top = height.saturating_mul(2) / 3;
+    let mut pixels = base.pixels_bgra().to_vec();
+    for y in changed_top..height {
+        for x in 0..changed_left {
+            let value = x
+                .wrapping_mul(31)
+                .wrapping_add(y.wrapping_mul(43))
+                .wrapping_add(173) as u8;
+            let index = (((target.1 + y) * WIDTH + target.0 + x) * 4) as usize;
+            pixels[index..index + 4].copy_from_slice(&[
+                value,
+                value.wrapping_add(71),
+                value.wrapping_mul(5).wrapping_add(13),
+                255,
+            ]);
+        }
+    }
+    BenchCase {
+        name,
+        frame: CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels)
+            .expect("changed bottom-left frame"),
+        expected: Some(target),
+        expected_scale: Some(scale),
+    }
+}
+
+fn similar_distractor_case(template: &CaptureFrame) -> BenchCase {
+    let target = (1_420, 720);
+    let distractor = (180, 180);
+    let mut frame = scaled_synthetic_frame(0x1234, target, 1.0, template);
+    let mut pixels = frame.pixels_bgra().to_vec();
+    for y in 0..TEMPLATE_HEIGHT {
+        for x in 0..TEMPLATE_WIDTH {
+            let source_index = ((y * TEMPLATE_WIDTH + x) * 4) as usize;
+            let target_index = (((distractor.1 + y) * WIDTH + distractor.0 + x) * 4) as usize;
+            pixels[target_index..target_index + 4]
+                .copy_from_slice(&template.pixels_bgra()[source_index..source_index + 4]);
+        }
+    }
+    let changed_index = (((distractor.1 + 5) * WIDTH + distractor.0 + 5) * 4) as usize;
+    pixels[changed_index] = pixels[changed_index].wrapping_add(80);
+    frame = CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels)
+        .expect("similar distractor frame");
+    BenchCase {
+        name: "similar-distractor",
+        frame,
+        expected: Some(target),
+        expected_scale: Some(1.0),
+    }
+}
+
+fn robust_miss_case(template: &CaptureFrame) -> BenchCase {
+    let target = (1_100, 620);
+    let mut frame = synthetic_frame(0x55AA, None, template);
+    let mut pixels = frame.pixels_bgra().to_vec();
+    for y in 0..TEMPLATE_HEIGHT / 3 {
+        for x in 0..TEMPLATE_WIDTH / 3 {
+            let source_index = ((y * TEMPLATE_WIDTH + x) * 4) as usize;
+            let target_index = (((target.1 + y) * WIDTH + target.0 + x) * 4) as usize;
+            pixels[target_index..target_index + 4]
+                .copy_from_slice(&template.pixels_bgra()[source_index..source_index + 4]);
+        }
+    }
+    frame = CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels)
+        .expect("robust miss frame");
+    BenchCase {
+        name: "robust-miss",
+        frame,
+        expected: None,
+        expected_scale: None,
+    }
+}
+
+fn anchor_recovery_case(template: &CaptureFrame) -> BenchCase {
+    let scale = 1.75;
+    let target = scale_target(scale);
+    let base = scaled_synthetic_frame(0xA55A, target, scale, template);
+    let (width, height) = scaled_dimensions(scale);
+    let mut pixels = base.pixels_bgra().to_vec();
+    for y in height.saturating_mul(2) / 3..height {
+        for x in 0..width / 3 {
+            let index = (((target.1 + y) * WIDTH + target.0 + x) * 4) as usize;
+            pixels[index..index + 4].copy_from_slice(&[0, 0, 0, 255]);
+        }
+    }
+    BenchCase {
+        name: "anchor-recovery-hit",
+        frame: CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels)
+            .expect("anchor recovery frame"),
+        expected: Some(target),
+        expected_scale: Some(scale),
+    }
+}
+
+fn alpha_masked_template(template: &CaptureFrame) -> CaptureFrame {
+    let mut pixels = template.pixels_bgra().to_vec();
+    for y in TEMPLATE_HEIGHT * 2 / 3..TEMPLATE_HEIGHT {
+        for x in 0..TEMPLATE_WIDTH / 2 {
+            let index = ((y * TEMPLATE_WIDTH + x) * 4 + 3) as usize;
+            pixels[index] = 0;
+        }
+    }
+    CaptureFrame::from_bgra(
+        Point { x: 0, y: 0 },
+        TEMPLATE_WIDTH,
+        TEMPLATE_HEIGHT,
+        pixels,
+    )
+    .expect("alpha masked template")
+}
+
+fn alpha_masked_frame(seed: u32, target: (u32, u32), template: &CaptureFrame) -> CaptureFrame {
+    let base = synthetic_frame(seed, None, template);
+    let mut pixels = base.pixels_bgra().to_vec();
+    for y in 0..template.height {
+        for x in 0..template.width {
+            let source_index = ((y * template.width + x) * 4) as usize;
+            if template.pixels_bgra()[source_index + 3] == 0 {
+                continue;
+            }
+            let target_index = (((target.1 + y) * WIDTH + target.0 + x) * 4) as usize;
+            pixels[target_index..target_index + 4]
+                .copy_from_slice(&template.pixels_bgra()[source_index..source_index + 4]);
+        }
+    }
+    CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels)
+        .expect("alpha masked frame")
 }
 
 fn previous_region(

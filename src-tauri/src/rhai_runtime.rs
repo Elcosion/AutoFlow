@@ -779,6 +779,54 @@ fn image_search_map(value: VisionSearchResult) -> Map {
         "matched_height".into(),
         Dynamic::from(i64::from(value.diagnostics.matched_height)),
     );
+    map.insert(
+        "robust_verify_used".into(),
+        Dynamic::from(value.diagnostics.robust_verify_used),
+    );
+    map.insert(
+        "robust_verify_ms".into(),
+        Dynamic::from(value.diagnostics.robust_verify_ms as i64),
+    );
+    map.insert(
+        "robust_score".into(),
+        value
+            .diagnostics
+            .robust_score
+            .map(|score| Dynamic::from(f64::from(score)))
+            .unwrap_or_else(|| Dynamic::from(())),
+    );
+    map.insert(
+        "valid_tile_count".into(),
+        Dynamic::from(value.diagnostics.valid_tile_count as i64),
+    );
+    map.insert(
+        "discarded_tile_count".into(),
+        Dynamic::from(value.diagnostics.discarded_tile_count as i64),
+    );
+    map.insert(
+        "alpha_mask_used".into(),
+        Dynamic::from(value.diagnostics.alpha_mask_used),
+    );
+    map.insert(
+        "anchor_recovery_used".into(),
+        Dynamic::from(value.diagnostics.anchor_recovery_used),
+    );
+    map.insert(
+        "anchor_candidate_count".into(),
+        Dynamic::from(value.diagnostics.anchor_candidate_count as i64),
+    );
+    map.insert(
+        "preferred_scale_hit".into(),
+        Dynamic::from(value.diagnostics.preferred_scale_hit),
+    );
+    map.insert(
+        "single_match_ms".into(),
+        Dynamic::from(value.diagnostics.single_match_ms as i64),
+    );
+    map.insert(
+        "wait_total_ms".into(),
+        Dynamic::from(value.diagnostics.wait_total_ms as i64),
+    );
     map
 }
 
@@ -1785,16 +1833,38 @@ mod tests {
             "scale_search_ms",
             "matched_width",
             "matched_height",
+            "robust_verify_used",
+            "robust_verify_ms",
+            "robust_score",
+            "valid_tile_count",
+            "discarded_tile_count",
+            "alpha_mask_used",
+            "anchor_recovery_used",
+            "anchor_candidate_count",
+            "preferred_scale_hit",
+            "single_match_ms",
+            "wait_total_ms",
         ] {
             assert!(map.contains_key(key), "missing diagnostic key: {key}");
         }
         assert!(map["matched_scale"].is_unit());
+        assert!(map["robust_score"].is_unit());
 
         let mut hit_diagnostics = crate::automation::VisionDiagnostics::for_mode(MatcherMode::Auto);
         hit_diagnostics.matched_scale = Some(1.25);
         hit_diagnostics.scale_candidates = vec![0.8, 1.25];
         hit_diagnostics.matched_width = 56;
         hit_diagnostics.matched_height = 51;
+        hit_diagnostics.robust_verify_used = true;
+        hit_diagnostics.robust_score = Some(0.98);
+        hit_diagnostics.valid_tile_count = 8;
+        hit_diagnostics.discarded_tile_count = 1;
+        hit_diagnostics.alpha_mask_used = true;
+        hit_diagnostics.anchor_recovery_used = true;
+        hit_diagnostics.anchor_candidate_count = 4;
+        hit_diagnostics.preferred_scale_hit = true;
+        hit_diagnostics.single_match_ms = 12;
+        hit_diagnostics.wait_total_ms = 64;
         let hit_map = image_search_map(VisionSearchResult {
             image: Some(crate::automation::ImageMatch {
                 x: 10,
@@ -1816,5 +1886,19 @@ mod tests {
             hit_map["matched_height"].clone().try_cast::<i64>(),
             Some(51)
         );
+        assert!(
+            (hit_map["robust_score"]
+                .clone()
+                .try_cast::<f64>()
+                .expect("robust score")
+                - 0.98)
+                .abs()
+                < 0.001
+        );
+        assert_eq!(
+            hit_map["valid_tile_count"].clone().try_cast::<i64>(),
+            Some(8)
+        );
+        assert_eq!(hit_map["wait_total_ms"].clone().try_cast::<i64>(), Some(64));
     }
 }

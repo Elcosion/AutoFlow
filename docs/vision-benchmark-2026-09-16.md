@@ -1,32 +1,68 @@
-# 多尺度视觉匹配 benchmark（2026-09-16）
+# High-DPI vision benchmark (2026-09-16)
 
-命令：
+Command:
 
 ```powershell
-$env:CARGO_TARGET_DIR = "src-tauri/target-scale-next"
+$env:CARGO_TARGET_DIR = "src-tauri/target-next"
 cargo run --release --manifest-path src-tauri/Cargo.toml --bin vision_bench
 ```
 
-这是纯内存、固定种子的 1920×1080 测试；`baseline_match_ms` 是保留的
-原始 1.0 倍串行 NCC，缩放命中时它预期可能找不到，因为 baseline 不做缩放。
-benchmark 不包含易受机器负载影响的硬毫秒断言。
+This is the deterministic in-memory `1920x1080` benchmark with a `45x41`
+template and threshold `0.92`. `single_match_ms` is one search attempt;
+`wait_total_ms` is reserved for the complete `wait_image` operation. Timings
+are diagnostic observations, not millisecond test assertions.
 
-| case                    | expected_xy | optimized_xy | expected_scale | matched_scale | total_ms | scale_search_ms | coarse_ms | refine_ms | fallback_ms | candidates | previous | fallback | matched size |
-| ----------------------- | ----------: | -----------: | -------------: | ------------: | -------: | --------------: | --------: | --------: | ----------: | ---------: | :------: | :------: | -----------: |
-| hit                     |   1875,1039 |    1875,1039 |           1.00 |        1.0000 |      169 |             169 |       160 |         6 |           0 |          8 |  false   |  false   |        45×41 |
-| miss                    |        none |        -1,-1 |           none |          none |      162 |             162 |       152 |         7 |           0 |          8 |  false   |  false   |          0×0 |
-| scale-0.80-hit          |   1883,1046 |    1883,1046 |           0.80 |        0.8000 |      162 |             162 |       153 |         6 |           0 |          8 |  false   |  false   |        36×33 |
-| scale-1.00-hit          |   1874,1038 |    1874,1038 |           1.00 |        1.0000 |      162 |             162 |       153 |         7 |           0 |          8 |  false   |  false   |        45×41 |
-| scale-1.25-hit          |   1863,1028 |    1863,1028 |           1.25 |        1.2500 |      163 |             163 |       154 |         6 |           0 |          8 |  false   |  false   |        56×51 |
-| scale-1.50-hit          |   1851,1017 |    1851,1017 |           1.50 |        1.5000 |      164 |             164 |       156 |         6 |           0 |          8 |  false   |  false   |        68×62 |
-| multiscale-miss         |        none |        -1,-1 |           none |          none |      166 |             166 |       155 |         8 |           0 |          8 |  false   |  false   |          0×0 |
-| repeat-hit              |   1875,1039 |    1875,1039 |           1.00 |        1.0000 |        8 |               8 |         3 |         4 |           0 |          8 |   true   |  false   |        45×41 |
-| moved-hit               |     812,437 |      812,437 |           1.00 |        1.0000 |      165 |             165 |       155 |         7 |           0 |          8 |  false   |  false   |        45×41 |
-| scale-1.25-hit (repeat) |   1863,1028 |    1863,1028 |           1.25 |        1.2500 |       11 |              11 |         6 |         5 |           0 |          8 |   true   |  false   |        56×51 |
-| scale-moved-hit         |     812,437 |      812,437 |           1.25 |        1.2500 |      182 |             181 |       163 |        15 |           0 |          8 |   true   |  false   |        56×51 |
-| scale-changed-hit       |   1851,1017 |    1851,1017 |           1.50 |        1.5000 |       10 |              10 |         5 |         4 |           0 |          8 |   true   |  false   |        68×62 |
+| case                          | expected → optimized  | expected → matched scale | total / single ms | robust score | alpha | anchor / preferred | matched size |
+| ----------------------------- | --------------------- | ------------------------ | ----------------: | -----------: | :---: | :----------------: | -----------: |
+| hit                           | 1875,1039 → 1875,1039 | 1.00 → 1.0000            |         224 / 224 |     1.000000 |  no   |      no / no       |        45x41 |
+| miss                          | none → -1,-1          | none → none              |         410 / 410 |         none |  no   |      yes / no      |          0x0 |
+| scale-0.80-hit                | 1883,1046 → 1883,1046 | 0.80 → 0.8000            |         221 / 221 |     1.000000 |  no   |      no / no       |        36x33 |
+| scale-1.00-hit                | 1874,1038 → 1874,1038 | 1.00 → 1.0000            |         224 / 224 |     1.000000 |  no   |      no / no       |        45x41 |
+| scale-1.25-hit                | 1863,1028 → 1863,1028 | 1.25 → 1.2500            |         227 / 227 |     1.000000 |  no   |      no / no       |        56x51 |
+| scale-1.50-hit                | 1851,1017 → 1851,1017 | 1.50 → 1.5000            |         228 / 228 |     1.000000 |  no   |      no / no       |        68x62 |
+| scale-1.75-hit                | 1840,1007 → 1840,1007 | 1.75 → 1.7500            |         235 / 235 |     1.000000 |  no   |      no / no       |        79x72 |
+| scale-2.00-hit                | 1829,997 → 1829,997   | 2.00 → 2.0000            |         226 / 226 |     1.000000 |  no   |      no / no       |        90x82 |
+| multiscale-miss               | none → -1,-1          | none → none              |         392 / 392 |         none |  no   |      yes / no      |          0x0 |
+| changed-bottom-left-hit       | 1840,1007 → 1840,1007 | 1.75 → 1.7500            |         216 / 216 |     1.000000 |  no   |      no / no       |        79x72 |
+| changed-bottom-left-moved-hit | 812,437 → 812,437     | 2.00 → 2.0000            |         220 / 220 |     1.000000 |  no   |      no / no       |        90x82 |
+| similar-distractor            | 1420,720 → 1420,720   | 1.00 → 1.0000            |         218 / 218 |     1.000000 |  no   |      no / no       |        45x41 |
+| robust-miss                   | none → -1,-1          | none → none              |         408 / 408 |         none |  no   |      yes / no      |          0x0 |
+| anchor-recovery-hit           | 1840,1007 → 1840,1007 | 1.75 → 1.7500            |         418 / 418 |     1.000000 |  no   |      yes / no      |        79x72 |
+| repeat-hit                    | 1875,1039 → 1875,1039 | 1.00 → 1.0000            |             6 / 6 |     1.000000 |  no   |      no / no       |        45x41 |
+| moved-hit                     | 812,437 → 812,437     | 1.00 → 1.0000            |         233 / 233 |     1.000000 |  no   |      no / no       |        45x41 |
+| scale-1.25-hit (repeat)       | 1863,1028 → 1863,1028 | 1.25 → 1.2500            |             9 / 9 |     1.000000 |  no   |      no / no       |        56x51 |
+| scale-moved-hit               | 812,437 → 812,437     | 1.25 → 1.2500            |         256 / 256 |     1.000000 |  no   |      yes / no      |        56x51 |
+| scale-changed-hit             | 1851,1017 → 1851,1017 | 1.50 → 1.5000            |             7 / 7 |     1.000000 |  no   |      no / no       |        68x62 |
+| scale-1.75-repeat             | 1840,1007 → 1840,1007 | 1.75 → 1.7500            |             7 / 7 |     1.000000 |  no   |      no / yes      |        79x72 |
+| scale-2.00-repeat             | 1829,997 → 1829,997   | 2.00 → 2.0000            |             8 / 8 |     1.000000 |  no   |      no / yes      |        90x82 |
+| alpha-masked-hit              | 1874,1038 → 1874,1038 | 1.00 → 1.0000            |         242 / 242 |     1.000000 |  yes  |      no / no       |        45x41 |
 
-本次 run 的完整诊断还报告默认候选为
-`0.67,0.80,0.83,1.00,1.20,1.25,1.50`。首次多尺度命中均低于 200ms，
-未命中为 162ms，同位置同尺度重复命中为 8ms；所有命中坐标、尺度和实际
-模板尺寸与预期一致，未命中没有生成匹配尺度或尺寸。
+The final benchmark reports the default candidate list as:
+`0.67,0.80,0.83,1.00,1.20,1.25,1.50,1.75,2.00`.
+The observed first-hit 1.75/2.00 cases stayed below 500 ms, while known-scale
+repeats stayed below 10 ms. Misses intentionally leave `matched_scale` and
+`robust_score` unset; the complete command output also includes
+`scale_search_ms`, `capture_ms`, `prepare_ms`, `coarse_match_ms`,
+`refine_match_ms`, `robust_verify_ms`, `fallback_match_ms`, tile counts,
+`anchor_candidate_count`, `candidate_count`, and `wait_total_ms`.
+
+## Interpretation
+
+The robust score is computed from the full-template NCC plus valid 3x3 tile
+scores. Low-information tiles are excluded, at most one worst tile is
+discarded, and at least three passing tiles must span multiple rows and
+columns. Anchor recovery is Auto-only, uses at most two spatially separated
+high-information tiles, four scale hypotheses, at most four positions per
+tile, and at most sixteen generated anchor candidates (the final refine still
+honors `max_candidates`). Every recovered position is converted to the full
+template top-left and rechecked by the full/robust verifier.
+
+PNG alpha is an optional source-image mask: alpha-zero pixels are omitted from
+final NCC/tile verification and partial alpha is used as a weight. The alpha
+image is resized with the grayscale image and is included in the prepared
+template cache accounting; no separate mask resource is introduced.
+
+These results cover the automated synthetic and service tests. Real Windows
+DPI behavior is still pending manual verification at 100%, 125%, 150%, 175%,
+and 200%, including the real `12.png` shortcut-badge case, movement, missing
+image, and F12 stop/restart flows.
