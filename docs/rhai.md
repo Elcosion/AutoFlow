@@ -77,7 +77,10 @@ performs bounded multi-scale coarse matching, and refines candidates with the
 corresponding original-resolution scaled template. Its final verification
 combines full-template NCC with a 3x3 robust spatial score: low-information
 tiles are ignored, at most the worst tile is discarded, and spatially
-separated passing tiles are required. If ordinary candidates are still
+separated passing tiles are required. The combined score is
+`0.15 * full + 0.70 * robust + 0.15 * (passed_tiles / valid_tiles)`; the
+robust gate also requires at least three passing tiles spanning at least two
+rows and columns. If ordinary candidates are still
 uncertain, `auto` may run bounded anchor recovery using at most two stable
 tiles, a few scales and a hard candidate cap; every recovery candidate is then
 checked again with the full spatial/robust verifier. `fast` performs the same

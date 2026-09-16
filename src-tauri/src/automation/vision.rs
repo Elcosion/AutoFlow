@@ -26,7 +26,8 @@ const ROBUST_MAX_DISCARDED_TILES: usize = 1;
 const ROBUST_TILE_VARIANCE_FLOOR: f64 = 1.0;
 const ROBUST_TILE_GRADIENT_FLOOR: f64 = 6.0;
 const ROBUST_TILE_GATE_MARGIN: f32 = 0.18;
-const ROBUST_COMBINED_WEIGHT: f32 = 0.85;
+const ROBUST_COMBINED_WEIGHT: f32 = 0.70;
+const ROBUST_PASS_COUNT_WEIGHT: f32 = 0.15;
 const ROBUST_MAX_LOCAL_POSITIONS: usize = 6;
 const MAX_ANCHOR_SCALES: usize = 4;
 const MAX_ANCHOR_TILES: usize = 2;
@@ -1118,6 +1119,7 @@ struct RefinedCandidate {
 #[derive(Debug, Clone, Copy)]
 struct RobustVerification {
     score: f32,
+    pass_ratio: f32,
     valid_tile_count: usize,
     discarded_tile_count: usize,
     accepted: bool,
@@ -1728,8 +1730,9 @@ fn evaluate_candidate_at(
         });
     }
     let robust = robust_verify_at(image, template, x, y, threshold);
-    let combined_score = (full_score * (1.0 - ROBUST_COMBINED_WEIGHT)
-        + robust.score * ROBUST_COMBINED_WEIGHT)
+    let combined_score = (full_score * (1.0 - ROBUST_COMBINED_WEIGHT - ROBUST_PASS_COUNT_WEIGHT)
+        + robust.score * ROBUST_COMBINED_WEIGHT
+        + robust.pass_ratio * ROBUST_PASS_COUNT_WEIGHT)
         .clamp(-1.0, 1.0);
     Some(CandidateEvaluation {
         full_score,
@@ -1791,10 +1794,16 @@ fn robust_verify_at(
         .collect::<std::collections::HashSet<_>>()
         .len();
     let passed_tile_count = passed_positions.len();
+    let pass_ratio = if valid_tile_count == 0 {
+        0.0
+    } else {
+        passed_tile_count as f32 / valid_tile_count as f32
+    };
     let spatially_separated =
         passed_tile_count >= ROBUST_MIN_PASS_TILES && unique_rows >= 2 && unique_columns >= 2;
     RobustVerification {
         score: score.clamp(-1.0, 1.0),
+        pass_ratio,
         valid_tile_count,
         discarded_tile_count,
         accepted: passed_tile_count >= ROBUST_MIN_PASS_TILES
@@ -2513,6 +2522,43 @@ mod tests {
         assert!(result.image.is_none());
         assert!(result.diagnostics.robust_score.is_none());
         assert!(result.diagnostics.robust_verify_used);
+    }
+
+    #[test]
+    fn robust_verification_rejects_two_spatially_insufficient_tiles() {
+        let (template, template_pixels, size) = test_template();
+        let target = (54_u32, 32_u32);
+        let mut image = patterned_frame(
+            Point { x: 0, y: 0 },
+            160,
+            120,
+            &size,
+            &template_pixels,
+            None,
+            0xBEEF,
+        );
+        let mut pixels = image.pixels_bgra().to_vec();
+        for (tile_x, tile_y) in [(0_u32, 0_u32), (16_u32, 16_u32)] {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let source_index =
+                        (((tile_y + y) * u32::from(size[0]) + tile_x + x) * 4) as usize;
+                    let target_index =
+                        (((target.1 + tile_y + y) * image.width + target.0 + tile_x + x) * 4)
+                            as usize;
+                    pixels[target_index..target_index + 4]
+                        .copy_from_slice(&template_pixels[source_index / 4]);
+                }
+            }
+        }
+        image = CaptureFrame::from_bgra(Point { x: 0, y: 0 }, 160, 120, pixels)
+            .expect("two tile frame");
+        let result = ImageProcVisionMatcher::new()
+            .find_template_with_options(&image, &template, 0.92, &MatcherOptions::default())
+            .expect("two tile search");
+        assert!(result.image.is_none());
+        assert!(result.diagnostics.robust_verify_used);
+        assert!(result.diagnostics.robust_score.is_none());
     }
 
     #[test]
