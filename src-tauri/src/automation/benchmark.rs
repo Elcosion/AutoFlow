@@ -1,5 +1,6 @@
 use super::types::{CaptureFrame, MatcherOptions, Point, ScreenRect, VisionMatcher};
 use super::vision::{ImageProcVisionMatcher, PreparedTemplate};
+use image::imageops::{resize, FilterType};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,7 +9,6 @@ const HEIGHT: u32 = 1_080;
 const TEMPLATE_WIDTH: u32 = 45;
 const TEMPLATE_HEIGHT: u32 = 41;
 const THRESHOLD: f32 = 0.92;
-const HIT_AT_END: (u32, u32) = (WIDTH - TEMPLATE_WIDTH, HEIGHT - TEMPLATE_HEIGHT);
 const MOVED_TO: (u32, u32) = (812, 437);
 
 #[derive(Debug)]
@@ -16,6 +16,7 @@ struct BenchCase {
     name: &'static str,
     frame: CaptureFrame,
     expected: Option<(u32, u32)>,
+    expected_scale: Option<f32>,
 }
 
 pub fn run_vision_benchmark() -> String {
@@ -32,25 +33,47 @@ pub fn run_vision_benchmark() -> String {
     let matcher = ImageProcVisionMatcher::new();
     let options = MatcherOptions::default();
 
-    let hit = BenchCase {
-        name: "hit",
-        frame: synthetic_frame(0xA11CE, Some(HIT_AT_END), &template),
-        expected: Some(HIT_AT_END),
-    };
+    let scale_080 = scaled_case(
+        "scale-0.80-hit",
+        0.80,
+        0xA11CE,
+        scale_target(0.80),
+        &template,
+    );
+    let scale_100 = scaled_case(
+        "scale-1.00-hit",
+        1.00,
+        0xA11CE,
+        scale_target(1.50),
+        &template,
+    );
+    let scale_125 = scaled_case(
+        "scale-1.25-hit",
+        1.25,
+        0xA11CE,
+        scale_target(1.25),
+        &template,
+    );
+    let scale_150 = scaled_case(
+        "scale-1.50-hit",
+        1.50,
+        0xA11CE,
+        scale_target(1.50),
+        &template,
+    );
+    let moved = scaled_case("scale-moved-hit", 1.25, 0xBEEF, MOVED_TO, &template);
+    let changed = scaled_case(
+        "scale-changed-hit",
+        1.50,
+        0xCAFE,
+        scale_target(1.50),
+        &template,
+    );
     let miss = BenchCase {
-        name: "miss",
+        name: "multiscale-miss",
         frame: synthetic_frame(0xA11CE, None, &template),
         expected: None,
-    };
-    let repeat = BenchCase {
-        name: "repeat-hit",
-        frame: hit.frame.clone(),
-        expected: Some(HIT_AT_END),
-    };
-    let moved = BenchCase {
-        name: "moved-hit",
-        frame: synthetic_frame(0xA11CE, Some(MOVED_TO), &template),
-        expected: Some(MOVED_TO),
+        expected_scale: None,
     };
 
     let mut report = String::new();
@@ -61,20 +84,26 @@ pub fn run_vision_benchmark() -> String {
     ));
     report.push_str(&format!("prepared_template_ms={prepare_ms}\n"));
 
-    append_case(
-        &mut report,
-        &matcher,
-        &prepared,
-        &options,
-        &hit,
-        prepare_ms,
-        false,
-    );
-    append_case(&mut report, &matcher, &prepared, &options, &miss, 0, false);
+    for case in [&scale_080, &scale_100, &scale_125, &scale_150, &miss] {
+        append_case(
+            &mut report,
+            &matcher,
+            &prepared,
+            &options,
+            case,
+            prepare_ms,
+            false,
+        );
+    }
 
-    let previous_region = previous_region(HIT_AT_END);
+    let repeat_target = scale_125.expected.expect("repeat target");
+    let repeat_dimensions = scaled_dimensions(1.25);
+    let repeat_search_region = previous_region(repeat_target, repeat_dimensions);
     let repeat_started = Instant::now();
-    let repeat_frame = repeat.frame.crop(previous_region).expect("repeat ROI");
+    let repeat_frame = scale_125
+        .frame
+        .crop(repeat_search_region)
+        .expect("repeat ROI");
     let mut repeat_result = matcher
         .find_prepared_template(
             &repeat_frame,
@@ -91,13 +120,13 @@ pub fn run_vision_benchmark() -> String {
         &matcher,
         &prepared,
         &options,
-        &repeat,
+        &scale_125,
         repeat_result,
         0,
     );
 
     let moved_started = Instant::now();
-    let moved_previous_frame = moved.frame.crop(previous_region).expect("moved ROI");
+    let moved_previous_frame = moved.frame.crop(repeat_search_region).expect("moved ROI");
     let previous = matcher
         .find_prepared_template(
             &moved_previous_frame,
@@ -127,6 +156,36 @@ pub fn run_vision_benchmark() -> String {
         &options,
         &moved,
         moved_result,
+        0,
+    );
+
+    let changed_started = Instant::now();
+    let changed_previous_region = previous_region(
+        scale_100.expected.expect("changed target"),
+        scaled_dimensions(1.0),
+    );
+    let changed_previous_frame = changed
+        .frame
+        .crop(changed_previous_region)
+        .expect("changed ROI");
+    let mut changed_result = matcher
+        .find_prepared_template(
+            &changed_previous_frame,
+            prepared.frame(),
+            Some(&prepared),
+            THRESHOLD,
+            &options,
+        )
+        .expect("changed previous match");
+    changed_result.diagnostics.previous_hit_used = true;
+    changed_result.diagnostics.total_ms = changed_started.elapsed().as_millis() as u64;
+    append_result(
+        &mut report,
+        &matcher,
+        &prepared,
+        &options,
+        &changed,
+        changed_result,
         0,
     );
 
@@ -187,48 +246,96 @@ fn append_result(
         .map(|(x, y)| format!("{x},{y}"))
         .unwrap_or_else(|| "none".to_string());
     let diagnostics = &result.diagnostics;
+    let expected_scale = case
+        .expected_scale
+        .map(|scale| format!("{scale:.2}"))
+        .unwrap_or_else(|| "none".to_string());
+    let matched_scale = diagnostics
+        .matched_scale
+        .map(|scale| format!("{scale:.4}"))
+        .unwrap_or_else(|| "none".to_string());
+    let scale_candidates = diagnostics
+        .scale_candidates
+        .iter()
+        .map(|scale| format!("{scale:.2}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let score = result
         .image
         .as_ref()
         .map(|image| format!("{:.6}", image.score))
         .unwrap_or_else(|| "none".to_string());
     report.push_str(&format!(
-        "case={} expected={} baseline_match_ms={} baseline_xy={},{} optimized_xy={},{} total_match_ms={} capture_ms={} prepare_ms={} coarse_match_ms={} refine_match_ms={} fallback_match_ms={} candidate_count={} coarse_score={:.6} refined_score={:.6} previous_hit_used={} fallback_used={} matcher_mode={} options_max_candidates={} score={}\n",
+        "case={} expected_xy={} optimized_xy={},{} expected_scale={} matched_scale={} baseline_match_ms={} baseline_xy={},{} total_match_ms={} scale_search_ms={} capture_ms={} prepare_ms={} coarse_match_ms={} refine_match_ms={} fallback_match_ms={} candidate_count={} scale_candidates={} previous_hit_used={} fallback_used={} matcher_mode={} options_max_candidates={} matched_width={} matched_height={} score={}\n",
         case.name,
         expected,
+        optimized_x,
+        optimized_y,
+        expected_scale,
+        matched_scale,
         baseline_ms,
         baseline_x,
         baseline_y,
-        optimized_x,
-        optimized_y,
         diagnostics.total_ms,
+        diagnostics.scale_search_ms,
         diagnostics.capture_ms,
         diagnostics.prepare_ms,
         diagnostics.coarse_ms,
         diagnostics.refine_ms,
         diagnostics.fallback_ms,
         diagnostics.candidate_count,
-        diagnostics.coarse_score,
-        diagnostics.refined_score,
+        scale_candidates,
         diagnostics.previous_hit_used,
         diagnostics.fallback_used,
         diagnostics.matcher_mode,
         options.max_candidates,
+        diagnostics.matched_width,
+        diagnostics.matched_height,
         score,
     ));
 }
 
-fn previous_region((x, y): (u32, u32)) -> ScreenRect {
-    let margin_x = TEMPLATE_WIDTH.saturating_mul(2).max(64);
-    let margin_y = TEMPLATE_HEIGHT.saturating_mul(2).max(64);
+fn scaled_dimensions(scale: f32) -> (u32, u32) {
+    (
+        (f64::from(TEMPLATE_WIDTH) * f64::from(scale)).round() as u32,
+        (f64::from(TEMPLATE_HEIGHT) * f64::from(scale)).round() as u32,
+    )
+}
+
+fn scale_target(scale: f32) -> (u32, u32) {
+    let (width, height) = scaled_dimensions(scale);
+    (WIDTH - width - 1, HEIGHT - height - 1)
+}
+
+fn scaled_case(
+    name: &'static str,
+    scale: f32,
+    seed: u32,
+    target: (u32, u32),
+    template: &CaptureFrame,
+) -> BenchCase {
+    BenchCase {
+        name,
+        frame: scaled_synthetic_frame(seed, target, scale, template),
+        expected: Some(target),
+        expected_scale: Some(scale),
+    }
+}
+
+fn previous_region(
+    (x, y): (u32, u32),
+    (template_width, template_height): (u32, u32),
+) -> ScreenRect {
+    let margin_x = template_width.saturating_mul(2).max(64);
+    let margin_y = template_height.saturating_mul(2).max(64);
     let left = x.saturating_sub(margin_x);
     let top = y.saturating_sub(margin_y);
     let right = x
-        .saturating_add(TEMPLATE_WIDTH)
+        .saturating_add(template_width)
         .saturating_add(margin_x)
         .min(WIDTH);
     let bottom = y
-        .saturating_add(TEMPLATE_HEIGHT)
+        .saturating_add(template_height)
         .saturating_add(margin_y)
         .min(HEIGHT);
     ScreenRect::from_parts(left as i32, top as i32, right - left, bottom - top)
@@ -278,6 +385,28 @@ fn synthetic_frame(seed: u32, target: Option<(u32, u32)>, template: &CaptureFram
         }
     }
     CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels).expect("synthetic frame")
+}
+
+fn scaled_synthetic_frame(
+    seed: u32,
+    target: (u32, u32),
+    scale: f32,
+    template: &CaptureFrame,
+) -> CaptureFrame {
+    let base = synthetic_frame(seed, None, template);
+    let gray = ImageProcVisionMatcher::gray(template).expect("benchmark template gray");
+    let (scaled_width, scaled_height) = scaled_dimensions(scale);
+    let scaled = resize(&gray, scaled_width, scaled_height, FilterType::Triangle);
+    let mut pixels = base.pixels_bgra().to_vec();
+    for y in 0..scaled_height {
+        for x in 0..scaled_width {
+            let value = scaled.get_pixel(x, y).0[0];
+            let index = (((target.1 + y) * WIDTH + target.0 + x) * 4) as usize;
+            pixels[index..index + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    CaptureFrame::from_bgra(Point { x: 0, y: 0 }, WIDTH, HEIGHT, pixels)
+        .expect("scaled synthetic frame")
 }
 
 fn next_byte(state: &mut u32) -> u8 {

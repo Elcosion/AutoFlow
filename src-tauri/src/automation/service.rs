@@ -40,6 +40,9 @@ struct LastMatchKey {
     threshold_bits: u32,
     mode: MatcherMode,
     max_candidates: usize,
+    scale_min_bits: u32,
+    scale_max_bits: u32,
+    scale_step_bits: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +51,7 @@ struct LastMatch {
     y: i32,
     width: u32,
     height: u32,
+    scale: f32,
     last_used: Instant,
 }
 
@@ -251,11 +255,14 @@ impl VisionService {
             threshold_bits: threshold.to_bits(),
             mode: options.mode,
             max_candidates: options.max_candidates,
+            scale_min_bits: options.scale_min.to_bits(),
+            scale_max_bits: options.scale_max.to_bits(),
+            scale_step_bits: options.scale_step.map(f32::to_bits),
         };
 
         if options.prefer_last {
             if let Some(last) = self.take_last_match(&key) {
-                if let Some(previous_region) = previous_match_region(region, last, &prepared) {
+                if let Some(previous_region) = previous_match_region(region, last) {
                     diagnostics.previous_hit_used = true;
                     let capture_started = Instant::now();
                     let previous_frame = self.capture_region(previous_region, cancel);
@@ -273,7 +280,11 @@ impl VisionService {
                             )?;
                             diagnostics.add_attempt(&result.diagnostics);
                             if let Some(image) = result.image {
-                                self.remember_last_match(&key, &image);
+                                self.remember_last_match(
+                                    &key,
+                                    &image,
+                                    diagnostics.matched_scale.unwrap_or(1.0),
+                                );
                                 diagnostics.total_ms = started.elapsed().as_millis() as u64;
                                 return Ok(VisionSearchResult {
                                     image: Some(image),
@@ -307,7 +318,7 @@ impl VisionService {
         )?;
         diagnostics.add_attempt(&result.diagnostics);
         if let Some(image) = result.image {
-            self.remember_last_match(&key, &image);
+            self.remember_last_match(&key, &image, diagnostics.matched_scale.unwrap_or(1.0));
             diagnostics.total_ms = started.elapsed().as_millis() as u64;
             return Ok(VisionSearchResult {
                 image: Some(image),
@@ -332,7 +343,7 @@ impl VisionService {
         Some(*cached)
     }
 
-    fn remember_last_match(&self, key: &LastMatchKey, image: &ImageMatch) {
+    fn remember_last_match(&self, key: &LastMatchKey, image: &ImageMatch, scale: f32) {
         let Ok(mut cache) = self.last_matches.lock() else {
             return;
         };
@@ -354,6 +365,7 @@ impl VisionService {
                 y: image.y,
                 width: image.width,
                 height: image.height,
+                scale,
                 last_used: Instant::now(),
             },
         );
@@ -584,13 +596,12 @@ impl VisionApi for VisionService {
     }
 }
 
-fn previous_match_region(
-    requested: ScreenRect,
-    last: LastMatch,
-    prepared: &std::sync::Arc<super::vision::PreparedTemplate>,
-) -> Option<ScreenRect> {
-    let margin_x = i64::from(last.width.saturating_mul(2).max(64));
-    let margin_y = i64::from(last.height.saturating_mul(2).max(64));
+fn previous_match_region(requested: ScreenRect, last: LastMatch) -> Option<ScreenRect> {
+    let scale_margin = f64::from(last.scale.max(1.0));
+    let margin_x = ((f64::from(last.width) * 2.0 * scale_margin).round() as u64).max(64);
+    let margin_y = ((f64::from(last.height) * 2.0 * scale_margin).round() as u64).max(64);
+    let margin_x = i64::try_from(margin_x).ok()?;
+    let margin_y = i64::try_from(margin_y).ok()?;
     let left = i64::from(last.x).checked_sub(margin_x)?;
     let top = i64::from(last.y).checked_sub(margin_y)?;
     let right = i64::from(last.x)
@@ -609,8 +620,7 @@ fn previous_match_region(
     if let Some(virtual_screen) = virtual_screen_region() {
         clipped = clipped.intersection(&virtual_screen)?;
     }
-    (clipped.width >= prepared.frame().width && clipped.height >= prepared.frame().height)
-        .then_some(clipped)
+    (clipped.width >= last.width && clipped.height >= last.height).then_some(clipped)
 }
 
 fn validate_wait(timeout: Duration, poll: Duration) -> Result<(), VisionError> {

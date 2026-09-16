@@ -6,7 +6,7 @@ use crate::automation::{
     MIN_POLL_MS,
 };
 use crate::{MacroStep, MouseButton};
-use rhai::{Dynamic, Engine, EvalAltResult, Map, Position};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -748,6 +748,37 @@ fn image_search_map(value: VisionSearchResult) -> Map {
         "matcher_mode".into(),
         Dynamic::from(value.diagnostics.matcher_mode),
     );
+    map.insert(
+        "matched_scale".into(),
+        value
+            .diagnostics
+            .matched_scale
+            .map(|scale| Dynamic::from(f64::from(scale)))
+            .unwrap_or_else(|| Dynamic::from(())),
+    );
+    map.insert(
+        "scale_candidates".into(),
+        Dynamic::from(
+            value
+                .diagnostics
+                .scale_candidates
+                .iter()
+                .map(|scale| Dynamic::from(f64::from(*scale)))
+                .collect::<Array>(),
+        ),
+    );
+    map.insert(
+        "scale_search_ms".into(),
+        Dynamic::from(value.diagnostics.scale_search_ms as i64),
+    );
+    map.insert(
+        "matched_width".into(),
+        Dynamic::from(i64::from(value.diagnostics.matched_width)),
+    );
+    map.insert(
+        "matched_height".into(),
+        Dynamic::from(i64::from(value.diagnostics.matched_height)),
+    );
     map
 }
 
@@ -783,10 +814,38 @@ fn checked_match_options(options: &Map) -> Result<MatcherOptions, String> {
             "vision_match_options_invalid：max_candidates 必须在 1 到 32 之间".to_string()
         })?;
     }
+    if let Some(value) = options.get("scale_min") {
+        parsed.scale_min = checked_scale_option(value, "scale_min")?;
+    }
+    if let Some(value) = options.get("scale_max") {
+        parsed.scale_max = checked_scale_option(value, "scale_max")?;
+    }
+    if let Some(value) = options.get("scale_step") {
+        parsed.scale_step = Some(checked_scale_option(value, "scale_step")?);
+    }
     parsed
         .validate()
         .map_err(|error| format!("{}：{}", error.code, error.message))?;
     Ok(parsed)
+}
+
+fn checked_scale_option(value: &Dynamic, name: &str) -> Result<f32, String> {
+    let number = if value.is_int() {
+        value
+            .as_int()
+            .map(|value| value as f64)
+            .map_err(|_| format!("vision_scale_invalid：{name} 必须是数字"))?
+    } else if value.is_float() {
+        value
+            .as_float()
+            .map_err(|_| format!("vision_scale_invalid：{name} 必须是数字"))?
+    } else {
+        return Err(format!("vision_scale_invalid：{name} 必须是数字"));
+    };
+    if !number.is_finite() {
+        return Err(format!("vision_scale_invalid：{name} 必须是有限数字"));
+    }
+    Ok(number as f32)
 }
 
 fn checked_point(x: i64, y: i64) -> Result<Point, String> {
@@ -1658,10 +1717,16 @@ mod tests {
         options.insert("mode".into(), Dynamic::from("fast"));
         options.insert("prefer_last".into(), Dynamic::from(false));
         options.insert("max_candidates".into(), Dynamic::from(4_i64));
+        options.insert("scale_min".into(), Dynamic::from(0.65_f64));
+        options.insert("scale_max".into(), Dynamic::from(1.6_f64));
+        options.insert("scale_step".into(), Dynamic::from(0.05_f64));
         let parsed = checked_match_options(&options).expect("valid image options");
         assert_eq!(parsed.mode, MatcherMode::Fast);
         assert!(!parsed.prefer_last);
         assert_eq!(parsed.max_candidates, 4);
+        assert!((parsed.scale_min - 0.65).abs() < 0.001);
+        assert!((parsed.scale_max - 1.6).abs() < 0.001);
+        assert_eq!(parsed.scale_step, Some(0.05));
 
         let mut invalid_mode = Map::new();
         invalid_mode.insert("mode".into(), Dynamic::from("turbo"));
@@ -1672,6 +1737,11 @@ mod tests {
         invalid_count.insert("max_candidates".into(), Dynamic::from(0_i64));
         let error = checked_match_options(&invalid_count).expect_err("invalid candidate count");
         assert!(error.contains("vision_match_options_invalid"));
+
+        let mut invalid_scale = Map::new();
+        invalid_scale.insert("scale_min".into(), Dynamic::from(2.1_f64));
+        let error = checked_match_options(&invalid_scale).expect_err("invalid scale");
+        assert!(error.contains("vision_scale_invalid"));
 
         let context = ExecutionContext::new(
             Arc::new(TestInput),
@@ -1707,8 +1777,14 @@ mod tests {
             "previous_hit_used",
             "fallback_used",
             "matcher_mode",
+            "matched_scale",
+            "scale_candidates",
+            "scale_search_ms",
+            "matched_width",
+            "matched_height",
         ] {
             assert!(map.contains_key(key), "missing diagnostic key: {key}");
         }
+        assert!(map["matched_scale"].is_unit());
     }
 }

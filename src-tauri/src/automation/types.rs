@@ -18,6 +18,9 @@ pub const MAX_CACHED_TEMPLATES: usize = 64;
 pub const MAX_CACHED_TEMPLATE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ASSET_NAME_LENGTH: usize = 128;
+pub const MIN_MATCH_SCALE: f32 = 0.5;
+pub const MAX_MATCH_SCALE: f32 = 2.0;
+pub const MAX_SCALE_CANDIDATES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(pub isize);
@@ -517,11 +520,14 @@ impl MatcherMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MatcherOptions {
     pub mode: MatcherMode,
     pub prefer_last: bool,
     pub max_candidates: usize,
+    pub scale_min: f32,
+    pub scale_max: f32,
+    pub scale_step: Option<f32>,
 }
 
 impl Default for MatcherOptions {
@@ -530,6 +536,9 @@ impl Default for MatcherOptions {
             mode: MatcherMode::Auto,
             prefer_last: true,
             max_candidates: 8,
+            scale_min: 0.67,
+            scale_max: 1.5,
+            scale_step: None,
         }
     }
 }
@@ -542,7 +551,100 @@ impl MatcherOptions {
                 "候选数量必须在 1 到 32 之间",
             ));
         }
+        if !self.scale_min.is_finite() || !self.scale_max.is_finite() {
+            return Err(VisionError::new(
+                "vision_scale_invalid",
+                "scale_min 和 scale_max 必须是有限数字",
+            ));
+        }
+        if !(MIN_MATCH_SCALE..=MAX_MATCH_SCALE).contains(&self.scale_min)
+            || !(MIN_MATCH_SCALE..=MAX_MATCH_SCALE).contains(&self.scale_max)
+        {
+            return Err(VisionError::new(
+                "vision_scale_invalid",
+                "scale_min 和 scale_max 必须在 0.5 到 2.0 倍之间",
+            ));
+        }
+        if self.scale_min > self.scale_max {
+            return Err(VisionError::new(
+                "vision_scale_range_invalid",
+                "scale_min 不能大于 scale_max",
+            ));
+        }
+        if let Some(step) = self.scale_step {
+            if !step.is_finite() || step <= 0.0 {
+                return Err(VisionError::new(
+                    "vision_scale_step_invalid",
+                    "scale_step 必须是大于 0 的有限数字",
+                ));
+            }
+            if step > MAX_MATCH_SCALE - MIN_MATCH_SCALE {
+                return Err(VisionError::new(
+                    "vision_scale_step_invalid",
+                    "scale_step 不能大于 1.5",
+                ));
+            }
+        }
+        self.scale_candidates()?;
         Ok(())
+    }
+
+    pub fn scale_candidates(&self) -> Result<Vec<f32>, VisionError> {
+        let mut candidates = Vec::new();
+        if self.mode == MatcherMode::Exact {
+            candidates.push(1.0);
+            return Ok(candidates);
+        }
+
+        if let Some(step) = self.scale_step {
+            let mut scale = self.scale_min;
+            for _ in 0..=MAX_SCALE_CANDIDATES {
+                if scale > self.scale_max + 0.0005 {
+                    break;
+                }
+                push_scale_candidate(&mut candidates, scale.min(self.scale_max));
+                if candidates.len() > MAX_SCALE_CANDIDATES {
+                    return Err(VisionError::new(
+                        "vision_scale_candidates_invalid",
+                        "scale_step 生成的尺寸候选不能超过 16 个",
+                    ));
+                }
+                let next = scale + step;
+                if next <= scale {
+                    return Err(VisionError::new(
+                        "vision_scale_step_invalid",
+                        "scale_step 生成的尺寸候选无效",
+                    ));
+                }
+                scale = next;
+            }
+            push_scale_candidate(&mut candidates, self.scale_max);
+        } else {
+            for scale in [0.67, 0.80, 0.83, 1.0, 1.20, 1.25, 1.50] {
+                if (self.scale_min..=self.scale_max).contains(&scale) {
+                    push_scale_candidate(&mut candidates, scale);
+                }
+            }
+            push_scale_candidate(&mut candidates, self.scale_min);
+            push_scale_candidate(&mut candidates, self.scale_max);
+        }
+        candidates.sort_by(|left, right| left.total_cmp(right));
+        if candidates.is_empty() || candidates.len() > MAX_SCALE_CANDIDATES {
+            return Err(VisionError::new(
+                "vision_scale_candidates_invalid",
+                "尺寸候选数量必须在 1 到 16 个之间",
+            ));
+        }
+        Ok(candidates)
+    }
+}
+
+fn push_scale_candidate(candidates: &mut Vec<f32>, scale: f32) {
+    if !candidates
+        .iter()
+        .any(|current| (*current - scale).abs() < 0.0005)
+    {
+        candidates.push(scale);
     }
 }
 
@@ -560,6 +662,11 @@ pub struct VisionDiagnostics {
     pub previous_hit_used: bool,
     pub fallback_used: bool,
     pub matcher_mode: String,
+    pub matched_scale: Option<f32>,
+    pub scale_candidates: Vec<f32>,
+    pub scale_search_ms: u64,
+    pub matched_width: u32,
+    pub matched_height: u32,
 }
 
 impl Default for VisionDiagnostics {
@@ -583,6 +690,11 @@ impl VisionDiagnostics {
             previous_hit_used: false,
             fallback_used: false,
             matcher_mode: mode.as_str().to_string(),
+            matched_scale: None,
+            scale_candidates: Vec::new(),
+            scale_search_ms: 0,
+            matched_width: 0,
+            matched_height: 0,
         }
     }
 
@@ -598,6 +710,15 @@ impl VisionDiagnostics {
         self.previous_hit_used |= other.previous_hit_used;
         self.fallback_used |= other.fallback_used;
         self.matcher_mode = other.matcher_mode.clone();
+        if self.scale_candidates.is_empty() {
+            self.scale_candidates = other.scale_candidates.clone();
+        }
+        self.scale_search_ms = self.scale_search_ms.saturating_add(other.scale_search_ms);
+        if other.matched_scale.is_some() {
+            self.matched_scale = other.matched_scale;
+            self.matched_width = other.matched_width;
+            self.matched_height = other.matched_height;
+        }
     }
 }
 
@@ -772,6 +893,36 @@ mod tests {
                 .expect_err("oversized region")
                 .code,
             "capture_region_invalid"
+        );
+    }
+
+    #[test]
+    fn scale_candidates_cover_common_windows_dpi_values_and_validate_bounds() {
+        let options = MatcherOptions::default();
+        assert_eq!(
+            options.scale_candidates().expect("default scales"),
+            vec![0.67, 0.8, 0.83, 1.0, 1.2, 1.25, 1.5]
+        );
+        let mut stepped = MatcherOptions {
+            scale_min: 0.8,
+            scale_max: 1.2,
+            scale_step: Some(0.2),
+            ..options.clone()
+        };
+        assert_eq!(
+            stepped.scale_candidates().expect("stepped scales"),
+            vec![0.8, 1.0, 1.2]
+        );
+        stepped.scale_min = 2.1;
+        assert_eq!(
+            stepped.validate().expect_err("invalid scale").code,
+            "vision_scale_invalid"
+        );
+        stepped.scale_min = 1.2;
+        stepped.scale_max = 0.8;
+        assert_eq!(
+            stepped.validate().expect_err("reversed range").code,
+            "vision_scale_range_invalid"
         );
     }
 }
