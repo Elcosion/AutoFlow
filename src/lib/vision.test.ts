@@ -6,6 +6,7 @@ import {
 } from "./macroSource";
 import { normalizeConfig } from "./tauri";
 import { RHAI_API_NAMES, RHAI_API_SIGNATURES } from "../components/RhaiEditor";
+import { RHAI_API_REFERENCE_SNIPPETS } from "./rhaiCompletions";
 import { isSupportedAssetFileName } from "../components/AssetManager";
 import type { BehaviorProfileV2, MacroRule, MacroStep } from "../types/config";
 
@@ -57,6 +58,16 @@ describe("vision automation frontend contracts", () => {
       expect(RHAI_API_NAMES).toContain(name);
       expect(RHAI_API_SIGNATURES[name]).toContain(name);
     }
+  });
+
+  it("documents the multi-scale options in the right-side reference", () => {
+    const findImage = RHAI_API_REFERENCE_SNIPPETS.find(
+      (snippet) =>
+        snippet.apiName === "find_image" && snippet.name.includes("options"),
+    );
+    expect(findImage?.code).toContain("scale_min: 0.65");
+    expect(findImage?.code).toContain("scale_max: 1.60");
+    expect(findImage?.code).toContain("不是百分数");
   });
 
   it("normalizes legacy config while retaining managed asset metadata", () => {

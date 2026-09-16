@@ -442,7 +442,8 @@ RHAI_API_OVERLOAD_REFERENCE_SNIPPETS.push(
     apiName: "find_image",
     category: "图像与像素",
     name: "find_image(fileName, x, y, width, height, threshold, options)",
-    description: "使用 auto、exact 或 fast 模式查找图像，并可控制上一命中优先和候选数量。",
+    description:
+      "使用多尺度 auto、exact 或 fast 模式查找图像；scale 使用倍率而不是百分数。",
     code: `let result = find_image(
   "confirm_button.png",
   0,
@@ -452,6 +453,9 @@ RHAI_API_OVERLOAD_REFERENCE_SNIPPETS.push(
   0.90,
   #{
     mode: "auto", // auto / exact / fast
+    scale_min: 0.65, // 最小倍率（不是百分数）
+    scale_max: 1.60, // 最大倍率（不是百分数）
+    // scale_step: 0.10, // 可选；候选数量最多 16 个
     prefer_last: true,
     max_candidates: 8
   }
@@ -462,7 +466,8 @@ RHAI_API_OVERLOAD_REFERENCE_SNIPPETS.push(
     apiName: "wait_image",
     category: "图像与像素",
     name: "wait_image(fileName, x, y, width, height, threshold, timeoutMs, pollMs, options)",
-    description: "轮询查找图像的高级重载，保留 timeout、poll_ms 和 F12 取消语义。",
+    description:
+      "轮询查找图像的多尺度高级重载，保留 timeout、poll_ms 和 F12 取消语义。",
     code: `let result = wait_image(
   "confirm_button.png",
   0,
@@ -472,7 +477,13 @@ RHAI_API_OVERLOAD_REFERENCE_SNIPPETS.push(
   0.90,
   10000,
   200,
-  #{ mode: "auto", prefer_last: true, max_candidates: 8 }
+  #{
+    mode: "auto", // auto / exact / fast
+    scale_min: 0.65, // 最小倍率（不是百分数）
+    scale_max: 1.60, // 最大倍率（不是百分数）
+    prefer_last: true,
+    max_candidates: 8
+  }
 );`,
   },
 );

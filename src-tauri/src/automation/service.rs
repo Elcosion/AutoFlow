@@ -97,6 +97,29 @@ impl VisionService {
     }
 
     pub fn set_assets(&self, assets: &[AutomationAsset]) {
+        // A catalog refresh may include edits, renames, deletions or a file
+        // restored under the same name. Clear prepared and scaled templates
+        // when the managed metadata actually changes; playback also calls
+        // this method, so clearing on every call would defeat the cache.
+        let catalog_changed = self
+            .catalog
+            .read()
+            .map(|catalog| {
+                let existing_ids = catalog
+                    .values()
+                    .map(|asset| asset.id.to_lowercase())
+                    .collect::<HashSet<_>>();
+                existing_ids.len() != assets.len()
+                    || assets.iter().any(|asset| {
+                        catalog
+                            .get(&asset.id.to_lowercase())
+                            .is_none_or(|current| current != asset)
+                    })
+            })
+            .unwrap_or(true);
+        if catalog_changed {
+            self.assets.invalidate_all();
+        }
         if let Ok(mut catalog) = self.catalog.write() {
             catalog.clear();
             for asset in assets {
@@ -271,12 +294,14 @@ impl VisionService {
                         .saturating_add(capture_started.elapsed().as_millis() as u64);
                     match previous_frame {
                         Ok(frame) => {
+                            let mut previous_options = options.clone();
+                            previous_options.preferred_scale = Some(last.scale);
                             let result = self.matcher.find_prepared_template(
                                 &frame,
                                 prepared.frame(),
                                 Some(prepared.as_ref()),
                                 threshold,
-                                options,
+                                &previous_options,
                             )?;
                             diagnostics.add_attempt(&result.diagnostics);
                             if let Some(image) = result.image {
@@ -325,6 +350,10 @@ impl VisionService {
                 diagnostics,
             });
         }
+        // Do not keep retrying a stale location after a complete miss. A
+        // subsequent call must perform a fresh search rather than repeatedly
+        // treating an old coordinate and size as authoritative.
+        self.forget_last_match(&key);
         diagnostics.total_ms = started.elapsed().as_millis() as u64;
         Ok(VisionSearchResult {
             image: None,
@@ -369,6 +398,12 @@ impl VisionService {
                 last_used: Instant::now(),
             },
         );
+    }
+
+    fn forget_last_match(&self, key: &LastMatchKey) {
+        if let Ok(mut cache) = self.last_matches.lock() {
+            cache.remove(key);
+        }
     }
 }
 
@@ -822,6 +857,7 @@ mod tests {
     use super::*;
     use crate::automation::types::{CaptureBackend, VisionPollBudget, WindowId, WindowInfo};
     use image::codecs::png::PngEncoder;
+    use image::imageops::{resize, FilterType};
     use image::{ColorType, ImageEncoder};
     use std::collections::VecDeque;
     use std::fs;
@@ -995,8 +1031,15 @@ mod tests {
     }
 
     fn screen_frame(target: (u32, u32), template: &CaptureFrame) -> CaptureFrame {
-        let width = 128_u32;
-        let height = 96_u32;
+        screen_frame_sized(target, template, 128, 96)
+    }
+
+    fn screen_frame_sized(
+        target: (u32, u32),
+        template: &CaptureFrame,
+        width: u32,
+        height: u32,
+    ) -> CaptureFrame {
         let mut pixels = vec![19_u8; (width * height * 4) as usize];
         for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel[0] = 7;
@@ -1013,6 +1056,32 @@ mod tests {
             }
         }
         CaptureFrame::from_bgra(Point { x: 0, y: 0 }, width, height, pixels).expect("screen frame")
+    }
+
+    fn scaled_screen_frame(
+        target: (u32, u32),
+        scale: f32,
+        template: &CaptureFrame,
+        width: u32,
+        height: u32,
+    ) -> CaptureFrame {
+        let mut pixels = vec![0_u8; (width * height * 4) as usize];
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[7, 13, 23, 255]);
+        }
+        let gray = ImageProcVisionMatcher::gray(template).expect("template gray");
+        let scaled_width = (f64::from(template.width) * f64::from(scale)).round() as u32;
+        let scaled_height = (f64::from(template.height) * f64::from(scale)).round() as u32;
+        let scaled = resize(&gray, scaled_width, scaled_height, FilterType::Triangle);
+        for y in 0..scaled_height {
+            for x in 0..scaled_width {
+                let value = scaled.get_pixel(x, y).0[0];
+                let index = (((target.1 + y) * width + target.0 + x) * 4) as usize;
+                pixels[index..index + 4].copy_from_slice(&[value, value, value, 255]);
+            }
+        }
+        CaptureFrame::from_bgra(Point { x: 0, y: 0 }, width, height, pixels)
+            .expect("scaled screen frame")
     }
 
     #[test]
@@ -1322,6 +1391,141 @@ mod tests {
         );
         assert!(moved_result.diagnostics.previous_hit_used);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn previous_hit_scale_is_prioritized_and_scale_changes_recover_without_old_click() {
+        let root = std::env::temp_dir().join(format!(
+            "autoflow-vision-scale-last-match-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let rgba = vision_template_pixels();
+        let template = CaptureFrame::from_bgra(
+            Point { x: 0, y: 0 },
+            24,
+            24,
+            rgba.iter()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                .collect(),
+        )
+        .expect("template frame");
+        let requested = ScreenRect::from_parts(0, 0, 512, 256);
+        let first_target = (350, 180);
+        let first = screen_frame_sized(first_target, &template, 512, 256);
+        let scale_changed = scaled_screen_frame(first_target, 1.5, &template, 512, 256);
+        let first_last = LastMatch {
+            x: first_target.0 as i32,
+            y: first_target.1 as i32,
+            width: 24,
+            height: 24,
+            scale: 1.0,
+            last_used: Instant::now(),
+        };
+        let first_roi = previous_match_region(requested, first_last).expect("first ROI");
+        let changed_roi = scale_changed.crop(first_roi).expect("changed ROI");
+        let moved_target = (0, 0);
+        let moved = scaled_screen_frame(moved_target, 1.5, &template, 512, 256);
+        let changed_last = LastMatch {
+            x: first_target.0 as i32,
+            y: first_target.1 as i32,
+            width: 36,
+            height: 36,
+            scale: 1.5,
+            last_used: Instant::now(),
+        };
+        let moved_roi = moved
+            .crop(previous_match_region(requested, changed_last).expect("moved ROI"))
+            .expect("moved previous ROI");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with_sequence(
+            vec![first, changed_roi, moved_roi, moved],
+            Arc::clone(&calls),
+            root.clone(),
+        );
+        let asset = super::super::assets::import_asset_file(
+            &root,
+            &[],
+            "button",
+            "button.png",
+            &png_image(24, 24, &rgba),
+        )
+        .expect("asset import");
+        service.set_assets(std::slice::from_ref(&asset));
+        let cancel = AtomicBool::new(false);
+
+        let first_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("first scale search");
+        let first_image = first_result.image.expect("first hit");
+        assert_eq!(
+            (first_image.x, first_image.y),
+            (first_target.0 as i32, first_target.1 as i32)
+        );
+        assert_eq!((first_image.width, first_image.height), (24, 24));
+        assert!((first_result.diagnostics.matched_scale.expect("first scale") - 1.0).abs() < 0.01);
+
+        let changed_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("same position scale change");
+        let changed_image = changed_result.image.expect("changed scale hit");
+        assert_eq!(
+            (changed_image.x, changed_image.y),
+            (first_target.0 as i32, first_target.1 as i32)
+        );
+        assert_eq!((changed_image.width, changed_image.height), (36, 36));
+        assert!(
+            (changed_result
+                .diagnostics
+                .matched_scale
+                .expect("changed scale")
+                - 1.5)
+                .abs()
+                < 0.01
+        );
+        assert!(changed_result.diagnostics.previous_hit_used);
+        assert_eq!(
+            changed_result.diagnostics.scale_candidates.first(),
+            Some(&1.0)
+        );
+
+        let moved_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("moved and scaled search");
+        let moved_image = moved_result.image.expect("moved scale hit");
+        assert_eq!(
+            (moved_image.x, moved_image.y),
+            (moved_target.0 as i32, moved_target.1 as i32)
+        );
+        assert_eq!((moved_image.width, moved_image.height), (36, 36));
+        assert!((moved_result.diagnostics.matched_scale.expect("moved scale") - 1.5).abs() < 0.01);
+        assert!(moved_result.diagnostics.previous_hit_used);
+        assert_eq!(
+            moved_result.diagnostics.scale_candidates.first(),
+            Some(&1.5)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         let _ = fs::remove_dir_all(root);
     }
 

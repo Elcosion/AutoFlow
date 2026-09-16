@@ -528,6 +528,10 @@ pub struct MatcherOptions {
     pub scale_min: f32,
     pub scale_max: f32,
     pub scale_step: Option<f32>,
+    /// Runtime-only hint populated by the previous-hit fast path. It is not
+    /// exposed through the Rhai options map and never expands the requested
+    /// scale range.
+    pub(crate) preferred_scale: Option<f32>,
 }
 
 impl Default for MatcherOptions {
@@ -539,6 +543,7 @@ impl Default for MatcherOptions {
             scale_min: 0.67,
             scale_max: 1.5,
             scale_step: None,
+            preferred_scale: None,
         }
     }
 }
@@ -634,6 +639,17 @@ impl MatcherOptions {
                 "vision_scale_candidates_invalid",
                 "尺寸候选数量必须在 1 到 16 个之间",
             ));
+        }
+        if let Some(preferred) = self.preferred_scale {
+            if preferred.is_finite() {
+                if let Some(index) = candidates
+                    .iter()
+                    .position(|scale| (*scale - preferred).abs() < 0.0005)
+                {
+                    let preferred = candidates.remove(index);
+                    candidates.insert(0, preferred);
+                }
+            }
         }
         Ok(candidates)
     }
@@ -923,6 +939,32 @@ mod tests {
         assert_eq!(
             stepped.validate().expect_err("reversed range").code,
             "vision_scale_range_invalid"
+        );
+
+        let mut non_finite = options.clone();
+        non_finite.scale_min = f32::NAN;
+        assert_eq!(
+            non_finite.validate().expect_err("non-finite scale").code,
+            "vision_scale_invalid"
+        );
+
+        let mut too_many = options.clone();
+        too_many.scale_min = MIN_MATCH_SCALE;
+        too_many.scale_max = MAX_MATCH_SCALE;
+        too_many.scale_step = Some(0.01);
+        assert_eq!(
+            too_many
+                .validate()
+                .expect_err("too many scale candidates")
+                .code,
+            "vision_scale_candidates_invalid"
+        );
+
+        let mut preferred = options;
+        preferred.preferred_scale = Some(1.25);
+        assert_eq!(
+            preferred.scale_candidates().expect("preferred scales")[0],
+            1.25
         );
     }
 }

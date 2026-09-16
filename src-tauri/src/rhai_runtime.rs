@@ -1713,20 +1713,23 @@ mod tests {
 
     #[test]
     fn image_match_options_validate_modes_and_candidate_count() {
+        let legacy = checked_match_options(&Map::new()).expect("legacy image options");
+        assert_eq!(legacy, MatcherOptions::default());
+
         let mut options = Map::new();
         options.insert("mode".into(), Dynamic::from("fast"));
         options.insert("prefer_last".into(), Dynamic::from(false));
         options.insert("max_candidates".into(), Dynamic::from(4_i64));
         options.insert("scale_min".into(), Dynamic::from(0.65_f64));
         options.insert("scale_max".into(), Dynamic::from(1.6_f64));
-        options.insert("scale_step".into(), Dynamic::from(0.05_f64));
+        options.insert("scale_step".into(), Dynamic::from(0.1_f64));
         let parsed = checked_match_options(&options).expect("valid image options");
         assert_eq!(parsed.mode, MatcherMode::Fast);
         assert!(!parsed.prefer_last);
         assert_eq!(parsed.max_candidates, 4);
         assert!((parsed.scale_min - 0.65).abs() < 0.001);
         assert!((parsed.scale_max - 1.6).abs() < 0.001);
-        assert_eq!(parsed.scale_step, Some(0.05));
+        assert_eq!(parsed.scale_step, Some(0.1));
 
         let mut invalid_mode = Map::new();
         invalid_mode.insert("mode".into(), Dynamic::from("turbo"));
@@ -1786,5 +1789,32 @@ mod tests {
             assert!(map.contains_key(key), "missing diagnostic key: {key}");
         }
         assert!(map["matched_scale"].is_unit());
+
+        let mut hit_diagnostics = crate::automation::VisionDiagnostics::for_mode(MatcherMode::Auto);
+        hit_diagnostics.matched_scale = Some(1.25);
+        hit_diagnostics.scale_candidates = vec![0.8, 1.25];
+        hit_diagnostics.matched_width = 56;
+        hit_diagnostics.matched_height = 51;
+        let hit_map = image_search_map(VisionSearchResult {
+            image: Some(crate::automation::ImageMatch {
+                x: 10,
+                y: 20,
+                width: 56,
+                height: 51,
+                center_x: 38,
+                center_y: 45,
+                score: 1.0,
+            }),
+            diagnostics: hit_diagnostics,
+        });
+        assert_eq!(
+            hit_map["matched_scale"].clone().try_cast::<f64>(),
+            Some(1.25)
+        );
+        assert_eq!(hit_map["matched_width"].clone().try_cast::<i64>(), Some(56));
+        assert_eq!(
+            hit_map["matched_height"].clone().try_cast::<i64>(),
+            Some(51)
+        );
     }
 }

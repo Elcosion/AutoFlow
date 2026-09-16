@@ -63,18 +63,32 @@ wait_image(file_name, region_x, region_y, region_width, region_height, threshold
 ```
 
 The optional image-search map uses `mode: "auto"`, `"exact"`, or `"fast"`,
-`prefer_last: true|false`, and `max_candidates` from 1 to 32. `auto` checks
-the previous hit, searches a half-resolution pyramid, refines a small set of
-candidates at original resolution, and only uses a parallel full-resolution
-fallback when the coarse result is uncertain. `exact` always uses the full
-resolution matcher; `fast` skips that fallback. Invalid values return a stable
-Chinese validation error. The default calls keep their original signatures and
-default to `auto`.
+`prefer_last: true|false`, `max_candidates` from 1 to 32, and scale values as
+倍率（例如 `1.25` 表示 125%，不是百分数 `125`）。`scale_min` and
+`scale_max` are finite values from `0.5` to `2.0`, with `scale_min <=
+scale_max`; an optional positive `scale_step` is also bounded by the maximum
+candidate count. When omitted, `auto` and `fast` search the common Windows
+DPI candidates `0.67, 0.80, 0.83, 1.00, 1.20, 1.25, 1.50` (within the selected
+range).
+
+`auto` checks the previous position and successful scale, performs bounded
+multi-scale coarse matching, refines candidates with the corresponding
+original-resolution scaled template, and may use a controlled full-resolution
+fallback when the result is uncertain. `fast` performs the same multi-scale
+coarse pass and local refinement but never runs that full-area fallback.
+`exact` deliberately keeps the fixed 1.0 full-resolution NCC baseline and does
+not perform cross-scale matching. Invalid values return a stable Chinese
+validation error. The default calls keep their original signatures and default
+to `auto`.
 
 Image result maps retain `found`, coordinates, dimensions and `score`, and add
 `total_ms`, `capture_ms`, `prepare_ms`, `coarse_ms`, `refine_ms`,
 `fallback_ms`, `candidate_count`, `previous_hit_used`, `fallback_used`, and
-`matcher_mode`. These fields are diagnostic only and do not change old scripts.
+`matcher_mode`, plus `matched_scale`, `scale_candidates`, `scale_search_ms`,
+`matched_width`, and `matched_height`. On a miss, `matched_scale` is the Rhai
+unit value `()` and the matched dimensions are `0`; on a hit, width and height
+are the actual scaled template dimensions. These fields are diagnostic only
+and do not change old scripts.
 
 Wait values are non-negative integers, coordinates and wheel values are i32,
 buttons are `left`, `right`, `middle`, `x1` or `x2`, and text/key arguments are
@@ -97,9 +111,13 @@ folder are discovered when the configuration is refreshed. Rhai receives the
 complete file name, including the `.png`, `.jpg`, or `.jpeg` extension; omitting
 the extension is not supported. It cannot open arbitrary paths. PNG/JPEG bytes are validated,
 the canonical path is checked against the managed directory, templates are
-decoded lazily and cached as a prepared grayscale template plus a half-resolution
-pyramid. Cache entries invalidate when the resource file name, metadata or
-SHA-256 changes; the cache is bounded to 64 entries and 64 MiB. Deletion requires confirmation when a script still
+decoded lazily and cached as a prepared grayscale template plus bounded,
+on-demand scaled grayscale templates. Scaled entries are keyed by resource,
+file fingerprint, requested scale and actual scaled dimensions. Cache entries
+invalidate when the resource file name, metadata or SHA-256 changes, and a
+catalog refresh or deletion clears the corresponding prepared/scaled cache;
+the cache is bounded to 64 base entries and 64 MiB, with at most 16 scaled
+templates and 8 MiB per prepared template. Deletion requires confirmation when a script still
 mentions the asset.
 
 The recommended polling interval is 150–250ms. Polls are interruptible in

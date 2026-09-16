@@ -59,13 +59,23 @@ impl AssetStore {
         &self,
         asset: &AutomationAsset,
     ) -> Result<Arc<PreparedTemplate>, VisionError> {
-        let path = self.resolve_existing(asset)?;
-        let bytes = fs::read(&path).map_err(|error| {
-            VisionError::new(
-                "asset_file_missing",
-                format!("无法读取图像资源 {}：{error}", asset.name),
-            )
-        })?;
+        let path = match self.resolve_existing(asset) {
+            Ok(path) => path,
+            Err(error) => {
+                self.invalidate_asset(&asset.id);
+                return Err(error);
+            }
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.invalidate_asset(&asset.id);
+                return Err(VisionError::new(
+                    "asset_file_missing",
+                    format!("无法读取图像资源 {}：{error}", asset.name),
+                ));
+            }
+        };
         let fingerprint = file_fingerprint(&path, &bytes)?;
         if let Ok(mut cache) = self.cache.lock() {
             if let Some(cached) = cache.get_mut(&asset.id) {
@@ -134,13 +144,31 @@ impl AssetStore {
         })
     }
 
+    /// Refreshing the managed asset catalog invalidates both the raw prepared
+    /// template and every lazily-created scaled template below it. The next
+    /// lookup will rebuild them from the current file fingerprint.
+    pub fn invalidate_all(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn invalidate_asset(&self, asset_id: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(asset_id);
+        }
+    }
+
     pub fn remove_file(&self, asset: &AutomationAsset) -> Result<(), VisionError> {
         let root = self.canonical_root()?;
         validate_file_name(&asset.file_name)?;
         let candidate = root.join(&asset.file_name);
         let canonical = match fs::canonicalize(&candidate) {
             Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.invalidate_asset(&asset.id);
+                return Ok(());
+            }
             Err(error) => {
                 return Err(VisionError::new(
                     "asset_file_missing",
@@ -675,6 +703,12 @@ mod tests {
         fs::write(root.join(&asset.file_name), replacement).expect("replace");
         let third = store.load_template(&asset).expect("invalidated load");
         assert!(!Arc::ptr_eq(&first, &third));
+        fs::remove_file(root.join(&asset.file_name)).expect("delete asset");
+        let missing = store
+            .load_prepared_template(&asset)
+            .expect_err("deleted asset");
+        assert_eq!(missing.code, "asset_file_missing");
+        assert_eq!(store.cache_stats().entries, 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -730,11 +764,12 @@ mod tests {
         let root = temp_root();
         let bytes = png([1, 2, 3, 255]);
         let asset = import_asset_file(&root, &[], "按钮", "before.png", &bytes).expect("import");
-        AssetStore::new(root.clone())
-            .rename_file(&asset, "after.png")
-            .expect("rename");
+        let store = AssetStore::new(root.clone());
+        store.load_prepared_template(&asset).expect("cache asset");
+        store.rename_file(&asset, "after.png").expect("rename");
         assert!(!root.join("before.png").exists());
         assert!(root.join("after.png").exists());
+        assert_eq!(store.cache_stats().entries, 0);
         let _ = fs::remove_dir_all(root);
     }
 }

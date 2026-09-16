@@ -425,21 +425,37 @@ for round in 0..100 {
 `find_image` 和 `wait_image` 继续支持原有参数签名，也支持最后追加一个
 `options` Map：`mode` 可取 `"auto"`、`"exact"` 或 `"fast"`，
 `prefer_last` 控制是否优先复用上一命中区域，`max_candidates` 范围为
-1–32。例如：
+1–32，`scale_min`/`scale_max` 是模板倍率（`1.25` 表示 125%，不是
+百分数），范围为 `0.5`–`2.0`；`scale_step` 可选且必须为正数。例如：
 
 ```rhai
 let result = find_image(
     "confirm_button.png", 0, 0, 1920, 1080, 0.90,
-    #{ mode: "auto", prefer_last: true, max_candidates: 8 }
+    #{
+        mode: "auto",
+        scale_min: 0.65,
+        scale_max: 1.60,
+        prefer_last: true,
+        max_candidates: 8
+    }
 );
 ```
 
-`auto` 使用上一命中区域、1/2 分辨率金字塔和原图局部复核；粗匹配不确定
-时才执行并行全图 NCC。`exact` 直接执行并行全图 NCC，`fast` 不执行全图
-兜底。返回 Map 在原有 `found`、坐标、尺寸和 `score` 外还包含
+未指定尺度时，`auto` 和 `fast` 默认覆盖常见 Windows DPI 倍率：
+`0.67`、`0.80`、`0.83`、`1.00`、`1.20`、`1.25`、`1.50`（并受自定义范围
+限制）。`auto` 使用上一命中位置和尺度、多尺度低分辨率粗匹配、跨位置/尺度
+候选筛选及对应缩放模板的原图局部复核；结果不确定时才执行受控的全区域 NCC
+fallback。`fast` 保留多尺度粗匹配和局部复核，但不执行全区域 fallback。
+`exact` 固定使用 1.0 倍全分辨率 NCC，明确不负责跨尺度匹配。
+
+返回 Map 在原有 `found`、坐标、尺寸和 `score` 外还包含
 `total_ms`、`capture_ms`、`prepare_ms`、`coarse_ms`、`refine_ms`、
-`fallback_ms`、`candidate_count`、`previous_hit_used`、`fallback_used` 和
-`matcher_mode`；旧脚本不读取这些字段时行为不变。
+`fallback_ms`、`candidate_count`、`previous_hit_used`、`fallback_used`、
+`matcher_mode`、`matched_scale`、`scale_candidates`、`scale_search_ms`、
+`matched_width` 和 `matched_height`。命中时 `matched_width`/`matched_height`
+是实际缩放模板尺寸，未命中时 `matched_scale` 为 Rhai 空值 `()`，尺寸为
+`0`。旧脚本不读取这些字段时行为不变；图片仍必须使用 `data/images` 中的
+完整文件名，资源扩展名规则不变。
 
 避免没有等待的无限循环。即使引擎有操作数限制，这类循环仍会快速消耗执行预算，也会让目标程序接收过多输入。
 

@@ -9,6 +9,7 @@ const HEIGHT: u32 = 1_080;
 const TEMPLATE_WIDTH: u32 = 45;
 const TEMPLATE_HEIGHT: u32 = 41;
 const THRESHOLD: f32 = 0.92;
+const HIT_AT_END: (u32, u32) = (WIDTH - TEMPLATE_WIDTH, HEIGHT - TEMPLATE_HEIGHT);
 const MOVED_TO: (u32, u32) = (812, 437);
 
 #[derive(Debug)]
@@ -33,6 +34,16 @@ pub fn run_vision_benchmark() -> String {
     let matcher = ImageProcVisionMatcher::new();
     let options = MatcherOptions::default();
 
+    // Keep the original scale-one benchmark cases as a regression baseline.
+    let hit = scaled_case("hit", 1.0, 0xA11CE, HIT_AT_END, &template);
+    let miss = BenchCase {
+        name: "miss",
+        frame: synthetic_frame(0xA11CE, None, &template),
+        expected: None,
+        expected_scale: None,
+    };
+    let moved_hit = scaled_case("moved-hit", 1.0, 0xA11CE, MOVED_TO, &template);
+
     let scale_080 = scaled_case(
         "scale-0.80-hit",
         0.80,
@@ -44,7 +55,7 @@ pub fn run_vision_benchmark() -> String {
         "scale-1.00-hit",
         1.00,
         0xA11CE,
-        scale_target(1.50),
+        scale_target(1.00),
         &template,
     );
     let scale_125 = scaled_case(
@@ -69,7 +80,7 @@ pub fn run_vision_benchmark() -> String {
         scale_target(1.50),
         &template,
     );
-    let miss = BenchCase {
+    let multiscale_miss = BenchCase {
         name: "multiscale-miss",
         frame: synthetic_frame(0xA11CE, None, &template),
         expected: None,
@@ -84,7 +95,15 @@ pub fn run_vision_benchmark() -> String {
     ));
     report.push_str(&format!("prepared_template_ms={prepare_ms}\n"));
 
-    for case in [&scale_080, &scale_100, &scale_125, &scale_150, &miss] {
+    for case in [
+        &hit,
+        &miss,
+        &scale_080,
+        &scale_100,
+        &scale_125,
+        &scale_150,
+        &multiscale_miss,
+    ] {
         append_case(
             &mut report,
             &matcher,
@@ -95,6 +114,52 @@ pub fn run_vision_benchmark() -> String {
             false,
         );
     }
+
+    let original_repeat_target = hit.expected.expect("original repeat target");
+    let original_repeat_region =
+        previous_region(original_repeat_target, (TEMPLATE_WIDTH, TEMPLATE_HEIGHT));
+    let original_repeat_started = Instant::now();
+    let original_repeat_frame = hit
+        .frame
+        .crop(original_repeat_region)
+        .expect("original repeat ROI");
+    let mut original_repeat_result = matcher
+        .find_prepared_template(
+            &original_repeat_frame,
+            prepared.frame(),
+            Some(&prepared),
+            THRESHOLD,
+            &options,
+        )
+        .expect("original repeat optimized match");
+    original_repeat_result.diagnostics.previous_hit_used = true;
+    original_repeat_result.diagnostics.total_ms =
+        original_repeat_started.elapsed().as_millis() as u64;
+    let original_repeat = BenchCase {
+        name: "repeat-hit",
+        frame: hit.frame.clone(),
+        expected: hit.expected,
+        expected_scale: hit.expected_scale,
+    };
+    append_result(
+        &mut report,
+        &matcher,
+        &prepared,
+        &options,
+        &original_repeat,
+        original_repeat_result,
+        0,
+    );
+
+    append_case(
+        &mut report,
+        &matcher,
+        &prepared,
+        &options,
+        &moved_hit,
+        0,
+        false,
+    );
 
     let repeat_target = scale_125.expected.expect("repeat target");
     let repeat_dimensions = scaled_dimensions(1.25);
@@ -160,10 +225,8 @@ pub fn run_vision_benchmark() -> String {
     );
 
     let changed_started = Instant::now();
-    let changed_previous_region = previous_region(
-        scale_100.expected.expect("changed target"),
-        scaled_dimensions(1.0),
-    );
+    let changed_target = changed.expected.expect("changed target");
+    let changed_previous_region = previous_region(changed_target, scaled_dimensions(1.0));
     let changed_previous_frame = changed
         .frame
         .crop(changed_previous_region)

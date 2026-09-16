@@ -26,6 +26,16 @@ struct CachedScaledTemplate {
     last_used: SystemTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ScaledTemplateKey {
+    resource_id: String,
+    file_name: String,
+    fingerprint: String,
+    scale_bits: u32,
+    width: u32,
+    height: u32,
+}
+
 #[derive(Debug)]
 pub struct PreparedScale {
     scale: f32,
@@ -87,6 +97,11 @@ impl PreparedScale {
                 .as_ref()
                 .map(|image| image.as_raw().len())
                 .unwrap_or(0)
+            + self
+                .quarter_gray
+                .as_ref()
+                .map(|image| image.as_raw().len())
+                .unwrap_or(0)
     }
 }
 
@@ -101,7 +116,7 @@ pub struct PreparedTemplate {
     sum: f64,
     sum_squares: f64,
     variance: f64,
-    scaled_templates: Mutex<HashMap<u32, CachedScaledTemplate>>,
+    scaled_templates: Mutex<HashMap<ScaledTemplateKey, CachedScaledTemplate>>,
 }
 
 impl PreparedTemplate {
@@ -195,17 +210,24 @@ impl PreparedTemplate {
 
     pub fn scaled_template(&self, scale: f32) -> Result<Arc<PreparedScale>, VisionError> {
         validate_scale(scale)?;
-        let scale_key = scale.to_bits();
+        let width = scaled_dimension(self.frame.width, scale)?;
+        let height = scaled_dimension(self.frame.height, scale)?;
+        validate_template_dimensions(width, height)?;
+        let cache_key = ScaledTemplateKey {
+            resource_id: self.resource_id.clone(),
+            file_name: self.file_name.clone(),
+            fingerprint: self.fingerprint.clone(),
+            scale_bits: scale.to_bits(),
+            width,
+            height,
+        };
         if let Ok(mut cache) = self.scaled_templates.lock() {
-            if let Some(cached) = cache.get_mut(&scale_key) {
+            if let Some(cached) = cache.get_mut(&cache_key) {
                 cached.last_used = SystemTime::now();
                 return Ok(Arc::clone(&cached.template));
             }
         }
 
-        let width = scaled_dimension(self.frame.width, scale)?;
-        let height = scaled_dimension(self.frame.height, scale)?;
-        validate_template_dimensions(width, height)?;
         let gray = if width == self.frame.width && height == self.frame.height {
             self.gray.clone()
         } else {
@@ -254,14 +276,14 @@ impl PreparedTemplate {
                     let Some(oldest) = cache
                         .iter()
                         .min_by_key(|(_, cached)| cached.last_used)
-                        .map(|(key, _)| *key)
+                        .map(|(key, _)| key.clone())
                     else {
                         break;
                     };
                     cache.remove(&oldest);
                 }
                 cache.insert(
-                    scale_key,
+                    cache_key,
                     CachedScaledTemplate {
                         template: Arc::clone(&prepared),
                         last_used: SystemTime::now(),
@@ -364,6 +386,19 @@ impl ImageProcVisionMatcher {
             || prepared.variance() < LOW_VARIANCE_FLOOR
             || prepared.frame.width.min(prepared.frame.height) < COARSE_TEMPLATE_MIN_SIDE;
         if direct_only {
+            // A fixed-scale safe path is required for low-variance and tiny
+            // templates because normalized coarse scores are undefined. Do
+            // not advertise scales that this path did not actually test.
+            diagnostics.scale_candidates = vec![1.0];
+            if options.mode == MatcherMode::Fast {
+                // Fast mode never turns an ineligible template into an
+                // expensive full-area fallback. Returning no hit is safer
+                // than accepting an unbounded or undefined score.
+                return Ok(MatcherResult {
+                    image: None,
+                    diagnostics: finish_diagnostics(diagnostics, started),
+                });
+            }
             let scale_started = Instant::now();
             let mut best = None;
             for scale in [1.0] {
@@ -371,7 +406,12 @@ impl ImageProcVisionMatcher {
                 if scaled.width() > frame.width || scaled.height() > frame.height {
                     continue;
                 }
-                let candidate = self.full_match_scaled(frame, &image, &scaled)?;
+                let candidate = self.full_match_scaled(
+                    frame,
+                    &image,
+                    &scaled,
+                    options.mode != MatcherMode::Exact,
+                )?;
                 if candidate.as_ref().is_some_and(|candidate| {
                     best.as_ref().is_none_or(|current: &RefinedCandidate| {
                         candidate.score > current.image.score
@@ -380,8 +420,13 @@ impl ImageProcVisionMatcher {
                     best = candidate.map(|image| RefinedCandidate { image, scale });
                 }
             }
-            diagnostics.scale_search_ms = scale_started.elapsed().as_millis() as u64;
-            diagnostics.refine_ms = diagnostics.scale_search_ms;
+            let direct_elapsed = scale_started.elapsed().as_millis() as u64;
+            diagnostics.scale_search_ms = direct_elapsed;
+            diagnostics.refine_ms = direct_elapsed;
+            if options.mode == MatcherMode::Auto {
+                diagnostics.fallback_ms = direct_elapsed;
+                diagnostics.fallback_used = true;
+            }
             diagnostics.candidate_count = usize::from(best.is_some());
             if let Some(best) = best {
                 diagnostics.refined_score = best.image.score;
@@ -400,29 +445,41 @@ impl ImageProcVisionMatcher {
         }
 
         let coarse_started = Instant::now();
-        let half_image = resize(
+        // A quarter-resolution pass keeps the bounded seven-scale search
+        // practical for a normal 1920x1080 desktop. Smaller synthetic/test
+        // frames keep the older half-resolution path so the local refine
+        // radius remains precise relative to the frame.
+        let coarse_factor = if frame.width >= 1024
+            && frame.height >= 720
+            && prepared.frame.width.min(prepared.frame.height) >= 24
+        {
+            4
+        } else {
+            2
+        };
+        let coarse_image = resize(
             &image,
-            frame.width.div_ceil(2),
-            frame.height.div_ceil(2),
+            frame.width.div_ceil(coarse_factor),
+            frame.height.div_ceil(coarse_factor),
             FilterType::Triangle,
         );
         let mut coarse_best = None;
         let mut all_candidates = Vec::new();
         for scale in &scales {
             let scaled = prepared.scaled_template(*scale)?;
-            let Some(half_template) = scaled.half_gray() else {
+            let Some(coarse_template) = scaled.coarse_gray(coarse_factor) else {
                 continue;
             };
             if scaled.width() > frame.width
                 || scaled.height() > frame.height
-                || half_template.width() > half_image.width()
-                || half_template.height() > half_image.height()
+                || coarse_template.width() > coarse_image.width()
+                || coarse_template.height() > coarse_image.height()
             {
                 continue;
             }
             let coarse_scores = match_template_parallel(
-                &half_image,
-                half_template,
+                &coarse_image,
+                coarse_template,
                 MatchTemplateMethod::CrossCorrelationNormalized,
             );
             let (best, candidates) = coarse_candidates_for_scale(
@@ -430,6 +487,7 @@ impl ImageProcVisionMatcher {
                 frame,
                 Arc::clone(&scaled),
                 options.max_candidates,
+                coarse_factor,
             );
             coarse_best = match (coarse_best, best) {
                 (Some(left), Some(right)) => Some(left.max(right)),
@@ -445,11 +503,10 @@ impl ImageProcVisionMatcher {
                 diagnostics: finish_diagnostics(diagnostics, started),
             });
         };
-        let candidate_budget = options
-            .max_candidates
-            .max(scales.len().saturating_mul(2))
-            .min(32);
-        let candidates = cross_scale_nms(all_candidates, candidate_budget);
+        // `max_candidates` is a hard total budget. The NMS stage first keeps
+        // one best coarse hypothesis for each scale while that budget allows,
+        // then fills remaining slots only with non-overlapping hypotheses.
+        let candidates = cross_scale_nms(all_candidates, options.max_candidates);
         diagnostics.candidate_count = candidates.len();
         diagnostics.coarse_score = coarse_best;
         let coarse_gate = (threshold - COARSE_GATE_MARGIN).max(COARSE_MIN_CONFIDENCE);
@@ -501,7 +558,7 @@ impl ImageProcVisionMatcher {
                 continue;
             }
             fallback_scales.push(candidate.scale());
-            let full = self.full_match_scaled(frame, &image, candidate.template())?;
+            let full = self.full_match_scaled(frame, &image, candidate.template(), true)?;
             if full.as_ref().is_some_and(|full| {
                 fallback_best
                     .as_ref()
@@ -539,6 +596,7 @@ impl ImageProcVisionMatcher {
         frame: &CaptureFrame,
         image: &GrayImage,
         template: &PreparedScale,
+        verify_zero_mean: bool,
     ) -> Result<Option<ImageMatch>, VisionError> {
         let scores = match_template_parallel(
             image,
@@ -550,21 +608,23 @@ impl ImageProcVisionMatcher {
         else {
             return Ok(None);
         };
-        let local_x = u32::try_from(i64::from(best.x) - i64::from(frame.origin.x))
-            .map_err(|_| VisionError::new("vision_match_failed", "匹配坐标超出帧范围"))?;
-        let local_y = u32::try_from(i64::from(best.y) - i64::from(frame.origin.y))
-            .map_err(|_| VisionError::new("vision_match_failed", "匹配坐标超出帧范围"))?;
-        let Some(score) = normalized_ncc_at(
-            image,
-            template.gray(),
-            template.sum(),
-            template.sum_squares(),
-            local_x,
-            local_y,
-        ) else {
-            return Ok(None);
-        };
-        best.score = score;
+        if verify_zero_mean {
+            let local_x = u32::try_from(i64::from(best.x) - i64::from(frame.origin.x))
+                .map_err(|_| VisionError::new("vision_match_failed", "匹配坐标超出帧范围"))?;
+            let local_y = u32::try_from(i64::from(best.y) - i64::from(frame.origin.y))
+                .map_err(|_| VisionError::new("vision_match_failed", "匹配坐标超出帧范围"))?;
+            let Some(score) = normalized_ncc_at(
+                image,
+                template.gray(),
+                template.sum(),
+                template.sum_squares(),
+                local_x,
+                local_y,
+            ) else {
+                return Ok(None);
+            };
+            best.score = score;
+        }
         Ok(Some(best))
     }
 
@@ -693,6 +753,7 @@ fn coarse_candidates_for_scale(
     frame: &CaptureFrame,
     template: Arc<PreparedScale>,
     max_candidates: usize,
+    coarse_factor: u32,
 ) -> (Option<f32>, Vec<CoarseCandidate>) {
     let template_width = template.width();
     let template_height = template.height();
@@ -705,8 +766,8 @@ fn coarse_candidates_for_scale(
             if !score.is_finite() {
                 return None;
             }
-            let x = x.saturating_mul(2).min(max_x);
-            let y = y.saturating_mul(2).min(max_y);
+            let x = x.saturating_mul(coarse_factor).min(max_x);
+            let y = y.saturating_mul(coarse_factor).min(max_y);
             let region = ScreenRect::from_parts(
                 frame.origin.x.saturating_add(i32::try_from(x).ok()?),
                 frame.origin.y.saturating_add(i32::try_from(y).ok()?),
@@ -766,25 +827,18 @@ fn cross_scale_nms(
             .then_with(|| left.scale().total_cmp(&right.scale()))
     });
     let mut selected = Vec::with_capacity(max_candidates);
-    let mut scale_counts = Vec::<(u32, usize)>::new();
+    let mut selected_scales = Vec::<u32>::new();
     for candidate in &candidates {
+        if selected.len() >= max_candidates {
+            break;
+        }
         let scale_key = candidate.scale().to_bits();
-        let count = scale_counts
-            .iter_mut()
-            .find(|(key, _)| *key == scale_key)
-            .map(|(_, count)| {
-                *count += 1;
-                *count
-            })
-            .unwrap_or_else(|| {
-                scale_counts.push((scale_key, 1));
-                1
-            });
-        if count <= 2 {
+        let already_selected = selected_scales.contains(&scale_key);
+        if !already_selected {
+            selected_scales.push(scale_key);
             selected.push(candidate.clone());
         }
     }
-    selected.truncate(max_candidates);
     if selected.len() < max_candidates {
         for candidate in candidates {
             if selected.len() >= max_candidates {
@@ -1439,6 +1493,41 @@ mod tests {
             0xFACE,
         );
         let matcher = ImageProcVisionMatcher::new();
+        let exact_scale_one_image = scaled_patterned_frame(
+            Point { x: 0, y: 0 },
+            160,
+            120,
+            &template,
+            (60, 30),
+            1.0,
+            0xFACE,
+        );
+        let exact_scale_one_result = matcher
+            .find_template_with_options(
+                &exact_scale_one_image,
+                &template,
+                0.99,
+                &MatcherOptions {
+                    mode: MatcherMode::Exact,
+                    ..MatcherOptions::default()
+                },
+            )
+            .expect("exact scale-one mode");
+        let exact_scale_one = exact_scale_one_result.image.expect("exact scale-one hit");
+        assert_eq!(
+            (
+                exact_scale_one.x,
+                exact_scale_one.y,
+                exact_scale_one.width,
+                exact_scale_one.height
+            ),
+            (60, 30, 24, 24)
+        );
+        assert_eq!(
+            exact_scale_one_result.diagnostics.scale_candidates,
+            vec![1.0]
+        );
+        assert!(!exact_scale_one_result.diagnostics.fallback_used);
         let exact = matcher
             .find_template_with_options(
                 &image,
@@ -1452,8 +1541,10 @@ mod tests {
             .expect("exact mode");
         assert!(exact.image.is_none());
         assert_eq!(exact.diagnostics.scale_candidates, vec![1.0]);
+        assert!(!exact.diagnostics.fallback_used);
+        assert_eq!(exact.diagnostics.coarse_ms, 0);
 
-        let fast = matcher
+        let fast_result = matcher
             .find_template_with_options(
                 &image,
                 &template,
@@ -1463,10 +1554,118 @@ mod tests {
                     ..MatcherOptions::default()
                 },
             )
-            .expect("fast mode")
-            .image
-            .expect("fast multiscale hit");
+            .expect("fast mode");
+        let fast = fast_result.image.expect("fast multiscale hit");
         assert_eq!((fast.x, fast.y, fast.width, fast.height), (60, 30, 30, 30));
+        assert!(!fast_result.diagnostics.fallback_used);
+        assert!((fast_result.diagnostics.matched_scale.expect("fast scale") - 1.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn highest_original_score_wins_across_scale_candidates() {
+        let (template, _, _) = test_template();
+        let true_target = (70_u32, 30_u32);
+        let weaker_target = (10_u32, 12_u32);
+        let mut image = scaled_patterned_frame(
+            Point { x: 0, y: 0 },
+            160,
+            120,
+            &template,
+            true_target,
+            1.25,
+            0x1234,
+        );
+        let gray = ImageProcVisionMatcher::gray(&template).expect("template gray");
+        let weaker = resize(&gray, 19, 19, FilterType::Triangle);
+        let mut pixels = image.pixels_bgra().to_vec();
+        for y in 0..weaker.height() {
+            for x in 0..weaker.width() {
+                let value = if x == 3 && y == 3 {
+                    weaker.get_pixel(x, y).0[0].wrapping_add(70)
+                } else {
+                    weaker.get_pixel(x, y).0[0]
+                };
+                let target_index =
+                    (((weaker_target.1 + y) * 160 + weaker_target.0 + x) * 4) as usize;
+                pixels[target_index..target_index + 4].copy_from_slice(&[value, value, value, 255]);
+            }
+        }
+        image = CaptureFrame::from_bgra(Point { x: 0, y: 0 }, 160, 120, pixels)
+            .expect("multi-scale candidates");
+
+        let result = ImageProcVisionMatcher::new()
+            .find_template_with_options(&image, &template, 0.99, &MatcherOptions::default())
+            .expect("multi-scale candidate match");
+        let found = result.image.expect("highest scale candidate");
+        assert_eq!(
+            (found.x, found.y),
+            (true_target.0 as i32, true_target.1 as i32)
+        );
+        assert_eq!((found.width, found.height), (30, 30));
+        assert!((result.diagnostics.matched_scale.expect("winning scale") - 1.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn scaled_template_cache_is_reused_and_bounded() {
+        let (template, _, _) = test_template();
+        let prepared = PreparedTemplate::from_frame(
+            "asset-id",
+            "button.png",
+            "fingerprint-a",
+            Arc::new(template),
+        )
+        .expect("prepared template");
+        let first = prepared.scaled_template(1.25).expect("first scale");
+        let second = prepared.scaled_template(1.25).expect("cached scale");
+        assert!(Arc::ptr_eq(&first, &second));
+        for index in 0..31 {
+            let scale = 0.5 + index as f32 * 0.05;
+            prepared.scaled_template(scale).expect("bounded scale");
+        }
+        let cache = prepared.scaled_templates.lock().expect("scale cache");
+        assert!(cache.len() <= MAX_SCALED_TEMPLATE_CACHE_ENTRIES);
+        assert!(
+            cache
+                .values()
+                .map(|cached| cached.template.memory_bytes())
+                .sum::<usize>()
+                <= MAX_SCALED_TEMPLATE_CACHE_BYTES
+        );
+    }
+
+    #[test]
+    fn scaled_template_larger_than_frame_and_miss_diagnostics_are_safe() {
+        let (template, _, _) = test_template();
+        let frame = patterned_frame(
+            Point { x: 0, y: 0 },
+            24,
+            24,
+            &[24, 24],
+            &vec![[5, 11, 23, 255]; 24 * 24],
+            None,
+            0xCAFE,
+        );
+        let result = ImageProcVisionMatcher::new()
+            .find_template_with_options(
+                &frame,
+                &template,
+                0.99,
+                &MatcherOptions {
+                    scale_min: 1.5,
+                    scale_max: 1.5,
+                    ..MatcherOptions::default()
+                },
+            )
+            .expect("scaled template should be skipped safely");
+        assert!(result.image.is_none());
+        assert!(result.diagnostics.matched_scale.is_none());
+        assert_eq!(
+            (
+                result.diagnostics.matched_width,
+                result.diagnostics.matched_height
+            ),
+            (0, 0)
+        );
     }
 
     #[test]
