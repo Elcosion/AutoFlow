@@ -11,13 +11,21 @@ export type TextHistory = {
 
 export const emptyTextHistory = (): TextHistory => ({ undo: [], redo: [] });
 
+function appendRecentSnapshots(
+  snapshots: TextSnapshot[],
+  current: TextSnapshot,
+  limit: number,
+): TextSnapshot[] {
+  return limit > 0 ? [...snapshots, current].slice(-limit) : [];
+}
+
 export function recordTextEdit(
   history: TextHistory,
   current: TextSnapshot,
   limit = 100,
 ): TextHistory {
   return {
-    undo: [...history.undo, current].slice(-limit),
+    undo: appendRecentSnapshots(history.undo, current, limit),
     redo: [],
   };
 }

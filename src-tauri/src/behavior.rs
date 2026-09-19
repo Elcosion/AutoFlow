@@ -464,7 +464,7 @@ impl BehaviorProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BehaviorRecordingStatus {
     pub active: bool,
@@ -481,7 +481,7 @@ pub struct BehaviorRecordingStatus {
     pub session_name: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct BehaviorRecordingResult {
     pub profile: BehaviorProfile,
     pub persist_raw_session: bool,
@@ -555,8 +555,10 @@ impl SampleStats {
 pub struct BehaviorRecorder {
     active: bool,
     capture_started: bool,
+    capture_incomplete: bool,
     session_name: Option<String>,
     started_at: Option<Instant>,
+    stopped_at: Option<Instant>,
     event_count: u64,
     keyboard_events: u64,
     mouse_events: u64,
@@ -601,6 +603,12 @@ impl BehaviorRecorder {
                 "行为训练录制已经在进行中",
             ));
         }
+        if self.stopped_at.is_some() {
+            return Err(AppError::invalid(
+                "behavior_recording_pending",
+                "行为训练录制已冻结，请先保存或丢弃",
+            ));
+        }
         *self = Self::default();
         self.active = true;
         self.session_name = Some(name.to_string());
@@ -609,13 +617,30 @@ impl BehaviorRecorder {
         Ok(())
     }
 
+    pub fn freeze_capture(&mut self, complete: bool) {
+        if self.active || self.stopped_at.is_some() {
+            if self.stopped_at.is_none() {
+                self.stopped_at = Some(Instant::now());
+            }
+            self.active = false;
+            if !complete {
+                self.capture_incomplete = true;
+            }
+        }
+    }
+
     pub fn status(&self) -> BehaviorRecordingStatus {
         BehaviorRecordingStatus {
             active: self.active,
             capture_started: self.capture_started,
             duration_ms: self
                 .started_at
-                .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .map(|started| {
+                    let end = self.stopped_at.unwrap_or_else(Instant::now);
+                    end.saturating_duration_since(started)
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64
+                })
                 .unwrap_or(0),
             event_count: self.event_count,
             keyboard_events: self.keyboard_events,
@@ -631,11 +656,15 @@ impl BehaviorRecorder {
         *self = Self::default();
     }
 
+    #[cfg(test)]
     pub fn record_key(&mut self, key: u32, scan_code: u32, is_down: bool) {
+        self.record_key_at(key, scan_code, is_down, Instant::now());
+    }
+
+    pub(crate) fn record_key_at(&mut self, key: u32, scan_code: u32, is_down: bool, now: Instant) {
         if !self.accept_event() {
             return;
         }
-        let now = Instant::now();
         self.retain_event(BehaviorEvent::Key {
             timestamp_ms: self.timestamp_ms(now),
             vk: key,
@@ -656,11 +685,15 @@ impl BehaviorRecorder {
         }
     }
 
+    #[cfg(test)]
     pub fn record_mouse_move(&mut self, x: i32, y: i32) {
+        self.record_mouse_move_at(x, y, Instant::now());
+    }
+
+    pub(crate) fn record_mouse_move_at(&mut self, x: i32, y: i32, now: Instant) {
         if !self.accept_event() {
             return;
         }
-        let now = Instant::now();
         self.retain_event(BehaviorEvent::MouseMove {
             timestamp_ms: self.timestamp_ms(now),
             x,
@@ -668,7 +701,7 @@ impl BehaviorRecorder {
         });
         self.mouse_events += 1;
         if let Some((previous_at, previous_x, previous_y)) = self.last_mouse {
-            let elapsed = previous_at.elapsed();
+            let elapsed = now.saturating_duration_since(previous_at);
             let elapsed_ms = duration_ms(elapsed);
             let dx = (x - previous_x) as f32;
             let dy = (y - previous_y) as f32;
@@ -692,11 +725,22 @@ impl BehaviorRecorder {
         self.last_mouse = Some((now, x, y));
     }
 
+    #[cfg(test)]
     pub fn record_mouse_button(&mut self, button: u8, is_down: bool, x: i32, y: i32) {
+        self.record_mouse_button_at(button, is_down, x, y, Instant::now());
+    }
+
+    pub(crate) fn record_mouse_button_at(
+        &mut self,
+        button: u8,
+        is_down: bool,
+        x: i32,
+        y: i32,
+        now: Instant,
+    ) {
         if !self.accept_event() {
             return;
         }
-        let now = Instant::now();
         self.retain_event(BehaviorEvent::MouseButton {
             timestamp_ms: self.timestamp_ms(now),
             button,
@@ -718,10 +762,22 @@ impl BehaviorRecorder {
         }
     }
 
+    #[cfg(test)]
     pub fn record_wheel(&mut self, delta_x: i32, delta_y: i32, x: i32, y: i32) {
+        self.record_wheel_at(delta_x, delta_y, x, y, Instant::now());
+    }
+
+    pub(crate) fn record_wheel_at(
+        &mut self,
+        delta_x: i32,
+        delta_y: i32,
+        x: i32,
+        y: i32,
+        now: Instant,
+    ) {
         if self.accept_event() {
             self.retain_event(BehaviorEvent::Wheel {
-                timestamp_ms: self.timestamp_ms(Instant::now()),
+                timestamp_ms: self.timestamp_ms(now),
                 delta_x,
                 delta_y,
                 x,
@@ -733,7 +789,13 @@ impl BehaviorRecorder {
     }
 
     pub fn stop(&mut self) -> Result<BehaviorRecordingResult, AppError> {
-        if !self.active {
+        if self.capture_incomplete {
+            return Err(AppError::invalid(
+                "behavior_capture_incomplete",
+                "行为训练录制未完整结束，无法保存",
+            ));
+        }
+        if !self.active && self.stopped_at.is_none() {
             return Err(AppError::invalid(
                 "behavior_recording_inactive",
                 "当前没有正在进行的行为训练录制",
@@ -741,7 +803,12 @@ impl BehaviorRecorder {
         }
         let duration_ms = self
             .started_at
-            .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            .map(|started| {
+                let end = self.stopped_at.unwrap_or_else(Instant::now);
+                end.saturating_duration_since(started)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            })
             .unwrap_or(0);
         if self.event_count < MIN_BEHAVIOR_EVENTS {
             self.reset();
@@ -1122,6 +1189,35 @@ mod tests {
     use super::*;
     use std::thread;
 
+    #[test]
+    fn captured_timestamps_drive_raw_events_hold_times_and_mouse_speed() {
+        let mut recorder = BehaviorRecorder::default();
+        recorder.start("captured clock", true).expect("record");
+        let started = recorder.started_at.expect("clock");
+        let at = |ms| started + Duration::from_millis(ms);
+        // Synthetic event clock deliberately differs from processing time;
+        // no sleep or real input is required to expose elapsed()-based timing.
+        recorder.record_key_at(0x41, 0, true, at(2000));
+        recorder.record_key_at(0x41, 0, false, at(2050));
+        recorder.record_mouse_button_at(1, true, 20, 20, at(2060));
+        recorder.record_mouse_button_at(1, false, 20, 20, at(2140));
+        recorder.record_mouse_move_at(0, 0, at(2150));
+        recorder.record_mouse_move_at(60, 0, at(2210));
+        recorder.record_wheel_at(0, 120, 60, 0, at(2220));
+        assert_eq!(recorder.key_hold_ms.values, [50.0]);
+        assert_eq!(recorder.click_hold_ms.values, [80.0]);
+        assert!((recorder.mouse_speed_px_per_sec.values[0] - 1000.0).abs() < 0.1);
+        let serialized = serde_json::to_value(&recorder.raw_events).expect("raw events");
+        let timestamps: Vec<u64> = serialized
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|event| event["timestampMs"].as_u64().expect("timestamp"))
+            .collect();
+        assert_eq!(timestamps, [2000, 2050, 2060, 2140, 2150, 2210, 2220]);
+        assert_eq!(recorder.event_count, 7);
+    }
+
     fn recorder_with_events() -> BehaviorProfile {
         let mut recorder = BehaviorRecorder::default();
         recorder.start("测试档案", true).unwrap();
@@ -1184,6 +1280,54 @@ mod tests {
         assert!(!result.persist_raw_session);
         assert_eq!(result.profile.sample_count, MAX_BEHAVIOR_EVENTS);
         assert_eq!(result.profile.raw_events.len() as u64, MAX_BEHAVIOR_EVENTS);
+    }
+
+    #[test]
+    fn frozen_complete_capture_is_retained_and_claimable_once() {
+        let mut recorder = BehaviorRecorder::default();
+        recorder.start("冻结完整", false).unwrap();
+        for index in 0..8 {
+            recorder.record_key(65 + index, 30 + index, true);
+        }
+        recorder.started_at = Some(Instant::now() - std::time::Duration::from_millis(100));
+        let started = recorder.started_at.unwrap();
+        recorder.freeze_capture(true);
+        recorder.stopped_at = Some(started + std::time::Duration::from_millis(50));
+        assert!(!recorder.active);
+        assert_eq!(recorder.event_count, 8);
+        let stopped_first = recorder.stopped_at;
+        recorder.freeze_capture(true);
+        assert_eq!(recorder.stopped_at, stopped_first);
+        assert_eq!(recorder.status().duration_ms, 50);
+        let error = recorder.start("再来一次", false).unwrap_err();
+        assert_eq!(error.code, "behavior_recording_pending");
+        let result = recorder.stop().unwrap();
+        assert_eq!(result.profile.sample_count, 8);
+        assert_eq!(result.profile.duration_ms, 50);
+        assert_eq!(result.profile.raw_events.len(), 8);
+        let error = recorder.stop().unwrap_err();
+        assert_eq!(error.code, "behavior_recording_inactive");
+    }
+
+    #[test]
+    fn incomplete_freeze_blocks_stop_and_start_stickily() {
+        let mut recorder = BehaviorRecorder::default();
+        recorder.start("冻结未完整", false).unwrap();
+        for index in 0..8 {
+            recorder.record_key(65 + index, 30 + index, true);
+        }
+        recorder.freeze_capture(false);
+        assert!(!recorder.active);
+        assert_eq!(recorder.event_count, 8);
+        let error = recorder.stop().unwrap_err();
+        assert_eq!(error.code, "behavior_capture_incomplete");
+        let error = recorder.start("再来一次", false).unwrap_err();
+        assert_eq!(error.code, "behavior_recording_pending");
+        assert_eq!(recorder.event_count, 8);
+        recorder.freeze_capture(true);
+        assert!(recorder.capture_incomplete);
+        let error = recorder.stop().unwrap_err();
+        assert_eq!(error.code, "behavior_capture_incomplete");
     }
 
     #[test]

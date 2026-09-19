@@ -1,4 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
+
+export type RuntimeNotification = {
+  id: number;
+  title: string;
+  message: string;
+};
+
+export async function takeRuntimeNotification(): Promise<RuntimeNotification | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<RuntimeNotification | null>("take_runtime_notification");
+}
+
+export async function acknowledgeRuntimeNotification(
+  id: number,
+): Promise<boolean> {
+  if (!isTauriRuntime()) return true;
+  return invoke<boolean>("acknowledge_runtime_notification", { id });
+}
 import {
   defaultConfig,
   type AppConfig,
@@ -42,6 +60,27 @@ export type MacroPlaybackStatus = {
   currentStep: number;
   totalSteps: number;
   lastError?: string;
+  playbackId: number;
+  macroId?: string;
+  macroName?: string;
+  programKind: "macro" | "rhai" | "unknown";
+  actionKind?: string;
+  actionSummary?: string;
+  elapsedMs: number;
+  phase:
+    | "idle"
+    | "starting"
+    | "running"
+    | "stopping"
+    | "cleaning"
+    | "completed"
+    | "stopped"
+    | "failed"
+    | "cleanup_failed"
+    | "fault_locked"
+    | "shutting_down";
+  cleanupStatus: "not_started" | "pending" | "safe" | "failed" | "unknown";
+  overlayVisible: boolean;
 };
 
 export type BehaviorRecordingStatus = {
@@ -521,6 +560,11 @@ export async function stopMacro(): Promise<void> {
   if (isTauriRuntime()) await invoke("stop_macro");
 }
 
+export async function recoverInputSafety(): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("安全恢复需要 Windows 桌面端");
+  await invoke("recover_input_safety");
+}
+
 export async function isMacroPlaying(): Promise<boolean> {
   if (!isTauriRuntime()) return false;
   return invoke<boolean>("is_macro_playing");
@@ -528,7 +572,17 @@ export async function isMacroPlaying(): Promise<boolean> {
 
 export async function getMacroPlaybackStatus(): Promise<MacroPlaybackStatus> {
   if (!isTauriRuntime()) {
-    return { running: false, currentStep: 0, totalSteps: 0 };
+    return {
+      running: false,
+      currentStep: 0,
+      totalSteps: 0,
+      playbackId: 0,
+      programKind: "unknown",
+      elapsedMs: 0,
+      phase: "idle",
+      cleanupStatus: "not_started",
+      overlayVisible: false,
+    };
   }
   return invoke<MacroPlaybackStatus>("get_macro_playback_status");
 }

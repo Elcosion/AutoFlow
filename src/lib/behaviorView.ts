@@ -27,14 +27,16 @@ export function getBucketTrainingView(
 }
 
 export function getBehaviorQualityView(profile: BehaviorProfileV2) {
-  const validEpisodeCount = Math.max(
-    0,
-    Math.floor(profile.coverage.validPointerEpisodeCount),
-  );
-  const eligibleEpisodeCount = Math.max(
-    0,
-    Math.floor(profile.coverage.eligibleEpisodeCount),
-  );
+  const validEpisodeCount = Number.isFinite(
+    profile.coverage.validPointerEpisodeCount,
+  )
+    ? Math.max(0, Math.floor(profile.coverage.validPointerEpisodeCount))
+    : 0;
+  const eligibleEpisodeCount = Number.isFinite(
+    profile.coverage.eligibleEpisodeCount,
+  )
+    ? Math.max(0, Math.floor(profile.coverage.eligibleEpisodeCount))
+    : 0;
   const eligibleCoverage = Math.min(
     1,
     Math.max(

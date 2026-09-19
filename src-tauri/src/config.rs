@@ -29,6 +29,10 @@ pub struct AppConfig {
     pub navigation_auto_collapse: bool,
     #[serde(default)]
     pub launch_at_startup: bool,
+    /// Whether the playback progress overlay is shown while a macro runs.
+    /// This is intentionally global; individual macros do not override it.
+    #[serde(default)]
+    pub show_playback_overlay: bool,
     #[serde(default)]
     pub hotkeys: Vec<HotkeyRule>,
     #[serde(default)]
@@ -322,6 +326,7 @@ impl Default for AppConfig {
             emergency_stop: "F12".to_string(),
             navigation_auto_collapse: false,
             launch_at_startup: false,
+            show_playback_overlay: false,
             hotkeys: vec![
                 HotkeyRule {
                     id: "capslock-to-escape".to_string(),
@@ -789,6 +794,21 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert!(AppConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn playback_overlay_defaults_to_disabled_and_legacy_configs_stay_disabled() {
+        let default_config = AppConfig::default();
+        assert!(!default_config.show_playback_overlay);
+
+        let mut saved = serde_json::to_value(default_config).expect("config should serialize");
+        saved
+            .as_object_mut()
+            .expect("config should be an object")
+            .remove("showPlaybackOverlay");
+        let restored: AppConfig = serde_json::from_value(saved)
+            .expect("legacy config without overlay setting should deserialize");
+        assert!(!restored.show_playback_overlay);
     }
 
     #[test]

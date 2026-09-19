@@ -94,6 +94,40 @@ describe("behavior model UI view contracts", () => {
     });
   });
 
+  it("normalizes non-finite quality counts and coverage", () => {
+    const nonFiniteCounts = getBehaviorQualityView({
+      ...profile,
+      coverage: {
+        ...profile.coverage,
+        validPointerEpisodeCount: Number.POSITIVE_INFINITY,
+        eligibleEpisodeCount: Number.NaN,
+        eligibleCoverage: Number.NaN,
+      },
+    });
+    expect(nonFiniteCounts).toMatchObject({
+      validEpisodeCount: 0,
+      eligibleEpisodeCount: 0,
+      eligibleCoverage: 0,
+    });
+    expect(Number.isFinite(nonFiniteCounts.eligibleCoverage)).toBe(true);
+
+    expect(
+      getBehaviorQualityView({
+        ...profile,
+        coverage: {
+          ...profile.coverage,
+          validPointerEpisodeCount: 35,
+          eligibleEpisodeCount: Number.NaN,
+          eligibleCoverage: Number.NaN,
+        },
+      }),
+    ).toMatchObject({
+      validEpisodeCount: 35,
+      eligibleEpisodeCount: 0,
+      eligibleCoverage: 0,
+    });
+  });
+
   it("makes unknown training geometry explicit", () => {
     expect(getTargetWidthTrainingView(profile)).toEqual({
       hasObservedTargetWidth: false,

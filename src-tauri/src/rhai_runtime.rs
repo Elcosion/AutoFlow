@@ -21,10 +21,10 @@ pub const MAX_RHAI_STRING_SIZE: usize = 1_000_000;
 pub(crate) const CANCELLED: &str = "脚本已被 F12 停止";
 const SCRIPT_STOP_REQUESTED: &str = "__autoflow_stop_with_message__";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptOutcome {
     Completed,
-    StoppedWithMessage,
+    StoppedWithMessage { title: String, message: String },
 }
 
 struct ScriptStopMessage {
@@ -46,6 +46,17 @@ pub trait AutomationInput: Send + Sync {
     fn move_to(&self, x: i32, y: i32) -> Result<(), String>;
     fn mouse_down(&self, button: &str, x: i32, y: i32) -> Result<(), String>;
     fn mouse_up(&self, button: &str, x: i32, y: i32) -> Result<(), String>;
+    /// Release paths must bypass the playback cancellation gate.  F12 may set
+    /// that gate before a script has released a button or key.
+    fn force_key_up(&self, key: &str) -> Result<(), String> {
+        self.key_up(key)
+    }
+    fn force_mouse_up(&self, button: &str) -> Result<(), String> {
+        self.mouse_up(button, 0, 0)
+    }
+    fn cleanup_injected_input(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn click(&self, button: &str, x: i32, y: i32) -> Result<(), String> {
         self.move_to(x, y)?;
         self.mouse_down(button, 0, 0)?;
@@ -88,6 +99,7 @@ pub struct ExecutionContext {
     input: Arc<dyn AutomationInput>,
     vision: Arc<dyn VisionApi>,
     budget: Arc<VisionPollBudget>,
+    action_progress: Option<Arc<dyn Fn(usize, String) + Send + Sync>>,
 }
 
 impl ExecutionContext {
@@ -113,6 +125,17 @@ impl ExecutionContext {
         progress: Option<Arc<dyn Fn(usize) + Send + Sync>>,
         vision: Arc<dyn VisionApi>,
     ) -> Self {
+        Self::new_with_vision_and_action_progress(input, cancel, speed, progress, None, vision)
+    }
+
+    pub fn new_with_vision_and_action_progress(
+        input: Arc<dyn AutomationInput>,
+        cancel: Arc<AtomicBool>,
+        speed: f32,
+        progress: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+        action_progress: Option<Arc<dyn Fn(usize, String) + Send + Sync>>,
+        vision: Arc<dyn VisionApi>,
+    ) -> Self {
         Self {
             cancel,
             speed: speed.max(0.05),
@@ -124,14 +147,18 @@ impl ExecutionContext {
             input,
             vision,
             budget: Arc::new(VisionPollBudget::new(progress)),
+            action_progress,
         }
     }
 
-    fn begin_action(&mut self) -> Result<(), String> {
+    fn begin_action(&mut self, name: &str) -> Result<(), String> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
         self.current_action = self.budget.consume().map_err(|error| error.message)?;
+        if let Some(progress) = &self.action_progress {
+            progress(self.current_action, name.to_string());
+        }
         Ok(())
     }
 
@@ -139,14 +166,34 @@ impl ExecutionContext {
         self.error_state = Some(error.to_string());
     }
 
-    fn release_all(&mut self) {
-        let keys = std::mem::take(&mut self.pressed_keys);
+    fn release_all(&mut self) -> Result<(), String> {
+        let keys = self.pressed_keys.iter().cloned().collect::<Vec<_>>();
+        let buttons = self
+            .pressed_mouse_buttons
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
         for key in keys {
-            let _ = self.input.key_up(&key);
+            match self.input.force_key_up(&key) {
+                Ok(()) => {
+                    self.pressed_keys.remove(&key);
+                }
+                Err(error) => failures.push(format!("key {key}: {error}")),
+            }
         }
-        let buttons = std::mem::take(&mut self.pressed_mouse_buttons);
         for button in buttons {
-            let _ = self.input.mouse_up(&button, 0, 0);
+            match self.input.force_mouse_up(&button) {
+                Ok(()) => {
+                    self.pressed_mouse_buttons.remove(&button);
+                }
+                Err(error) => failures.push(format!("button {button}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("输入释放失败: {}", failures.join("; ")))
         }
     }
 }
@@ -200,7 +247,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if milliseconds < 0 {
                 return Err("wait_ms 的参数必须是非负整数".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("wait_ms")?;
             context
                 .input
                 .wait_ms(milliseconds as u64, context.speed, context.cancel.as_ref())
@@ -216,7 +263,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if maximum < minimum {
                 return Err("wait_random_ms 的最大值不能小于最小值".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("wait_random_ms")?;
             context.input.wait_random_ms(
                 minimum as u64,
                 maximum as u64,
@@ -232,7 +279,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if key.is_empty() {
                 return Err("key_down 的按键名不能为空".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("key_down")?;
             context.input.key_down(&key)?;
             context.pressed_keys.insert(key);
             Ok(())
@@ -245,7 +292,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if key.is_empty() {
                 return Err("key_up 的按键名不能为空".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("key_up")?;
             context.input.key_up(&key)?;
             context.pressed_keys.remove(&key);
             Ok(())
@@ -258,7 +305,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if key.is_empty() {
                 return Err("press 的按键名不能为空".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("press")?;
             context.input.key_down(&key)?;
             context.pressed_keys.insert(key.clone());
             let result = context.input.key_up(&key);
@@ -273,7 +320,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn("move_to", move |x: i64, y: i64| {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
-            context.begin_action()?;
+            context.begin_action("move_to")?;
             context.input.move_to(x, y)
         })
     });
@@ -282,7 +329,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn("bio_move_to", move |x: i64, y: i64| {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
-            context.begin_action()?;
+            context.begin_action("bio_move_to")?;
             context
                 .input
                 .bio_move_to(x, y, None, false, context.cancel.as_ref())
@@ -294,7 +341,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
             let (target_width, followed_by_click) = parse_behavior_options(&options)?;
-            context.begin_action()?;
+            context.begin_action("bio_move_to")?;
             context.input.bio_move_to(
                 x,
                 y,
@@ -310,7 +357,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
             validate_button(&button)?;
-            context.begin_action()?;
+            context.begin_action("mouse_down")?;
             context.input.mouse_down(&button, x, y)?;
             context.pressed_mouse_buttons.insert(button);
             Ok(())
@@ -322,7 +369,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
             validate_button(&button)?;
-            context.begin_action()?;
+            context.begin_action("mouse_up")?;
             context.input.mouse_up(&button, x, y)?;
             context.pressed_mouse_buttons.remove(&button);
             Ok(())
@@ -333,7 +380,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn("click", move |button: String| {
         with_context(&current, |context| {
             validate_button(&button)?;
-            context.begin_action()?;
+            context.begin_action("click")?;
             context.input.click(&button, 0, 0)
         })
     });
@@ -343,7 +390,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
             validate_button(&button)?;
-            context.begin_action()?;
+            context.begin_action("click")?;
             context.input.click(&button, x, y)
         })
     });
@@ -352,7 +399,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn("click", move |x: i64, y: i64| {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
-            context.begin_action()?;
+            context.begin_action("click")?;
             let button = "left".to_string();
             context.input.click(&button, x, y)
         })
@@ -363,7 +410,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
         with_context(&current, |context| {
             let (x, y) = checked_coordinates(x, y)?;
             validate_button(&button)?;
-            context.begin_action()?;
+            context.begin_action("bio_click")?;
             context
                 .input
                 .bio_click(&button, x, y, None, context.cancel.as_ref())
@@ -378,7 +425,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let (x, y) = checked_coordinates(x, y)?;
                 validate_button(&button)?;
                 let (target_width, _) = parse_behavior_options(&options)?;
-                context.begin_action()?;
+                context.begin_action("bio_click")?;
                 context
                     .input
                     .bio_click(&button, x, y, target_width, context.cancel.as_ref())
@@ -390,7 +437,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn("scroll", move |delta_x: i64, delta_y: i64| {
         with_context(&current, |context| {
             let (delta_x, delta_y) = (checked_integer(delta_x)?, checked_integer(delta_y)?);
-            context.begin_action()?;
+            context.begin_action("scroll")?;
             context.input.scroll(delta_x, delta_y)
         })
     });
@@ -401,7 +448,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if text.is_empty() {
                 return Err("type_text 的文本不能为空".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("type_text")?;
             context.input.type_text(&text)
         })
     });
@@ -412,7 +459,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             if text.is_empty() {
                 return Err("bio_type_text 的文本不能为空".to_string());
             }
-            context.begin_action()?;
+            context.begin_action("bio_type_text")?;
             context.input.type_text(&text)
         })
     });
@@ -432,7 +479,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                     return Err("bio_type_text 当前只支持 mode=normal".to_string());
                 }
             }
-            context.begin_action()?;
+            context.begin_action("bio_type_text")?;
             context.input.type_text(&text)
         })
     });
@@ -448,7 +495,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     let current = Arc::clone(&state);
     engine.register_fn("active_window_title", move || {
         with_context(&current, |context| {
-            context.begin_action()?;
+            context.begin_action("active_window_title")?;
             context
                 .vision
                 .active_window_title()
@@ -459,7 +506,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     let current = Arc::clone(&state);
     engine.register_fn("window_exists", move |title_query: String| {
         with_context(&current, |context| {
-            context.begin_action()?;
+            context.begin_action("window_exists")?;
             context
                 .vision
                 .window_exists(&title_query)
@@ -470,7 +517,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     let current = Arc::clone(&state);
     engine.register_fn("window_rect", move |title_query: String| {
         with_context(&current, |context| {
-            context.begin_action()?;
+            context.begin_action("window_rect")?;
             context
                 .vision
                 .window_rect(&title_query)
@@ -486,7 +533,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             with_context(&current, |context| {
                 let timeout = checked_timeout(timeout_ms)?;
                 let poll = checked_poll(poll_ms)?;
-                context.begin_action()?;
+                context.begin_action("wait_window")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
@@ -508,7 +555,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let point = checked_point(x, y)?;
                 let expected = checked_rgb(red, green, blue)?;
                 let tolerance = checked_byte(tolerance, "tolerance")?;
-                context.begin_action()?;
+                context.begin_action("pixel_matches")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 vision
@@ -535,7 +582,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let tolerance = checked_byte(tolerance, "tolerance")?;
                 let timeout = checked_timeout(timeout_ms)?;
                 let poll = checked_poll(poll_ms)?;
-                context.begin_action()?;
+                context.begin_action("wait_pixel")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
@@ -563,7 +610,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
             with_context(&current, |context| {
                 let region = checked_region(region_x, region_y, region_width, region_height)?;
                 let threshold = checked_threshold(threshold)?;
-                context.begin_action()?;
+                context.begin_action("find_image")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 vision
@@ -596,7 +643,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let threshold = checked_threshold(threshold)?;
                 let timeout = checked_timeout(timeout_ms)?;
                 let poll = checked_poll(poll_ms)?;
-                context.begin_action()?;
+                context.begin_action("wait_image")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
@@ -628,7 +675,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let region = checked_region(region_x, region_y, region_width, region_height)?;
                 let threshold = checked_threshold(threshold)?;
                 let matcher_options = checked_match_options(&options)?;
-                context.begin_action()?;
+                context.begin_action("find_image")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 vision
@@ -657,7 +704,7 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
                 let timeout = checked_timeout(timeout_ms)?;
                 let poll = checked_poll(poll_ms)?;
                 let matcher_options = checked_match_options(&options)?;
-                context.begin_action()?;
+                context.begin_action("wait_image")?;
                 let vision = Arc::clone(&context.vision);
                 let cancel = Arc::clone(&context.cancel);
                 let budget = Arc::clone(&context.budget);
@@ -921,7 +968,9 @@ fn request_script_stop(
     let mut context = state
         .lock()
         .map_err(|_| runtime_error("执行上下文状态异常"))?;
-    context.begin_action().map_err(runtime_error)?;
+    context
+        .begin_action("stop_with_message")
+        .map_err(runtime_error)?;
     context.stop_message = Some(ScriptStopMessage {
         title: if title.is_empty() {
             "AutoFlow".to_string()
@@ -1064,11 +1113,25 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<Script
     let ast = compile_source(&engine, source)?;
     let result = engine.eval_ast::<Dynamic>(&ast);
     let mut context = state.lock().map_err(|_| "执行上下文状态异常".to_string())?;
-    context.release_all();
+    let release_error = context.release_all().err();
+    let input_cleanup_error = context.input.cleanup_injected_input().err();
+    let cleanup_error = release_error.or(input_cleanup_error);
+    if let Some(error) = cleanup_error.as_deref() {
+        context.remember_error(error);
+    }
     if let Some(stop_message) = context.stop_message.take() {
-        drop(context);
-        show_script_message(&stop_message.title, &stop_message.message);
-        return Ok(ScriptOutcome::StoppedWithMessage);
+        if let Some(error) = cleanup_error {
+            return Err(format!("脚本停止后输入清理失败，当前状态不安全: {error}"));
+        }
+        return Ok(ScriptOutcome::StoppedWithMessage {
+            title: stop_message.title,
+            message: stop_message.message,
+        });
+    }
+    if let Some(error) = cleanup_error {
+        return Err(format!(
+            "输入清理失败，当前状态可能仍有按键或鼠标按钮按下: {error}"
+        ));
     }
     match result {
         Ok(_) => {
@@ -1088,43 +1151,6 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<Script
             }
         }
     }
-}
-
-#[cfg(all(windows, not(test)))]
-pub(crate) fn show_script_message(title: &str, message: &str) {
-    use windows::core::HSTRING;
-    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, MessageBoxW, MB_ICONINFORMATION, MB_OK,
-        MB_SETFOREGROUND, MB_TOPMOST,
-    };
-
-    let title = HSTRING::from(title);
-    let message = HSTRING::from(message);
-    unsafe {
-        // Macro playback runs on a background worker. Joining its input queue to
-        // the current foreground thread gives Windows enough context to activate
-        // the dialog instead of only flashing it behind another application.
-        let current_thread_id = GetCurrentThreadId();
-        let foreground_thread_id = GetWindowThreadProcessId(GetForegroundWindow(), None);
-        let attached = foreground_thread_id != 0
-            && foreground_thread_id != current_thread_id
-            && AttachThreadInput(current_thread_id, foreground_thread_id, true).as_bool();
-        let _ = MessageBoxW(
-            None,
-            &message,
-            &title,
-            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
-        );
-        if attached {
-            let _ = AttachThreadInput(current_thread_id, foreground_thread_id, false);
-        }
-    }
-}
-
-#[cfg(any(not(windows), test))]
-pub(crate) fn show_script_message(title: &str, message: &str) {
-    log::info!("脚本提示 [{title}]: {message}");
 }
 
 pub fn validate_rhai_source(source: &str) -> Result<(), String> {
@@ -1725,7 +1751,13 @@ mod tests {
             context,
         )
         .expect("custom stop should not be reported as a runtime failure");
-        assert_eq!(outcome, ScriptOutcome::StoppedWithMessage);
+        assert_eq!(
+            outcome,
+            ScriptOutcome::StoppedWithMessage {
+                title: "完成".to_string(),
+                message: "任务已经结束".to_string(),
+            }
+        );
     }
 
     #[test]

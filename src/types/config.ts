@@ -282,6 +282,7 @@ export type AppConfig = {
   emergencyStop: string;
   navigationAutoCollapse: boolean;
   launchAtStartup: boolean;
+  showPlaybackOverlay: boolean;
   hotkeys: HotkeyRule[];
   textExpansions: TextExpansionRule[];
   macros: MacroRule[];
@@ -307,6 +308,7 @@ export const defaultConfig: AppConfig = {
   emergencyStop: "F12",
   navigationAutoCollapse: false,
   launchAtStartup: false,
+  showPlaybackOverlay: false,
   hotkeys: [
     {
       id: "capslock-to-escape",

@@ -531,6 +531,19 @@ export function MacrosPage() {
     window.setTimeout(() => setNotice(null), 1800);
   };
 
+  const updatePlaybackOverlay = async (enabled: boolean) => {
+    try {
+      const savedConfig = await persist({
+        ...configRef.current,
+        showPlaybackOverlay: enabled,
+      });
+      configRef.current = savedConfig;
+      showNotice(enabled ? "已开启播放进度悬浮窗" : "已关闭播放进度悬浮窗");
+    } catch (reason) {
+      setError(toErrorMessage(reason));
+    }
+  };
+
   const pushMacroUndo = (entry: MacroUndoEntry) => {
     setUndoStack((current) => {
       const next = [...current, entry].slice(-50);
@@ -1248,6 +1261,23 @@ export function MacrosPage() {
           </button>
         </div>
       ) : null}
+      <section className="macro-runtime-settings" aria-label="宏运行设置">
+        <div>
+          <strong>运行设置</strong>
+          <p>
+            进度悬浮窗只读显示当前宏动作、阶段和耗时，不提供停止按钮，也不会改变输入执行。
+          </p>
+        </div>
+        <label className="toggle-setting">
+          <input
+            checked={config.showPlaybackOverlay}
+            disabled={saving}
+            onChange={(event) => void updatePlaybackOverlay(event.target.checked)}
+            type="checkbox"
+          />
+          <span>运行时显示进度悬浮窗</span>
+        </label>
+      </section>
       {recording ? (
         <div className="macro-recording-guide">
           <strong>正在录制</strong>

@@ -7,6 +7,9 @@ import { MacrosPage } from "./pages/MacrosPage";
 import { BehaviorPage } from "./pages/BehaviorPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TextExpansionPage } from "./pages/TextExpansionPage";
+import { PlaybackOverlay } from "./components/PlaybackOverlay";
+import { RuntimeNotifications } from "./components/RuntimeNotifications";
+import { RuntimeSafety } from "./components/RuntimeSafety";
 import type { RouteId } from "./types/navigation";
 
 function currentRoute(): RouteId {
@@ -52,10 +55,22 @@ function pageForRoute(route: RouteId, onNavigate: (route: RouteId) => void) {
 }
 
 export default function App() {
+  if (
+    new URLSearchParams(window.location.search).get("window") ===
+    "playback-overlay"
+  ) {
+    return <PlaybackOverlay />;
+  }
+  return <MainApp />;
+}
+
+function MainApp() {
   const [route, navigate] = useHashRoute();
   return (
     <AppShell route={route} onNavigate={navigate}>
       {pageForRoute(route, navigate)}
+      <RuntimeNotifications />
+      <RuntimeSafety />
     </AppShell>
   );
 }

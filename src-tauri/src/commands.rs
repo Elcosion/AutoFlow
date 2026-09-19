@@ -276,7 +276,7 @@ pub fn stop_macro_recording(
 pub fn get_macro_recording_status(
     state: State<'_, RuntimeState>,
 ) -> Result<MacroRecordingStatus, AppError> {
-    Ok(state.macro_recording_status())
+    state.macro_recording_status()
 }
 
 #[tauri::command]
@@ -305,7 +305,50 @@ pub fn is_macro_playing(state: State<'_, RuntimeState>) -> Result<bool, AppError
 pub fn get_macro_playback_status(
     state: State<'_, RuntimeState>,
 ) -> Result<MacroPlaybackStatus, AppError> {
-    Ok(state.macro_playback_status())
+    state.macro_playback_status()
+}
+
+#[tauri::command]
+pub fn recover_input_safety(
+    window: tauri::WebviewWindow,
+    state: State<'_, RuntimeState>,
+) -> Result<(), AppError> {
+    if window.label() != "main" {
+        return Err(AppError::invalid(
+            "safety_recovery_forbidden",
+            "只有主界面可以请求安全恢复",
+        ));
+    }
+    state.recover_input_safety()
+}
+
+#[tauri::command]
+pub fn take_runtime_notification(
+    window: tauri::WebviewWindow,
+    state: State<'_, RuntimeState>,
+) -> Result<Option<crate::runtime_notifications::RuntimeNotification>, AppError> {
+    if window.label() != "main" {
+        return Err(AppError::invalid(
+            "notification_access_denied",
+            "仅主界面可以领取运行通知",
+        ));
+    }
+    Ok(state.take_runtime_notification())
+}
+
+#[tauri::command]
+pub fn acknowledge_runtime_notification(
+    window: tauri::WebviewWindow,
+    state: State<'_, RuntimeState>,
+    id: u64,
+) -> Result<bool, AppError> {
+    if window.label() != "main" {
+        return Err(AppError::invalid(
+            "notification_access_denied",
+            "仅主界面可以确认运行通知",
+        ));
+    }
+    Ok(state.acknowledge_runtime_notification(id))
 }
 
 #[tauri::command]
@@ -510,7 +553,7 @@ fn clear_behavior_profile_references(config: &mut AppConfig, profile_id: &str) {
 pub fn get_behavior_recording_status(
     state: State<'_, RuntimeState>,
 ) -> Result<BehaviorRecordingStatus, AppError> {
-    Ok(state.behavior_recording_status())
+    state.behavior_recording_status()
 }
 
 #[tauri::command]

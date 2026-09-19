@@ -67,6 +67,9 @@ pub struct VisionService {
 }
 
 impl VisionService {
+    pub fn asset_root(&self) -> PathBuf {
+        self.assets.root().to_path_buf()
+    }
     pub fn new(asset_root: PathBuf) -> Arc<Self> {
         Self::with_parts(
             Arc::new(WindowsWindowProvider::new()),
