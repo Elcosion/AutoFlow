@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteAsset,
   importAsset,
+  openDataDirectory,
   readAsset,
   renameAsset,
 } from "../lib/tauri";
@@ -28,7 +29,9 @@ function mimeType(fileName: string): string {
 
 export function isSupportedAssetFileName(fileName: string): boolean {
   const lower = fileName.toLowerCase();
-  return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+  return (
+    lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+  );
 }
 
 export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
@@ -67,7 +70,10 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
     };
   }, [assets]);
 
-  const assetCountLabel = useMemo(() => `${assets.length} 个资源`, [assets.length]);
+  const assetCountLabel = useMemo(
+    () => `${assets.length} 个资源`,
+    [assets.length],
+  );
 
   const importSelected = async (file: File) => {
     if (!isSupportedAssetFileName(file.name)) {
@@ -77,7 +83,11 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
     setBusy(true);
     try {
       const name = file.name.replace(/\.(png|jpe?g)$/i, "") || "新图像资源";
-      await importAsset(name, file.name, new Uint8Array(await file.arrayBuffer()));
+      await importAsset(
+        name,
+        file.name,
+        new Uint8Array(await file.arrayBuffer()),
+      );
       await refresh();
       setNotice("图像资源已导入");
     } catch (reason) {
@@ -89,13 +99,18 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
   };
 
   const rename = async (asset: AutomationAsset) => {
-    const name = window.prompt("资源名称", asset.name)?.trim();
-    if (!name || name === asset.name) return;
+    const fileName = window
+      .prompt(
+        "图像文件名（调用时必须包含 .png、.jpg 或 .jpeg 后缀）",
+        asset.fileName,
+      )
+      ?.trim();
+    if (!fileName || fileName === asset.fileName) return;
     setBusy(true);
     try {
-      await renameAsset(asset.id, name);
+      await renameAsset(asset.id, fileName);
       await refresh();
-      setNotice("资源名称已更新");
+      setNotice("图像文件名及脚本引用已更新");
     } catch (reason) {
       onError(toErrorMessage(reason));
     } finally {
@@ -104,7 +119,12 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
   };
 
   const remove = async (asset: AutomationAsset) => {
-    if (!window.confirm(`确认删除资源“${asset.name}”吗？引用它的 Rhai 脚本也会失效。`)) return;
+    if (
+      !window.confirm(
+        `确认删除图像文件“${asset.fileName}”吗？引用该文件名的 Rhai 脚本也会失效。`,
+      )
+    )
+      return;
     setBusy(true);
     try {
       await deleteAsset(asset.id, true);
@@ -117,12 +137,32 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
     }
   };
 
-  const copyId = async (asset: AutomationAsset) => {
+  const copyFileName = async (asset: AutomationAsset) => {
     try {
-      await navigator.clipboard.writeText(asset.id);
-      setNotice("资源 ID 已复制");
+      await navigator.clipboard.writeText(asset.fileName);
+      setNotice("图像文件名已复制");
     } catch {
-      onError("复制资源 ID 失败，请手动选择复制");
+      onError("复制图像文件名失败，请手动选择复制");
+    }
+  };
+
+  const openImageFolder = async () => {
+    try {
+      await openDataDirectory("images");
+    } catch (reason) {
+      onError(toErrorMessage(reason));
+    }
+  };
+
+  const refreshAssets = async () => {
+    setBusy(true);
+    try {
+      await refresh();
+      setNotice("图像文件夹已刷新");
+    } catch (reason) {
+      onError(toErrorMessage(reason));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -131,10 +171,28 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
       <div className="asset-manager-heading">
         <div>
           <strong>图像资源</strong>
-          <span>托管在 AutoFlow 资源目录中，Rhai 只能通过资源 ID 使用。</span>
+          <span>
+            存放在 data/images；Rhai 调用必须使用包含扩展名的完整文件名。
+          </span>
         </div>
         <div className="asset-manager-actions">
           <span>{assetCountLabel}</span>
+          <button
+            className="button"
+            disabled={busy}
+            onClick={() => void openImageFolder()}
+            type="button"
+          >
+            打开图像文件夹
+          </button>
+          <button
+            className="button"
+            disabled={busy}
+            onClick={() => void refreshAssets()}
+            type="button"
+          >
+            刷新
+          </button>
           <button
             className="button button-primary"
             disabled={busy}
@@ -156,7 +214,10 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
         </div>
       </div>
       {assets.length === 0 ? (
-        <div className="asset-empty">还没有图像资源。导入按钮图像后，可在脚本中使用 find_image。</div>
+        <div className="asset-empty">
+          还没有图像资源。可导入图片或直接把 PNG/JPEG 文件放入
+          data/images，然后点击刷新。
+        </div>
       ) : (
         <div className="asset-grid">
           {assets.map((asset) => (
@@ -165,18 +226,40 @@ export function AssetManager({ assets, refresh, onError }: AssetManagerProps) {
                 {previews[asset.id] ? (
                   <img alt={asset.name} src={previews[asset.id]} />
                 ) : (
-                  <span>{missing.has(asset.id) ? "文件不存在" : "读取中…"}</span>
+                  <span>
+                    {missing.has(asset.id) ? "文件不存在" : "读取中…"}
+                  </span>
                 )}
               </div>
               <div className="asset-card-body">
-                <strong title={asset.name}>{asset.name}</strong>
-                <small>{asset.width} × {asset.height}px</small>
-                <code title={asset.id}>{asset.id}</code>
+                <strong title={asset.fileName}>{asset.fileName}</strong>
+                <small>
+                  {asset.width} × {asset.height}px · 调用时需要后缀
+                </small>
+                <code title={asset.fileName}>{asset.fileName}</code>
                 {missing.has(asset.id) ? <em>资源文件缺失</em> : null}
                 <div className="asset-card-actions">
-                  <button onClick={() => void copyId(asset)} type="button">复制 ID</button>
-                  <button disabled={busy} onClick={() => void rename(asset)} type="button">重命名</button>
-                  <button className="danger-link" disabled={busy} onClick={() => void remove(asset)} type="button">删除</button>
+                  <button
+                    onClick={() => void copyFileName(asset)}
+                    type="button"
+                  >
+                    复制文件名
+                  </button>
+                  <button
+                    disabled={busy}
+                    onClick={() => void rename(asset)}
+                    type="button"
+                  >
+                    重命名
+                  </button>
+                  <button
+                    className="danger-link"
+                    disabled={busy}
+                    onClick={() => void remove(asset)}
+                    type="button"
+                  >
+                    删除
+                  </button>
                 </div>
               </div>
             </article>

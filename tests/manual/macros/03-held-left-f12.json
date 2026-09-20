@@ -1,0 +1,16 @@
+{
+  "id": "manual-acceptance-03-held-left-f12",
+  "name": "MANUAL_TEST 03 - Held left button interrupted",
+  "enabled": false,
+  "triggerKeys": [],
+  "mode": "once",
+  "repeatCount": 1,
+  "speed": 1.0,
+  "recordMouseMove": false,
+  "recordMouseClicks": false,
+  "program": {
+    "kind": "rhai",
+    "apiVersion": 1,
+    "source": "let w = window_rect(\"AutoFlow Manual Acceptance Harness\");\nif w.found {\n    let x = w.x + w.width / 2;\n    let y = w.y + w.height / 2;\n    move_to(x, y);\n    mouse_down(\"left\", x, y);\n    wait_ms(30000);\n    mouse_up(\"left\", x, y);\n}"
+  }
+}

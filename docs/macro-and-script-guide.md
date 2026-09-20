@@ -25,7 +25,7 @@
 5. 修改名称、触发组合、步骤参数后，先点击“测试播放”。
 6. 确认结果正确后再点击“启用宏”。
 
-当前参考宏包括普通键鼠流程、随机等待、窗口内找图和像素等待。参考宏中的坐标、窗口标题、颜色和图像资源 ID 都是示例值，必须按实际目标修改。
+当前参考代码包括普通键鼠流程、随机等待、窗口内找图和像素等待。其中的坐标、窗口标题、颜色和图像文件名都是示例值，必须按实际目标修改。
 
 ### 2.2 新建空白宏
 
@@ -297,10 +297,10 @@ if wait_pixel(100, 200, 32, 64, 128, 8, 5000, 200) {
 
 ### 7.5 图像查找 API
 
-| API                                                                         | 返回值 | 说明                     |
-| --------------------------------------------------------------------------- | ------ | ------------------------ |
-| `find_image(asset_id, x, y, width, height, threshold)`                      | Map    | 在指定区域查找一次       |
-| `wait_image(asset_id, x, y, width, height, threshold, timeout_ms, poll_ms)` | Map    | 轮询查找，直到找到或超时 |
+| API                                                                          | 返回值 | 说明                                 |
+| ---------------------------------------------------------------------------- | ------ | ------------------------------------ |
+| `find_image(file_name, x, y, width, height, threshold)`                      | Map    | 按完整文件名在指定区域查找一次       |
+| `wait_image(file_name, x, y, width, height, threshold, timeout_ms, poll_ms)` | Map    | 按完整文件名轮询查找，直到找到或超时 |
 
 返回 Map 包含：
 
@@ -326,7 +326,7 @@ let window = window_rect("记事本");
 
 if window.found {
     let result = wait_image(
-        "confirm_button",
+        "confirm_button.png",
         window.x,
         window.y,
         window.width,
@@ -344,13 +344,13 @@ if window.found {
 
 ## 8. 图像资源管理
 
-图像查找不能直接读取任意文件路径，必须先把图片导入 AutoFlow：
+图像查找不能直接读取任意文件路径。图片统一保存在 AutoFlow 的 `data/images` 文件夹：
 
 1. 打开宏的“源码”页签。
-2. 在“图像资源”区域点击“导入 PNG/JPEG”。
-3. 选择一张 PNG、JPG 或 JPEG 图片。
-4. 导入后点击资源卡片中的“复制 ID”。
-5. 把复制的 ID 填入 `find_image` 或 `wait_image` 的第一个参数。
+2. 在“图像资源”区域点击“导入 PNG/JPEG”，或者打开图像文件夹后直接复制图片进去。
+3. 选择或放入一张 PNG、JPG 或 JPEG 图片；直接添加文件后点击“刷新”。
+4. 点击资源卡片中的“复制文件名”。
+5. 把复制的完整文件名填入 `find_image` 或 `wait_image` 的第一个参数。必须包含 `.png`、`.jpg` 或 `.jpeg` 后缀。
 
 素材建议：
 
@@ -358,7 +358,7 @@ if window.found {
 - 素材应与实际显示缩放、主题、字体和窗口状态一致。
 - 优先在目标窗口范围内找图，不要直接搜索整个桌面。
 - `threshold` 范围为 `0.0`–`1.0`；可从 `0.90` 开始，误匹配时提高，找不到时适当降低。
-- 删除素材会使引用该资源 ID 的脚本失效。
+- 删除素材会使引用该文件名的脚本失效。
 
 ## 9. 视觉参数与多显示器
 
@@ -381,7 +381,7 @@ let title = "目标程序";
 if wait_window(title, 15000, 200) {
     let window = window_rect(title);
     let button = wait_image(
-        "submit_button",
+        "submit_button.png",
         window.x,
         window.y,
         window.width,
@@ -419,6 +419,55 @@ for round in 0..100 {
     wait_random_ms(800, 1200);
 }
 ```
+
+### 7.6 图像匹配高级选项
+
+`find_image` 和 `wait_image` 继续支持原有参数签名，也支持最后追加一个
+`options` Map：`mode` 可取 `"auto"`、`"exact"` 或 `"fast"`，
+`prefer_last` 控制是否优先复用上一命中区域，`max_candidates` 范围为
+1–32，`scale_min`/`scale_max` 是模板倍率（`1.25` 表示 125%，不是
+百分数），范围为 `0.5`–`2.0`；`scale_step` 可选且必须为正数。例如：
+
+```rhai
+let result = find_image(
+    "confirm_button.png", 0, 0, 1920, 1080, 0.90,
+    #{
+        mode: "auto",
+        scale_min: 0.67,
+        scale_max: 2.00,
+        prefer_last: true,
+        max_candidates: 8
+    }
+);
+```
+
+未指定尺度时，`auto` 和 `fast` 默认覆盖常见 Windows DPI 倍率：
+`0.67`、`0.80`、`0.83`、`1.00`、`1.20`、`1.25`、`1.50`、`1.75`、`2.00`
+（并受自定义范围限制）。`auto` 使用上一命中位置、尺度和实际尺寸，多尺度低
+分辨率粗匹配、跨位置/尺度候选筛选及对应缩放模板的原图局部复核。最终复核
+还会计算 3×3 局部鲁棒分数：忽略低方差/低梯度块，最多丢弃最差一个块，并要求
+多个空间分离的有效块通过。最终分数按 `0.15 * full + 0.70 * robust +
+0.15 * (passed_tiles / valid_tiles)` 合成；至少三个块、至少两行两列通过且
+最终分数达到阈值才算命中。必要时才执行有硬上限的 anchor recovery 和全区域
+fallback。`fast` 保留多尺度粗匹配和局部复核，但不执行 recovery 或全区域 fallback。
+`exact` 固定使用 1.0 倍全分辨率 NCC，明确不负责跨尺度匹配。
+
+返回 Map 在原有 `found`、坐标、尺寸和 `score` 外还包含
+`total_ms`、`capture_ms`、`prepare_ms`、`coarse_ms`、`refine_ms`、
+`fallback_ms`、`candidate_count`、`previous_hit_used`、`fallback_used`、
+`matcher_mode`、`matched_scale`、`scale_candidates`、`scale_search_ms`、
+`matched_width`、`matched_height`、`robust_verify_used`、`robust_verify_ms`、
+`robust_score`、`valid_tile_count`、`discarded_tile_count`、`alpha_mask_used`、
+`anchor_recovery_used`、`anchor_candidate_count`、`preferred_scale_hit`、
+`single_match_ms` 和 `wait_total_ms`。命中时 `matched_width`/`matched_height`
+是实际缩放模板尺寸，未命中时 `matched_scale` 和 `robust_score` 为 Rhai
+空值 `()`，尺寸为 `0`，不会伪造诊断值。旧脚本不读取这些字段时行为不变；
+图片仍必须使用 `data/images` 中的完整文件名，资源扩展名规则不变。
+
+PNG 的 alpha 通道是可选遮罩：alpha 为 0 的像素不参与最终复核，半透明像素按
+alpha 加权；普通不透明 RGB/RGBA 图像保持原有行为。缩放时灰度图和 alpha 使用
+相同实际尺寸，不需要另建 mask 文件。需要忽略 Windows 快捷方式角标时，可让该
+区域成为透明区域；本轮不要求用户制作遮罩编辑器。
 
 避免没有等待的无限循环。即使引擎有操作数限制，这类循环仍会快速消耗执行预算，也会让目标程序接收过多输入。
 
@@ -462,7 +511,7 @@ Rhai 脚本只能调用 AutoFlow 注册的 API，不能访问：
 
 ### 找图一直返回 `found = false`
 
-- 确认使用的是资源 ID，不是文件名或显示名称。
+- 确认使用的是包含扩展名的完整文件名，例如 `confirm_button.png`；后缀不能省略。
 - 确认素材没有被删除，预览中没有显示“文件不存在”。
 - 检查搜索区域是否覆盖目标图像。
 - 检查显示缩放、主题、亮暗模式和按钮状态是否与素材一致。

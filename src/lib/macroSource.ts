@@ -1,8 +1,4 @@
-import type {
-  MacroRule,
-  MacroStep,
-  MouseButton,
-} from "../types/config";
+import type { MacroRule, MacroStep, MouseButton } from "../types/config";
 
 export type MacroSourceKind = "compatible" | "advanced";
 
@@ -42,6 +38,7 @@ const compatibleFunctions = new Set([
 ]);
 
 const advancedOnlyFunctions = [
+  "stop_with_message",
   "active_window_title",
   "window_exists",
   "window_rect",
@@ -62,7 +59,11 @@ const mouseButtons = new Set<MouseButton>([
   "x2",
 ]);
 
-function sourceError(message: string, line: number, column = 1): MacroSourceError {
+function sourceError(
+  message: string,
+  line: number,
+  column = 1,
+): MacroSourceError {
   return new MacroSourceError(`第 ${line} 行第 ${column} 列：${message}`, {
     line,
     column,
@@ -144,7 +145,10 @@ export function macroToSource(macro: MacroRule): string {
         case "delay":
           return step.durationMaxMs !== undefined &&
             step.durationMaxMs > step.durationMs
-            ? formatCall("wait_random_ms", [step.durationMs, step.durationMaxMs])
+            ? formatCall("wait_random_ms", [
+                step.durationMs,
+                step.durationMaxMs,
+              ])
             : formatCall("wait_ms", [step.durationMs]);
         case "key":
           return formatCall(step.action === "down" ? "key_down" : "key_up", [
@@ -181,7 +185,8 @@ function stripInlineComment(line: string): string {
       quote = character;
       continue;
     }
-    if (character === "/" && line[index + 1] === "/") return line.slice(0, index);
+    if (character === "/" && line[index + 1] === "/")
+      return line.slice(0, index);
   }
   return line;
 }
@@ -218,7 +223,11 @@ function parseArguments(
       return;
     }
     if (!/^-?\d+$/.test(token)) {
-      throw sourceError("兼容宏参数必须是双引号字符串或整数", line, openingColumn);
+      throw sourceError(
+        "兼容宏参数必须是双引号字符串或整数",
+        line,
+        openingColumn,
+      );
     }
     const parsed = Number(token);
     if (!Number.isSafeInteger(parsed)) {
@@ -283,7 +292,10 @@ function argumentCount(
   line: number,
 ) {
   if (args.length !== count) {
-    throw sourceError(`${name} 需要 ${count} 个参数，实际得到 ${args.length} 个`, line);
+    throw sourceError(
+      `${name} 需要 ${count} 个参数，实际得到 ${args.length} 个`,
+      line,
+    );
   }
 }
 
@@ -331,11 +343,17 @@ function parseCompatibleStatement(lineText: string, line: number): MacroStep {
     }
     case "click": {
       if (args.length !== 1 && args.length !== 3) {
-        throw sourceError(`${name} 需要 1 或 3 个参数，实际得到 ${args.length} 个`, line);
+        throw sourceError(
+          `${name} 需要 1 或 3 个参数，实际得到 ${args.length} 个`,
+          line,
+        );
       }
       const button = stringArgument(args, 0, name, line) as MouseButton;
       if (!mouseButtons.has(button)) {
-        throw sourceError(`${name} 的鼠标按钮必须是 left、right、middle、x1 或 x2`, line);
+        throw sourceError(
+          `${name} 的鼠标按钮必须是 left、right、middle、x1 或 x2`,
+          line,
+        );
       }
       return {
         type: "mouseButton",
@@ -358,7 +376,10 @@ function parseCompatibleStatement(lineText: string, line: number): MacroStep {
       argumentCount(args, 3, name, line);
       const button = stringArgument(args, 0, name, line) as MouseButton;
       if (!mouseButtons.has(button)) {
-        throw sourceError(`${name} 的鼠标按钮必须是 left、right、middle、x1 或 x2`, line);
+        throw sourceError(
+          `${name} 的鼠标按钮必须是 left、right、middle、x1 或 x2`,
+          line,
+        );
       }
       return {
         type: "mouseButton",
@@ -416,9 +437,14 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function requiredString(value: JsonObject, field: string, path: string): string {
+function requiredString(
+  value: JsonObject,
+  field: string,
+  path: string,
+): string {
   const result = value[field];
-  if (typeof result !== "string") throw new Error(`${path}.${field} 必须是字符串`);
+  if (typeof result !== "string")
+    throw new Error(`${path}.${field} 必须是字符串`);
   return result;
 }
 
@@ -433,7 +459,10 @@ function legacySteps(value: JsonObject): MacroStep[] {
   });
 }
 
-function parseLegacyJsonSource(source: string, base: MacroRule | string): MacroRule {
+function parseLegacyJsonSource(
+  source: string,
+  base: MacroRule | string,
+): MacroRule {
   let value: unknown;
   try {
     value = JSON.parse(source);
@@ -443,7 +472,8 @@ function parseLegacyJsonSource(source: string, base: MacroRule | string): MacroR
   if (!isObject(value)) throw new Error("旧宏源码根节点必须是 JSON 对象");
   const expectedId = typeof base === "string" ? base : base.id;
   const id = requiredString(value, "id", "宏");
-  if (id !== expectedId) throw new Error("id 不允许修改，请保持当前宏的 id 不变");
+  if (id !== expectedId)
+    throw new Error("id 不允许修改，请保持当前宏的 id 不变");
   if (typeof base === "string") {
     throw new Error("旧 JSON 源码缺少可继承的宏元数据，请重新打开宏编辑器");
   }
@@ -455,7 +485,10 @@ function parseLegacyJsonSource(source: string, base: MacroRule | string): MacroR
   };
 }
 
-export function parseMacroSource(source: string, base: MacroRule | string): MacroRule {
+export function parseMacroSource(
+  source: string,
+  base: MacroRule | string,
+): MacroRule {
   if (source.trimStart().startsWith("{")) {
     return parseLegacyJsonSource(source, base);
   }

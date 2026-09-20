@@ -2,11 +2,54 @@ use crate::automation::{
     AutomationAsset, MAX_ASSET_NAME_LENGTH, MAX_TEMPLATE_HEIGHT, MAX_TEMPLATE_PIXELS,
     MAX_TEMPLATE_WIDTH,
 };
+use crate::behavior::v2::{
+    BehaviorPolicy, BehaviorProfileV2, BehaviorProfileV2File, BehaviorSessionFile,
+    BehaviorSessionV2,
+};
+use crate::behavior::{
+    BehaviorProfile, BehaviorProfileFile, BiomimeticInput, BiomimeticInputFile,
+    MAX_BEHAVIOR_PROFILE_NAME,
+};
 use crate::AppError;
 use serde::{de::Deserializer, Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 6;
+
+pub(crate) fn normalized_virtual_key(key: &str) -> Option<u32> {
+    let normalized = key.trim().to_ascii_uppercase();
+    let named = [
+        ("CTRL", 0x11),
+        ("CONTROL", 0x11),
+        ("ALT", 0x12),
+        ("SHIFT", 0x10),
+        ("WIN", 0x5B),
+        ("ESC", 0x1B),
+        ("ENTER", 0x0D),
+        ("SPACE", 0x20),
+        ("TAB", 0x09),
+        ("BACKSPACE", 0x08),
+        ("CAPSLOCK", 0x14),
+        ("LEFT", 0x25),
+        ("RIGHT", 0x27),
+        ("UP", 0x26),
+        ("DOWN", 0x28),
+    ];
+    if let Some((_, value)) = named.iter().find(|(name, _)| *name == normalized) {
+        return Some(*value);
+    }
+    if normalized.len() == 1 {
+        let byte = normalized.as_bytes()[0];
+        if byte.is_ascii_uppercase() || byte.is_ascii_digit() {
+            return Some(u32::from(byte));
+        }
+    }
+    normalized
+        .strip_prefix('F')
+        .and_then(|number| number.parse::<u32>().ok())
+        .filter(|number| (1..=24).contains(number))
+        .map(|number| 0x70 + number - 1)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +64,10 @@ pub struct AppConfig {
     pub navigation_auto_collapse: bool,
     #[serde(default)]
     pub launch_at_startup: bool,
+    /// Whether the playback progress overlay is shown while a macro runs.
+    /// This is intentionally global; individual macros do not override it.
+    #[serde(default)]
+    pub show_playback_overlay: bool,
     #[serde(default)]
     pub hotkeys: Vec<HotkeyRule>,
     #[serde(default)]
@@ -28,7 +75,41 @@ pub struct AppConfig {
     #[serde(default)]
     pub macros: Vec<MacroRule>,
     #[serde(default)]
+    pub macro_files: Vec<MacroRuleFile>,
+    #[serde(default)]
     pub assets: Vec<AutomationAsset>,
+    #[serde(default)]
+    pub behavior_profiles: Vec<BehaviorProfile>,
+    #[serde(default)]
+    pub behavior_profile_files: Vec<BehaviorProfileFile>,
+    #[serde(default)]
+    pub biomimetic_inputs: Vec<BiomimeticInput>,
+    #[serde(default)]
+    pub biomimetic_input_files: Vec<BiomimeticInputFile>,
+    #[serde(default)]
+    pub active_behavior_profile_id: Option<String>,
+    #[serde(default)]
+    pub selected_behavior_profile_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_biomimetic_input_ids: Vec<String>,
+    #[serde(default)]
+    pub biomimetic_enabled: bool,
+    #[serde(default = "default_biomimetic_intensity")]
+    pub biomimetic_intensity: f32,
+    #[serde(default = "default_true")]
+    pub retain_behavior_records: bool,
+    #[serde(default)]
+    pub behavior_sessions_v2: Vec<BehaviorSessionV2>,
+    #[serde(default)]
+    pub behavior_session_files_v2: Vec<BehaviorSessionFile>,
+    #[serde(default)]
+    pub behavior_profiles_v2: Vec<BehaviorProfileV2>,
+    #[serde(default)]
+    pub behavior_profile_v2_files: Vec<BehaviorProfileV2File>,
+    #[serde(default)]
+    pub active_behavior_profile_v2_id: Option<String>,
+    #[serde(default)]
+    pub behavior_policy: BehaviorPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +153,8 @@ pub struct TextExpansionRule {
 pub struct MacroRule {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_error: Option<String>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -88,7 +171,27 @@ pub struct MacroRule {
     pub record_mouse_clicks: bool,
     #[serde(default)]
     pub target: Option<MacroTarget>,
+    #[serde(default)]
+    pub behavior_policy: Option<BehaviorPolicy>,
     pub program: AutomationProgram,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroRuleFile {
+    pub id: String,
+    pub name: String,
+    pub file_name: String,
+}
+
+impl MacroRuleFile {
+    pub fn from_macro(rule: &MacroRule, file_name: String) -> Self {
+        Self {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            file_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +220,8 @@ struct MacroRuleWire {
     id: String,
     name: String,
     #[serde(default)]
+    import_error: Option<String>,
+    #[serde(default)]
     enabled: bool,
     #[serde(default)]
     trigger_keys: Vec<String>,
@@ -132,6 +237,8 @@ struct MacroRuleWire {
     record_mouse_clicks: bool,
     #[serde(default)]
     target: Option<MacroTarget>,
+    #[serde(default)]
+    behavior_policy: Option<BehaviorPolicy>,
     #[serde(default)]
     program: Option<AutomationProgram>,
     #[serde(default)]
@@ -150,6 +257,7 @@ impl<'de> Deserialize<'de> for MacroRule {
         Ok(Self {
             id: wire.id,
             name: wire.name,
+            import_error: wire.import_error,
             enabled: wire.enabled,
             trigger_keys: wire.trigger_keys,
             mode: wire.mode,
@@ -158,6 +266,7 @@ impl<'de> Deserialize<'de> for MacroRule {
             record_mouse_move: wire.record_mouse_move,
             record_mouse_clicks: wire.record_mouse_clicks,
             target: wire.target,
+            behavior_policy: wire.behavior_policy,
             program,
         })
     }
@@ -252,6 +361,7 @@ impl Default for AppConfig {
             emergency_stop: "F12".to_string(),
             navigation_auto_collapse: false,
             launch_at_startup: false,
+            show_playback_overlay: false,
             hotkeys: vec![
                 HotkeyRule {
                     id: "capslock-to-escape".to_string(),
@@ -284,7 +394,24 @@ impl Default for AppConfig {
                 sensitive: false,
             }],
             macros: Vec::new(),
+            macro_files: Vec::new(),
             assets: Vec::new(),
+            behavior_profiles: Vec::new(),
+            behavior_profile_files: Vec::new(),
+            biomimetic_inputs: Vec::new(),
+            biomimetic_input_files: Vec::new(),
+            active_behavior_profile_id: None,
+            selected_behavior_profile_ids: Vec::new(),
+            selected_biomimetic_input_ids: Vec::new(),
+            biomimetic_enabled: false,
+            biomimetic_intensity: default_biomimetic_intensity(),
+            retain_behavior_records: true,
+            behavior_sessions_v2: Vec::new(),
+            behavior_session_files_v2: Vec::new(),
+            behavior_profiles_v2: Vec::new(),
+            behavior_profile_v2_files: Vec::new(),
+            active_behavior_profile_v2_id: None,
+            behavior_policy: BehaviorPolicy::default(),
         }
     }
 }
@@ -299,6 +426,24 @@ impl AppConfig {
         }
         let migrated = self.schema_version != SCHEMA_VERSION;
         self.schema_version = SCHEMA_VERSION;
+        if self.selected_behavior_profile_ids.is_empty() {
+            if let Some(active_id) = &self.active_behavior_profile_id {
+                self.selected_behavior_profile_ids.push(active_id.clone());
+            }
+        }
+        if !self.behavior_policy.enabled && self.biomimetic_enabled {
+            self.behavior_policy = BehaviorPolicy::from_legacy(
+                true,
+                self.biomimetic_intensity,
+                self.active_behavior_profile_v2_id.clone(),
+            );
+        }
+        if self.active_behavior_profile_v2_id.is_none() {
+            self.active_behavior_profile_v2_id = self
+                .behavior_profiles_v2
+                .first()
+                .map(|profile| profile.id.clone());
+        }
         Ok((self, migrated))
     }
 
@@ -315,6 +460,128 @@ impl AppConfig {
                 "emergency_stop_empty",
                 "紧急停止键不能为空，请设置为 F12 或其他按键",
             ));
+        }
+        let emergency_vk = normalized_virtual_key(&self.emergency_stop).ok_or_else(|| {
+            AppError::invalid(
+                "emergency_stop_unsupported",
+                "紧急停止键无法识别；请使用 F12 或其他受支持的单键",
+            )
+        })?;
+
+        if !self.biomimetic_intensity.is_finite()
+            || !(0.0..=1.0).contains(&self.biomimetic_intensity)
+        {
+            return Err(AppError::invalid(
+                "behavior_intensity_invalid",
+                "仿生操作强度必须在 0 到 1 之间",
+            ));
+        }
+        self.behavior_policy.validate()?;
+
+        let mut v2_session_ids = HashSet::new();
+        for session in &self.behavior_sessions_v2 {
+            session.validate()?;
+            if !v2_session_ids.insert(session.id.clone()) {
+                return Err(AppError::invalid(
+                    "behavior_v2_session_duplicate_id",
+                    "V2 训练会话 ID 不能重复",
+                ));
+            }
+        }
+        let mut v2_profile_ids = HashSet::new();
+        for profile in &self.behavior_profiles_v2 {
+            profile.validate()?;
+            if !v2_profile_ids.insert(profile.id.clone()) {
+                return Err(AppError::invalid(
+                    "behavior_v2_profile_duplicate_id",
+                    "V2 行为档案 ID 不能重复",
+                ));
+            }
+        }
+        if let Some(profile_id) = &self.active_behavior_profile_v2_id {
+            if !v2_profile_ids.contains(profile_id) {
+                return Err(AppError::invalid(
+                    "behavior_v2_profile_not_found",
+                    "当前 V2 行为档案不存在",
+                ));
+            }
+        }
+        if let Some(profile_id) = &self.behavior_policy.profile_id {
+            if !v2_profile_ids.contains(profile_id) {
+                return Err(AppError::invalid(
+                    "behavior_v2_profile_not_found",
+                    "行为策略绑定的 V2 行为档案不存在",
+                ));
+            }
+        }
+
+        let mut behavior_ids = HashSet::new();
+        for profile in &self.behavior_profiles {
+            profile.validate()?;
+            if profile.name.chars().count() > MAX_BEHAVIOR_PROFILE_NAME {
+                return Err(AppError::invalid(
+                    "behavior_profile_name_too_long",
+                    "行为档案名称不能超过 64 个字符",
+                ));
+            }
+            if !behavior_ids.insert(profile.id.clone()) {
+                return Err(AppError::invalid(
+                    "behavior_profile_duplicate_id",
+                    "行为档案 ID 不能重复",
+                ));
+            }
+        }
+        if let Some(active_id) = &self.active_behavior_profile_id {
+            if !behavior_ids.contains(active_id) {
+                return Err(AppError::invalid(
+                    "behavior_profile_not_found",
+                    "当前选中的行为档案不存在",
+                ));
+            }
+        }
+        for profile_id in &self.selected_behavior_profile_ids {
+            if !behavior_ids.contains(profile_id) {
+                return Err(AppError::invalid(
+                    "behavior_profile_not_found",
+                    "选中的行为档案不存在",
+                ));
+            }
+        }
+
+        for macro_rule in &self.macros {
+            if macro_rule.import_error.is_some() {
+                continue;
+            }
+            if let Some(policy) = &macro_rule.behavior_policy {
+                policy.validate()?;
+                if let Some(profile_id) = &policy.profile_id {
+                    if !v2_profile_ids.contains(profile_id) {
+                        return Err(AppError::invalid(
+                            "behavior_v2_profile_not_found",
+                            "宏绑定的 V2 行为档案不存在",
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut input_ids = HashSet::new();
+        for input in &self.biomimetic_inputs {
+            input.validate()?;
+            if !input_ids.insert(input.id.clone()) {
+                return Err(AppError::invalid(
+                    "biomimetic_input_duplicate_id",
+                    "仿生输入文件 ID 不能重复",
+                ));
+            }
+        }
+        for input_id in &self.selected_biomimetic_input_ids {
+            if !input_ids.contains(input_id) {
+                return Err(AppError::invalid(
+                    "biomimetic_input_not_found",
+                    "选中的仿生输入文件不存在",
+                ));
+            }
         }
 
         let mut hotkey_signatures = HashSet::new();
@@ -392,6 +659,15 @@ impl AppConfig {
             if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
                 return Err(AppError::invalid("macro_missing_name", "宏需要填写名称"));
             }
+            if rule.import_error.is_some() {
+                if rule.enabled {
+                    return Err(AppError::invalid(
+                        "macro_import_invalid_enabled",
+                        "导入错误的宏必须保持停用，修复脚本后才能启用",
+                    ));
+                }
+                continue;
+            }
             if rule.speed <= 0.0 || !rule.speed.is_finite() {
                 return Err(AppError::invalid(
                     "macro_invalid_speed",
@@ -402,6 +678,17 @@ impl AppConfig {
                 return Err(AppError::invalid(
                     "macro_missing_trigger",
                     "启用宏前至少需要设置一个触发键",
+                ));
+            }
+            if rule
+                .trigger_keys
+                .iter()
+                .filter_map(|key| normalized_virtual_key(key))
+                .any(|vk| vk == emergency_vk)
+            {
+                return Err(AppError::invalid(
+                    "macro_emergency_key_conflict",
+                    "宏快捷键不能包含紧急停止键；请更换快捷键组合",
                 ));
             }
             let trigger_keys = rule
@@ -486,7 +773,7 @@ impl AppConfig {
                     "图像资源 ID 不能重复",
                 ));
             }
-            if !asset_file_names.insert(asset.file_name.clone()) {
+            if !asset_file_names.insert(asset.file_name.to_lowercase()) {
                 return Err(AppError::invalid(
                     "asset_duplicate_file",
                     "图像资源文件名不能重复",
@@ -524,7 +811,7 @@ impl AppConfig {
 
 fn default_schema_version() -> u32 {
     // A missing version belongs to the pre-program format and must pass
-    // through the migration path instead of being mistaken for v2.
+    // through the migration path instead of being mistaken for v4.
     1
 }
 
@@ -544,13 +831,59 @@ fn default_macro_speed() -> f32 {
     1.0
 }
 
+fn default_biomimetic_intensity() -> f32 {
+    0.65
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::behavior::v2::{
+        train_behavior_profile_with_retention, BehaviorCaptureMetadata, BehaviorSessionV2,
+        SourceRetention,
+    };
+
+    fn macro_fixture(id: &str, trigger_keys: Vec<&str>, mode: MacroMode) -> MacroRule {
+        MacroRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            import_error: None,
+            enabled: true,
+            trigger_keys: trigger_keys.into_iter().map(str::to_string).collect(),
+            mode,
+            repeat_count: 3,
+            speed: 1.0,
+            record_mouse_move: true,
+            record_mouse_clicks: true,
+            target: None,
+            behavior_policy: None,
+            program: AutomationProgram::Macro {
+                steps: vec![MacroStep::Delay {
+                    duration_ms: 10,
+                    duration_max_ms: None,
+                }],
+            },
+        }
+    }
 
     #[test]
     fn default_config_is_valid() {
         assert!(AppConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn playback_overlay_defaults_to_disabled_and_legacy_configs_stay_disabled() {
+        let default_config = AppConfig::default();
+        assert!(!default_config.show_playback_overlay);
+
+        let mut saved = serde_json::to_value(default_config).expect("config should serialize");
+        saved
+            .as_object_mut()
+            .expect("config should be an object")
+            .remove("showPlaybackOverlay");
+        let restored: AppConfig = serde_json::from_value(saved)
+            .expect("legacy config without overlay setting should deserialize");
+        assert!(!restored.show_playback_overlay);
     }
 
     #[test]
@@ -601,6 +934,7 @@ mod tests {
         let macro_rule = MacroRule {
             id: "macro-a".to_string(),
             name: "宏 A".to_string(),
+            import_error: None,
             enabled: true,
             trigger_keys: vec!["Ctrl".to_string(), "F8".to_string()],
             mode: MacroMode::Once,
@@ -609,6 +943,7 @@ mod tests {
             record_mouse_move: true,
             record_mouse_clicks: true,
             target: None,
+            behavior_policy: None,
             program: AutomationProgram::Macro {
                 steps: vec![MacroStep::Delay {
                     duration_ms: 10,
@@ -627,6 +962,55 @@ mod tests {
             .validate()
             .expect_err("duplicate macro trigger should fail");
         assert_eq!(error.code, "macro_conflict");
+    }
+
+    #[test]
+    fn global_hold_and_ordinary_shortcuts_validate() {
+        let mut config = AppConfig::default();
+        config.macros.push(macro_fixture(
+            "ordinary-shortcut",
+            vec!["Ctrl", "F9"],
+            MacroMode::Once,
+        ));
+        config
+            .validate()
+            .expect("ordinary shortcut should validate");
+
+        config.macros[0].mode = MacroMode::Hold;
+        config
+            .validate()
+            .expect("enabled Hold with a global shortcut should validate");
+    }
+
+    #[test]
+    fn macro_shortcuts_cannot_contain_default_or_custom_emergency_key() {
+        for (keys, mode) in [
+            (vec!["F12"], MacroMode::Hold),
+            (vec!["Ctrl", "F12"], MacroMode::Once),
+        ] {
+            let mut config = AppConfig::default();
+            config
+                .macros
+                .push(macro_fixture("emergency-conflict", keys, mode));
+            assert_eq!(
+                config.validate().expect_err("F12 conflict").code,
+                "macro_emergency_key_conflict"
+            );
+        }
+
+        let mut config = AppConfig {
+            emergency_stop: "F11".to_string(),
+            ..AppConfig::default()
+        };
+        config.macros.push(macro_fixture(
+            "custom-emergency-conflict",
+            vec!["Shift", "F11"],
+            MacroMode::Hold,
+        ));
+        assert_eq!(
+            config.validate().expect_err("custom conflict").code,
+            "macro_emergency_key_conflict"
+        );
     }
 
     #[test]
@@ -695,11 +1079,33 @@ mod tests {
     }
 
     #[test]
+    fn schema_five_configs_gain_an_empty_macro_file_index() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 5,
+            "macros": [{
+                "id": "inline-macro",
+                "name": "Inline macro",
+                "steps": []
+            }]
+        }))
+        .expect("schema five config should deserialize");
+        assert!(config.macro_files.is_empty());
+        assert_eq!(config.macros.len(), 1);
+
+        let (config, migrated) = config.migrate().expect("schema five should migrate");
+        assert!(migrated);
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        let saved = serde_json::to_value(config).expect("migrated config should serialize");
+        assert_eq!(saved["macroFiles"], serde_json::json!([]));
+    }
+
+    #[test]
     fn rhai_program_requires_api_version_one_and_non_empty_source() {
         let mut config = AppConfig::default();
         config.macros.push(MacroRule {
             id: "rhai-macro".to_string(),
             name: "Rhai".to_string(),
+            import_error: None,
             enabled: false,
             trigger_keys: Vec::new(),
             mode: MacroMode::Once,
@@ -708,6 +1114,7 @@ mod tests {
             record_mouse_move: true,
             record_mouse_clicks: true,
             target: None,
+            behavior_policy: None,
             program: AutomationProgram::Rhai {
                 source: "press(\"A\");".to_string(),
                 api_version: 1,
@@ -720,6 +1127,160 @@ mod tests {
         assert_eq!(
             config.validate().expect_err("wrong API version").code,
             "rhai_api_version"
+        );
+    }
+
+    #[test]
+    fn invalid_imported_macro_must_stay_disabled_until_repaired() {
+        let mut config = AppConfig::default();
+        config.macros.push(MacroRule {
+            id: "invalid-import".to_string(),
+            name: "待修复".to_string(),
+            import_error: Some("JSON 格式不合法".to_string()),
+            enabled: false,
+            trigger_keys: Vec::new(),
+            mode: MacroMode::Once,
+            repeat_count: 1,
+            speed: 1.0,
+            record_mouse_move: true,
+            record_mouse_clicks: true,
+            target: None,
+            behavior_policy: None,
+            program: AutomationProgram::Rhai {
+                source: "broken".to_string(),
+                api_version: 1,
+            },
+        });
+        assert!(config.validate().is_ok());
+        config.macros[0].enabled = true;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "macro_import_invalid_enabled"
+        );
+    }
+
+    #[test]
+    fn legacy_configs_get_safe_biomimetic_defaults() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "macros": []
+        }))
+        .expect("v2 config should deserialize");
+        assert!(config.behavior_profiles.is_empty());
+        assert!(config.active_behavior_profile_id.is_none());
+        assert!(config.selected_behavior_profile_ids.is_empty());
+        assert!(config.selected_biomimetic_input_ids.is_empty());
+        assert!(!config.biomimetic_enabled);
+        assert_eq!(config.biomimetic_intensity, 0.65);
+        assert!(config.retain_behavior_records);
+        let (config, migrated) = config.migrate().expect("v2 config should migrate");
+        assert!(migrated);
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        config.validate().expect("migrated config should validate");
+    }
+
+    #[test]
+    fn biomimetic_intensity_is_bounded() {
+        let config = AppConfig {
+            biomimetic_intensity: 1.1,
+            ..AppConfig::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("out of range intensity should fail");
+        assert_eq!(error.code, "behavior_intensity_invalid");
+    }
+
+    #[test]
+    fn v2_policy_has_safe_defaults_when_missing_from_old_config() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 4,
+            "macros": []
+        }))
+        .expect("old config should deserialize with V2 defaults");
+        assert!(!config.behavior_policy.enabled);
+        assert_eq!(config.behavior_policy.timing_strength, 0.0);
+        assert_eq!(config.behavior_policy.correction_strength, 0.15);
+        let (config, migrated) = config.migrate().expect("old config should migrate");
+        assert!(migrated);
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        config
+            .validate()
+            .expect("migrated V2 defaults should validate");
+    }
+
+    #[test]
+    fn v2_policy_strengths_are_bounded() {
+        let mut config = AppConfig::default();
+        config.behavior_policy.pointer_path_strength = 1.1;
+        let error = config
+            .validate()
+            .expect_err("out of range V2 strength should fail");
+        assert_eq!(error.code, "behavior_policy_strength_invalid");
+    }
+
+    #[test]
+    fn v2_active_profile_and_macro_policy_round_trip() {
+        let session = BehaviorSessionV2 {
+            id: "config-session".to_string(),
+            name: "Config session".to_string(),
+            api_version: crate::BEHAVIOR_V2_API_VERSION,
+            created_at_ms: 1,
+            duration_ms: 0,
+            task_tag: None,
+            capture_metadata: BehaviorCaptureMetadata::default(),
+            raw_events: Vec::new(),
+        };
+        let profile = train_behavior_profile_with_retention(&session, SourceRetention::Persisted)
+            .expect("empty session still produces an explicit insufficient profile");
+        let profile_id = profile.id.clone();
+        let macro_rule = MacroRule {
+            id: "policy-macro".to_string(),
+            name: "Policy macro".to_string(),
+            import_error: None,
+            enabled: false,
+            trigger_keys: vec!["F8".to_string()],
+            mode: MacroMode::Once,
+            repeat_count: 1,
+            speed: 1.0,
+            record_mouse_move: true,
+            record_mouse_clicks: true,
+            target: None,
+            behavior_policy: Some(BehaviorPolicy {
+                enabled: true,
+                profile_id: Some(profile_id.clone()),
+                timing_strength: 0.5,
+                pointer_path_strength: 0.4,
+                pause_strength: 0.2,
+                correction_strength: 0.3,
+                speed_scale: 1.1,
+                seed: Some(42),
+            }),
+            program: AutomationProgram::Macro { steps: Vec::new() },
+        };
+        let mut config = AppConfig::default();
+        config.behavior_sessions_v2.push(session);
+        config.behavior_profiles_v2.push(profile);
+        config.active_behavior_profile_v2_id = Some(profile_id.clone());
+        config.behavior_policy.profile_id = Some(profile_id);
+        config.macros.push(macro_rule);
+
+        let serialized = serde_json::to_string(&config).expect("config should serialize");
+        let round_trip: AppConfig =
+            serde_json::from_str(&serialized).expect("config should deserialize");
+        round_trip
+            .validate()
+            .expect("round-tripped config should validate");
+        assert_eq!(
+            round_trip.macros[0]
+                .behavior_policy
+                .as_ref()
+                .and_then(|policy| policy.seed),
+            Some(42)
+        );
+        assert_eq!(
+            round_trip.active_behavior_profile_v2_id,
+            round_trip.behavior_policy.profile_id
         );
     }
 }

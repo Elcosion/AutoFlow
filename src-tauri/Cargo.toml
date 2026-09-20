@@ -27,7 +27,7 @@ tauri = { version = "2", features = [] }
 rhai = "1.23"
 sha2 = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-imageproc = { version = "0.27.0", default-features = false }
+imageproc = { version = "0.27.0", default-features = false, features = ["rayon"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2.0.1"
@@ -38,6 +38,10 @@ windows = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_JobObjects",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging"

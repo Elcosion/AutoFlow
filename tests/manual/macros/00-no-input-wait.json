@@ -1,0 +1,17 @@
+{
+  "id": "manual-acceptance-00-no-input-wait",
+  "name": "MANUAL_TEST 00 - No-input wait",
+  "enabled": false,
+  "triggerKeys": [],
+  "mode": "once",
+  "repeatCount": 1,
+  "speed": 1.0,
+  "recordMouseMove": false,
+  "recordMouseClicks": false,
+  "program": {
+    "kind": "macro",
+    "steps": [
+      { "type": "delay", "durationMs": 1500 }
+    ]
+  }
+}

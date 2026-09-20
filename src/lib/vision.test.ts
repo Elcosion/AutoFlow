@@ -2,14 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   classifyMacroSource,
   macroToSource,
+  parseMacroSource,
 } from "./macroSource";
 import { normalizeConfig } from "./tauri";
-import {
-  RHAI_API_NAMES,
-  RHAI_API_SIGNATURES,
-} from "../components/RhaiEditor";
+import { RHAI_API_NAMES, RHAI_API_SIGNATURES } from "../components/RhaiEditor";
+import { RHAI_API_REFERENCE_SNIPPETS } from "./rhaiCompletions";
 import { isSupportedAssetFileName } from "../components/AssetManager";
-import type { MacroRule, MacroStep } from "../types/config";
+import type { BehaviorProfileV2, MacroRule, MacroStep } from "../types/config";
 
 const rhaiMacro: MacroRule = {
   id: "vision-macro",
@@ -24,15 +23,25 @@ const rhaiMacro: MacroRule = {
   program: {
     kind: "rhai",
     apiVersion: 1,
-    source: 'let title = active_window_title();\nwait_image("button", 0, 0, 400, 300, 0.9, 1000, 100);',
+    source:
+      'let title = active_window_title();\nwait_image("button.png", 0, 0, 400, 300, 0.9, 1000, 100);',
   },
 };
 
 describe("vision automation frontend contracts", () => {
   it("classifies vision calls as advanced and preserves their source", () => {
     expect(classifyMacroSource('window_exists("Editor");')).toBe("advanced");
-    if (rhaiMacro.program.kind !== "rhai") throw new Error("expected Rhai macro");
+    if (rhaiMacro.program.kind !== "rhai")
+      throw new Error("expected Rhai macro");
     expect(macroToSource(rhaiMacro)).toBe(rhaiMacro.program.source);
+  });
+
+  it("classifies custom stop popups as advanced Rhai", () => {
+    expect(classifyMacroSource('stop_with_message("完成");')).toBe("advanced");
+    expect(RHAI_API_NAMES).toContain("stop_with_message");
+    expect(RHAI_API_SIGNATURES.stop_with_message).toContain(
+      "stop_with_message",
+    );
   });
 
   it("exposes all vision APIs with signatures for completion and help", () => {
@@ -49,6 +58,19 @@ describe("vision automation frontend contracts", () => {
       expect(RHAI_API_NAMES).toContain(name);
       expect(RHAI_API_SIGNATURES[name]).toContain(name);
     }
+  });
+
+  it("documents the multi-scale options in the right-side reference", () => {
+    const findImage = RHAI_API_REFERENCE_SNIPPETS.find(
+      (snippet) =>
+        snippet.apiName === "find_image" && snippet.name.includes("options"),
+    );
+    expect(findImage?.code).toContain("scale_min: 0.67");
+    expect(findImage?.code).toContain("scale_max: 2.00");
+    expect(findImage?.code).toContain("robust_score");
+    expect(findImage?.code).toContain("anchor_recovery_used");
+    expect(findImage?.code).toContain("single_match_ms");
+    expect(findImage?.code).toContain("不是百分数");
   });
 
   it("normalizes legacy config while retaining managed asset metadata", () => {
@@ -70,7 +92,8 @@ describe("vision automation frontend contracts", () => {
         },
       ],
     });
-    expect(normalized.schemaVersion).toBe(2);
+    expect(normalized.schemaVersion).toBe(6);
+    expect(normalized.macroFiles).toEqual([]);
     expect(normalized.assets[0].fileName).toBe("asset_button_abc.png");
     expect(normalized.macros[0].program).toEqual({
       kind: "macro",
@@ -83,5 +106,84 @@ describe("vision automation frontend contracts", () => {
     expect(isSupportedAssetFileName("button.jpeg")).toBe(true);
     expect(isSupportedAssetFileName("button.webp")).toBe(false);
     expect(isSupportedAssetFileName("button.png.exe")).toBe(false);
+  });
+
+  it("normalizes nested macro policy and V2 model fallback metadata", () => {
+    const normalized = normalizeConfig({
+      behaviorProfilesV2: [
+        {
+          id: "profile-v2",
+          name: "Profile",
+          apiVersion: 2,
+          sourceSessionIds: ["session-v2"],
+          createdAtMs: 1,
+          sourceRetention: "ephemeral",
+          coverage: {
+            rawEventCount: 0,
+            pointerEpisodeCount: 0,
+            validPointerEpisodeCount: 0,
+            clickAssociatedPointerEpisodeCount: 0,
+            clickEpisodeCount: 0,
+            discardedEventCount: 0,
+            discardedReasons: {},
+            bucketCoverage: [],
+            quality: "insufficient",
+          },
+          pointerModel: {
+            buckets: [],
+            totalEpisodeCount: 0,
+            validEpisodeCount: 0,
+            discardedEpisodeCount: 0,
+          },
+          clickModel: { buckets: [], totalClickCount: 0, validClickCount: 0 },
+        } as unknown as BehaviorProfileV2,
+      ],
+      macros: [
+        {
+          ...rhaiMacro,
+          behaviorPolicy: {
+            enabled: true,
+            profileId: "profile-v2",
+            timingStrength: 4,
+            pointerPathStrength: -1,
+            pauseStrength: 0.25,
+            correctionStrength: 0.4,
+            speedScale: 99,
+            seed: 12.9,
+          },
+        },
+      ],
+    });
+    expect(normalized.macros[0].behaviorPolicy).toMatchObject({
+      enabled: true,
+      profileId: "profile-v2",
+      timingStrength: 1,
+      pointerPathStrength: 0,
+      speedScale: 4,
+      seed: 12,
+    });
+    expect(normalized.behaviorProfilesV2[0].modelConfig.minBucketSamples).toBe(
+      3,
+    );
+    expect(normalized.behaviorProfilesV2[0].pointerModel.buckets).toEqual([]);
+  });
+
+  it("keeps a macro policy when compatible source is edited", () => {
+    const policyMacro: MacroRule = {
+      ...rhaiMacro,
+      program: { kind: "macro", steps: [] },
+      behaviorPolicy: {
+        enabled: true,
+        profileId: "profile-v2",
+        timingStrength: 0.5,
+        pointerPathStrength: 0.4,
+        pauseStrength: 0.3,
+        correctionStrength: 0.2,
+        speedScale: 1.1,
+        seed: 9,
+      },
+    };
+    const parsed = parseMacroSource("move_to(10, 20);", policyMacro);
+    expect(parsed.behaviorPolicy).toEqual(policyMacro.behaviorPolicy);
   });
 });

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="96" viewBox="0 0 180 96" role="img" aria-labelledby="title desc">
+  <title id="title">VISION TARGET</title>
+  <desc id="desc">Auditable reference target for the offline AutoFlow manual acceptance harness.</desc>
+  <rect width="180" height="96" fill="#0b6e69" stroke="#f5c542" stroke-width="6"/>
+  <rect x="11" y="11" width="158" height="74" fill="none" stroke="#102a43" stroke-width="5"/>
+  <text x="90" y="56" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="18" font-weight="700" letter-spacing="1" text-anchor="middle">VISION TARGET</text>
+</svg>

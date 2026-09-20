@@ -20,6 +20,24 @@
         "minHeight": 640,
         "resizable": true,
         "decorations": false
+      },
+      {
+        "label": "playback-overlay",
+        "title": "AutoFlow Playback Progress",
+        "url": "index.html?window=playback-overlay",
+        "width": 320,
+        "height": 178,
+        "visible": false,
+        "create": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "focusable": false,
+        "resizable": false,
+        "shadow": false,
+        "center": false
       }
     ],
     "security": { "csp": null }

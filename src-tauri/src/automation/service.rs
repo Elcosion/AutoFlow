@@ -1,13 +1,14 @@
 use super::assets::{AssetCacheStats, AssetStore};
 use super::capture::WindowsCaptureBackend;
 use super::types::{
-    AutomationAsset, CaptureBackend, CaptureFrame, ImageMatch, Point, RgbColor, ScreenRect,
-    VisionApi, VisionError, VisionMatcher, VisionPollOptions, WindowProvider, WindowRectValue,
-    MAX_POLL_MS, MAX_WAIT_MS, MIN_POLL_MS,
+    AutomationAsset, CaptureBackend, CaptureFrame, ImageMatch, MatcherMode, MatcherOptions, Point,
+    RgbColor, ScreenRect, VisionApi, VisionDiagnostics, VisionError, VisionMatcher,
+    VisionPollOptions, VisionSearchResult, WindowProvider, WindowRectValue, MAX_POLL_MS,
+    MAX_WAIT_MS, MIN_POLL_MS,
 };
 use super::vision::ImageProcVisionMatcher;
 use super::window::WindowsWindowProvider;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -27,6 +28,32 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const DEFAULT_CAPTURE_INTERVAL: Duration = Duration::from_millis(50);
 const WAIT_SLICE: Duration = Duration::from_millis(25);
+const MAX_LAST_MATCHES: usize = 128;
+const LAST_MATCH_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LastMatchKey {
+    resource_id: String,
+    file_name: String,
+    fingerprint: String,
+    region: ScreenRect,
+    threshold_bits: u32,
+    mode: MatcherMode,
+    max_candidates: usize,
+    scale_min_bits: u32,
+    scale_max_bits: u32,
+    scale_step_bits: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastMatch {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale: f32,
+    last_used: Instant,
+}
 
 pub struct VisionService {
     window: Arc<dyn WindowProvider>,
@@ -34,11 +61,15 @@ pub struct VisionService {
     matcher: Arc<dyn VisionMatcher>,
     assets: Arc<AssetStore>,
     catalog: RwLock<HashMap<String, AutomationAsset>>,
+    last_matches: Mutex<HashMap<LastMatchKey, LastMatch>>,
     last_capture: Mutex<Option<Instant>>,
     min_capture_interval: Duration,
 }
 
 impl VisionService {
+    pub fn asset_root(&self) -> PathBuf {
+        self.assets.root().to_path_buf()
+    }
     pub fn new(asset_root: PathBuf) -> Arc<Self> {
         Self::with_parts(
             Arc::new(WindowsWindowProvider::new()),
@@ -62,17 +93,54 @@ impl VisionService {
             matcher,
             assets,
             catalog: RwLock::new(HashMap::new()),
+            last_matches: Mutex::new(HashMap::new()),
             last_capture: Mutex::new(None),
             min_capture_interval,
         })
     }
 
     pub fn set_assets(&self, assets: &[AutomationAsset]) {
+        // A catalog refresh may include edits, renames, deletions or a file
+        // restored under the same name. Clear prepared and scaled templates
+        // when the managed metadata actually changes; playback also calls
+        // this method, so clearing on every call would defeat the cache.
+        let catalog_changed = self
+            .catalog
+            .read()
+            .map(|catalog| {
+                let existing_ids = catalog
+                    .values()
+                    .map(|asset| asset.id.to_lowercase())
+                    .collect::<HashSet<_>>();
+                existing_ids.len() != assets.len()
+                    || assets.iter().any(|asset| {
+                        catalog
+                            .get(&asset.id.to_lowercase())
+                            .is_none_or(|current| current != asset)
+                    })
+            })
+            .unwrap_or(true);
+        if catalog_changed {
+            self.assets.invalidate_all();
+        }
         if let Ok(mut catalog) = self.catalog.write() {
             catalog.clear();
             for asset in assets {
-                catalog.insert(asset.id.clone(), asset.clone());
+                catalog.insert(asset.file_name.to_lowercase(), asset.clone());
+                catalog
+                    .entry(asset.id.to_lowercase())
+                    .or_insert_with(|| asset.clone());
             }
+        }
+        let stable_assets = assets
+            .iter()
+            .map(|asset| (asset.id.to_lowercase(), asset.file_name.to_lowercase()))
+            .collect::<HashSet<_>>();
+        if let Ok(mut last_matches) = self.last_matches.lock() {
+            last_matches.retain(|key, _| {
+                stable_assets
+                    .contains(&(key.resource_id.to_lowercase(), key.file_name.to_lowercase()))
+            });
         }
     }
 
@@ -84,17 +152,21 @@ impl VisionService {
         self.assets.cache_stats()
     }
 
-    fn asset(&self, asset_id: &str) -> Result<AutomationAsset, VisionError> {
-        if asset_id.trim().is_empty() {
-            return Err(VisionError::new("asset_not_found", "资源 ID 不能为空"));
+    fn asset(&self, file_name: &str) -> Result<AutomationAsset, VisionError> {
+        let file_name = file_name.trim();
+        if file_name.is_empty() {
+            return Err(VisionError::new("asset_not_found", "图像文件名不能为空"));
         }
         self.catalog
             .read()
             .map_err(|_| VisionError::new("asset_not_found", "图像资源目录状态异常"))?
-            .get(asset_id)
+            .get(&file_name.to_lowercase())
             .cloned()
             .ok_or_else(|| {
-                VisionError::new("asset_not_found", format!("找不到图像资源：{asset_id}"))
+                VisionError::new(
+                    "asset_not_found",
+                    format!("找不到图像文件：{file_name}（需要包含 .png、.jpg 或 .jpeg 后缀）"),
+                )
             })
     }
 
@@ -189,15 +261,155 @@ impl VisionService {
 
     fn find_image_once(
         &self,
-        asset_id: &str,
+        file_name: &str,
         region: ScreenRect,
         threshold: f32,
         cancel: &AtomicBool,
-    ) -> Result<Option<ImageMatch>, VisionError> {
-        let asset = self.asset(asset_id)?;
-        let template = self.assets.load_template(&asset)?;
-        let frame = self.capture_region(region, cancel)?;
-        self.matcher.find_template(&frame, &template, threshold)
+        options: &MatcherOptions,
+    ) -> Result<VisionSearchResult, VisionError> {
+        let started = Instant::now();
+        let asset = self.asset(file_name)?;
+        let prepare_started = Instant::now();
+        let prepared = self.assets.load_prepared_template(&asset)?;
+        let mut diagnostics = VisionDiagnostics::for_mode(options.mode);
+        diagnostics.prepare_ms = prepare_started.elapsed().as_millis() as u64;
+        let key = LastMatchKey {
+            resource_id: asset.id.clone(),
+            file_name: asset.file_name.clone(),
+            fingerprint: prepared.fingerprint().to_string(),
+            region,
+            threshold_bits: threshold.to_bits(),
+            mode: options.mode,
+            max_candidates: options.max_candidates,
+            scale_min_bits: options.scale_min.to_bits(),
+            scale_max_bits: options.scale_max.to_bits(),
+            scale_step_bits: options.scale_step.map(f32::to_bits),
+        };
+
+        if options.prefer_last {
+            if let Some(last) = self.take_last_match(&key) {
+                if let Some(previous_region) = previous_match_region(region, last) {
+                    diagnostics.previous_hit_used = true;
+                    let capture_started = Instant::now();
+                    let previous_frame = self.capture_region(previous_region, cancel);
+                    diagnostics.capture_ms = diagnostics
+                        .capture_ms
+                        .saturating_add(capture_started.elapsed().as_millis() as u64);
+                    match previous_frame {
+                        Ok(frame) => {
+                            let mut previous_options = options.clone();
+                            previous_options.preferred_scale = Some(last.scale);
+                            let result = self.matcher.find_prepared_template(
+                                &frame,
+                                prepared.frame(),
+                                Some(prepared.as_ref()),
+                                threshold,
+                                &previous_options,
+                            )?;
+                            diagnostics.add_attempt(&result.diagnostics);
+                            if let Some(image) = result.image {
+                                self.remember_last_match(
+                                    &key,
+                                    &image,
+                                    diagnostics.matched_scale.unwrap_or(1.0),
+                                );
+                                diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                                diagnostics.single_match_ms = diagnostics.total_ms;
+                                return Ok(VisionSearchResult {
+                                    image: Some(image),
+                                    diagnostics,
+                                });
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.code.as_str(),
+                                "capture_device_lost" | "capture_timeout"
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+
+        let capture_started = Instant::now();
+        let frame = self.capture_region(region, cancel);
+        diagnostics.capture_ms = diagnostics
+            .capture_ms
+            .saturating_add(capture_started.elapsed().as_millis() as u64);
+        let frame = frame?;
+        let result = self.matcher.find_prepared_template(
+            &frame,
+            prepared.frame(),
+            Some(prepared.as_ref()),
+            threshold,
+            options,
+        )?;
+        diagnostics.add_attempt(&result.diagnostics);
+        if let Some(image) = result.image {
+            self.remember_last_match(&key, &image, diagnostics.matched_scale.unwrap_or(1.0));
+            diagnostics.total_ms = started.elapsed().as_millis() as u64;
+            diagnostics.single_match_ms = diagnostics.total_ms;
+            return Ok(VisionSearchResult {
+                image: Some(image),
+                diagnostics,
+            });
+        }
+        // Do not keep retrying a stale location after a complete miss. A
+        // subsequent call must perform a fresh search rather than repeatedly
+        // treating an old coordinate and size as authoritative.
+        self.forget_last_match(&key);
+        diagnostics.total_ms = started.elapsed().as_millis() as u64;
+        diagnostics.single_match_ms = diagnostics.total_ms;
+        Ok(VisionSearchResult {
+            image: None,
+            diagnostics,
+        })
+    }
+
+    fn take_last_match(&self, key: &LastMatchKey) -> Option<LastMatch> {
+        let mut cache = self.last_matches.lock().ok()?;
+        let cached = cache.get_mut(key)?;
+        if cached.last_used.elapsed() > LAST_MATCH_TTL {
+            cache.remove(key);
+            return None;
+        }
+        cached.last_used = Instant::now();
+        Some(*cached)
+    }
+
+    fn remember_last_match(&self, key: &LastMatchKey, image: &ImageMatch, scale: f32) {
+        let Ok(mut cache) = self.last_matches.lock() else {
+            return;
+        };
+        cache.retain(|_, value| value.last_used.elapsed() <= LAST_MATCH_TTL);
+        while cache.len() >= MAX_LAST_MATCHES {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, value)| value.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            key.clone(),
+            LastMatch {
+                x: image.x,
+                y: image.y,
+                width: image.width,
+                height: image.height,
+                scale,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    fn forget_last_match(&self, key: &LastMatchKey) {
+        if let Ok(mut cache) = self.last_matches.lock() {
+            cache.remove(key);
+        }
     }
 }
 
@@ -313,23 +525,60 @@ impl VisionApi for VisionService {
 
     fn find_image(
         &self,
-        asset_id: &str,
+        file_name: &str,
         region: ScreenRect,
         threshold: f32,
         cancel: &AtomicBool,
     ) -> Result<Option<ImageMatch>, VisionError> {
+        self.find_image_diagnostic(
+            file_name,
+            region,
+            threshold,
+            cancel,
+            &MatcherOptions::default(),
+        )
+        .map(|result| result.image)
+    }
+
+    fn find_image_diagnostic(
+        &self,
+        file_name: &str,
+        region: ScreenRect,
+        threshold: f32,
+        cancel: &AtomicBool,
+        options: &MatcherOptions,
+    ) -> Result<VisionSearchResult, VisionError> {
         super::vision::validate_threshold(threshold)?;
+        options.validate()?;
         region.validate()?;
-        self.find_image_once(asset_id, region, threshold, cancel)
+        self.find_image_once(file_name, region, threshold, cancel, options)
     }
 
     fn wait_image(
         &self,
-        asset_id: &str,
+        file_name: &str,
         region: ScreenRect,
         threshold: f32,
         options: VisionPollOptions<'_>,
     ) -> Result<Option<ImageMatch>, VisionError> {
+        self.wait_image_diagnostic(
+            file_name,
+            region,
+            threshold,
+            options,
+            &MatcherOptions::default(),
+        )
+        .map(|result| result.image)
+    }
+
+    fn wait_image_diagnostic(
+        &self,
+        file_name: &str,
+        region: ScreenRect,
+        threshold: f32,
+        options: VisionPollOptions<'_>,
+        matcher_options: &MatcherOptions,
+    ) -> Result<VisionSearchResult, VisionError> {
         let VisionPollOptions {
             timeout,
             poll,
@@ -337,25 +586,51 @@ impl VisionApi for VisionService {
             budget,
         } = options;
         super::vision::validate_threshold(threshold)?;
+        matcher_options.validate()?;
         region.validate()?;
         validate_wait(timeout, poll)?;
         let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut diagnostics = VisionDiagnostics::for_mode(matcher_options.mode);
         loop {
             budget.consume()?;
-            match self.find_image_once(asset_id, region, threshold, cancel) {
-                Ok(Some(found)) => return Ok(Some(found)),
-                Ok(None) => {}
+            match self.find_image_once(file_name, region, threshold, cancel, matcher_options) {
+                Ok(attempt) => {
+                    diagnostics.add_attempt(&attempt.diagnostics);
+                    diagnostics.previous_hit_used |= attempt.diagnostics.previous_hit_used;
+                    if let Some(found) = attempt.image {
+                        diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                        diagnostics.wait_total_ms = diagnostics.total_ms;
+                        return Ok(VisionSearchResult {
+                            image: Some(found),
+                            diagnostics,
+                        });
+                    }
+                }
                 Err(error)
                     if error.code == "capture_device_lost" || error.code == "capture_timeout" =>
                 {
                     if Instant::now() >= deadline {
-                        return Ok(None);
+                        diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                        diagnostics.wait_total_ms = diagnostics.total_ms;
+                        return Ok(VisionSearchResult {
+                            image: None,
+                            diagnostics,
+                        });
                     }
                 }
                 Err(error) => return Err(error),
             }
+            if cancel.load(Ordering::SeqCst) {
+                return Err(VisionError::cancelled());
+            }
             if Instant::now() >= deadline {
-                return Ok(None);
+                diagnostics.total_ms = started.elapsed().as_millis() as u64;
+                diagnostics.wait_total_ms = diagnostics.total_ms;
+                return Ok(VisionSearchResult {
+                    image: None,
+                    diagnostics,
+                });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if !interruptible_wait(poll.min(remaining), cancel) {
@@ -363,6 +638,33 @@ impl VisionApi for VisionService {
             }
         }
     }
+}
+
+fn previous_match_region(requested: ScreenRect, last: LastMatch) -> Option<ScreenRect> {
+    let scale_margin = f64::from(last.scale.max(1.0));
+    let margin_x = ((f64::from(last.width) * 2.0 * scale_margin).round() as u64).max(64);
+    let margin_y = ((f64::from(last.height) * 2.0 * scale_margin).round() as u64).max(64);
+    let margin_x = i64::try_from(margin_x).ok()?;
+    let margin_y = i64::try_from(margin_y).ok()?;
+    let left = i64::from(last.x).checked_sub(margin_x)?;
+    let top = i64::from(last.y).checked_sub(margin_y)?;
+    let right = i64::from(last.x)
+        .checked_add(i64::from(last.width))?
+        .checked_add(margin_x)?;
+    let bottom = i64::from(last.y)
+        .checked_add(i64::from(last.height))?
+        .checked_add(margin_y)?;
+    let expanded = ScreenRect::from_parts(
+        i32::try_from(left).ok()?,
+        i32::try_from(top).ok()?,
+        u32::try_from(right.checked_sub(left)?).ok()?,
+        u32::try_from(bottom.checked_sub(top)?).ok()?,
+    );
+    let mut clipped = requested.intersection(&expanded)?;
+    if let Some(virtual_screen) = virtual_screen_region() {
+        clipped = clipped.intersection(&virtual_screen)?;
+    }
+    (clipped.width >= last.width && clipped.height >= last.height).then_some(clipped)
 }
 
 fn validate_wait(timeout: Duration, poll: Duration) -> Result<(), VisionError> {
@@ -564,9 +866,12 @@ mod tests {
     use super::*;
     use crate::automation::types::{CaptureBackend, VisionPollBudget, WindowId, WindowInfo};
     use image::codecs::png::PngEncoder;
+    use image::imageops::{resize, FilterType};
     use image::{ColorType, ImageEncoder};
     use std::collections::VecDeque;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct MockWindowProvider {
@@ -627,6 +932,26 @@ mod tests {
         }
     }
 
+    struct SequenceCaptureBackend {
+        frames: VecDeque<CaptureFrame>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CaptureBackend for SequenceCaptureBackend {
+        fn capture_region(&mut self, _region: ScreenRect) -> Result<CaptureFrame, VisionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.frames
+                .pop_front()
+                .ok_or_else(|| VisionError::new("capture_timeout", "no frame"))
+        }
+
+        fn capture_window(&mut self, _window: WindowId) -> Result<CaptureFrame, VisionError> {
+            self.capture_region(ScreenRect::from_parts(0, 0, 1, 1))
+        }
+
+        fn reset(&mut self) {}
+    }
+
     fn service_with(frame: CaptureFrame) -> Arc<VisionService> {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -656,6 +981,32 @@ mod tests {
         )
     }
 
+    fn service_with_sequence(
+        frames: Vec<CaptureFrame>,
+        calls: Arc<AtomicUsize>,
+        root: PathBuf,
+    ) -> Arc<VisionService> {
+        VisionService::with_parts(
+            Arc::new(MockWindowProvider {
+                windows: Mutex::new(vec![WindowInfo {
+                    id: WindowId(1),
+                    title: "Demo Window".to_string(),
+                    rect: ScreenRect::from_parts(0, 0, 128, 96),
+                    visible: true,
+                    minimized: false,
+                    process_id: Some(42),
+                }]),
+            }),
+            Box::new(SequenceCaptureBackend {
+                frames: VecDeque::from(frames),
+                calls,
+            }),
+            Arc::new(ImageProcVisionMatcher::new()),
+            Arc::new(AssetStore::new(root)),
+            Duration::ZERO,
+        )
+    }
+
     fn png_image(width: u32, height: u32, pixels: &[[u8; 4]]) -> Vec<u8> {
         let mut output = Vec::new();
         PngEncoder::new(&mut output)
@@ -672,6 +1023,74 @@ mod tests {
             )
             .expect("test png");
         output
+    }
+
+    fn vision_template_pixels() -> Vec<[u8; 4]> {
+        (0..24_u32 * 24)
+            .map(|index| {
+                let value = ((index.wrapping_mul(37).wrapping_add(19)) % 251) as u8;
+                [
+                    value.wrapping_add(17),
+                    value.wrapping_mul(3).wrapping_add(31),
+                    value.wrapping_mul(5).wrapping_add(47),
+                    255,
+                ]
+            })
+            .collect()
+    }
+
+    fn screen_frame(target: (u32, u32), template: &CaptureFrame) -> CaptureFrame {
+        screen_frame_sized(target, template, 128, 96)
+    }
+
+    fn screen_frame_sized(
+        target: (u32, u32),
+        template: &CaptureFrame,
+        width: u32,
+        height: u32,
+    ) -> CaptureFrame {
+        let mut pixels = vec![19_u8; (width * height * 4) as usize];
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel[0] = 7;
+            pixel[1] = 13;
+            pixel[2] = 23;
+            pixel[3] = 255;
+        }
+        for y in 0..template.height {
+            for x in 0..template.width {
+                let source_index = ((y * template.width + x) * 4) as usize;
+                let target_index = (((target.1 + y) * width + target.0 + x) * 4) as usize;
+                pixels[target_index..target_index + 4]
+                    .copy_from_slice(&template.pixels_bgra()[source_index..source_index + 4]);
+            }
+        }
+        CaptureFrame::from_bgra(Point { x: 0, y: 0 }, width, height, pixels).expect("screen frame")
+    }
+
+    fn scaled_screen_frame(
+        target: (u32, u32),
+        scale: f32,
+        template: &CaptureFrame,
+        width: u32,
+        height: u32,
+    ) -> CaptureFrame {
+        let mut pixels = vec![0_u8; (width * height * 4) as usize];
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[7, 13, 23, 255]);
+        }
+        let gray = ImageProcVisionMatcher::gray(template).expect("template gray");
+        let scaled_width = (f64::from(template.width) * f64::from(scale)).round() as u32;
+        let scaled_height = (f64::from(template.height) * f64::from(scale)).round() as u32;
+        let scaled = resize(&gray, scaled_width, scaled_height, FilterType::Triangle);
+        for y in 0..scaled_height {
+            for x in 0..scaled_width {
+                let value = scaled.get_pixel(x, y).0[0];
+                let index = (((target.1 + y) * width + target.0 + x) * 4) as usize;
+                pixels[index..index + 4].copy_from_slice(&[value, value, value, 255]);
+            }
+        }
+        CaptureFrame::from_bgra(Point { x: 0, y: 0 }, width, height, pixels)
+            .expect("scaled screen frame")
     }
 
     #[test]
@@ -817,11 +1236,24 @@ mod tests {
         )
         .expect("asset import");
         service.set_assets(std::slice::from_ref(&asset));
+        assert_eq!(
+            service.asset("BUTTON.PNG").expect("file name lookup").id,
+            asset.id
+        );
+        assert!(service
+            .asset("button")
+            .expect_err("suffix is required")
+            .message
+            .contains("需要包含"));
+        assert_eq!(
+            service.asset(&asset.id).expect("legacy id lookup").id,
+            asset.id
+        );
         let cancel = AtomicBool::new(false);
         let budget = VisionPollBudget::new(None);
         assert!(service
             .wait_image(
-                &asset.id,
+                &asset.file_name,
                 ScreenRect::from_parts(0, 0, 2, 2),
                 0.99,
                 VisionPollOptions::new(
@@ -833,6 +1265,22 @@ mod tests {
             )
             .expect("image wait")
             .is_some());
+        let diagnostic = service
+            .wait_image_diagnostic(
+                &asset.file_name,
+                ScreenRect::from_parts(0, 0, 2, 2),
+                0.99,
+                VisionPollOptions::new(
+                    Duration::ZERO,
+                    Duration::from_millis(50),
+                    &cancel,
+                    &VisionPollBudget::new(None),
+                ),
+                &MatcherOptions::default(),
+            )
+            .expect("diagnostic image wait");
+        assert!(diagnostic.image.is_some());
+        assert!(diagnostic.diagnostics.wait_total_ms >= diagnostic.diagnostics.single_match_ms);
 
         let mismatch = CaptureFrame::from_bgra(
             Point { x: 0, y: 0 },
@@ -866,7 +1314,7 @@ mod tests {
         mismatch_service.set_assets(std::slice::from_ref(&mismatch_asset));
         assert!(mismatch_service
             .wait_image(
-                &mismatch_asset.id,
+                &mismatch_asset.file_name,
                 ScreenRect::from_parts(0, 0, 2, 2),
                 0.99,
                 VisionPollOptions::new(
@@ -882,7 +1330,7 @@ mod tests {
         assert_eq!(
             service
                 .wait_image(
-                    &asset.id,
+                    &asset.file_name,
                     ScreenRect::from_parts(0, 0, 2, 2),
                     0.99,
                     VisionPollOptions::new(
@@ -898,6 +1346,352 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(mismatch_root);
+    }
+
+    #[test]
+    fn previous_hit_region_is_fast_and_full_search_recovers_after_move() {
+        let root = std::env::temp_dir().join(format!(
+            "autoflow-vision-last-match-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let rgba = vision_template_pixels();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_template = CaptureFrame::from_bgra(
+            Point { x: 0, y: 0 },
+            24,
+            24,
+            rgba.iter()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                .collect(),
+        )
+        .expect("template frame");
+        let first = screen_frame((86, 60), &first_template);
+        let moved = screen_frame((20, 10), &first_template);
+        let previous_roi = moved
+            .crop(ScreenRect::from_parts(22, 0, 106, 96))
+            .expect("previous ROI");
+        let service = service_with_sequence(
+            vec![first, previous_roi, moved],
+            Arc::clone(&calls),
+            root.clone(),
+        );
+        let asset = super::super::assets::import_asset_file(
+            &root,
+            &[],
+            "button",
+            "button.png",
+            &png_image(24, 24, &rgba),
+        )
+        .expect("asset import");
+        service.set_assets(std::slice::from_ref(&asset));
+        let cancel = AtomicBool::new(false);
+        let first_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                ScreenRect::from_parts(0, 0, 128, 96),
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("first image search");
+        assert_eq!(
+            first_result.image.as_ref().map(|image| (image.x, image.y)),
+            Some((86, 60))
+        );
+        let moved_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                ScreenRect::from_parts(0, 0, 128, 96),
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("moved image search");
+        assert_eq!(
+            moved_result.image.as_ref().map(|image| (image.x, image.y)),
+            Some((20, 10))
+        );
+        assert!(moved_result.diagnostics.previous_hit_used);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn previous_hit_scale_is_prioritized_and_scale_changes_recover_without_old_click() {
+        let root = std::env::temp_dir().join(format!(
+            "autoflow-vision-scale-last-match-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let rgba = vision_template_pixels();
+        let template = CaptureFrame::from_bgra(
+            Point { x: 0, y: 0 },
+            24,
+            24,
+            rgba.iter()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                .collect(),
+        )
+        .expect("template frame");
+        let requested = ScreenRect::from_parts(0, 0, 512, 256);
+        let first_target = (350, 180);
+        let first = screen_frame_sized(first_target, &template, 512, 256);
+        let scale_changed = scaled_screen_frame(first_target, 1.5, &template, 512, 256);
+        let first_last = LastMatch {
+            x: first_target.0 as i32,
+            y: first_target.1 as i32,
+            width: 24,
+            height: 24,
+            scale: 1.0,
+            last_used: Instant::now(),
+        };
+        let first_roi = previous_match_region(requested, first_last).expect("first ROI");
+        let changed_roi = scale_changed.crop(first_roi).expect("changed ROI");
+        let moved_target = (0, 0);
+        let moved = scaled_screen_frame(moved_target, 1.5, &template, 512, 256);
+        let changed_last = LastMatch {
+            x: first_target.0 as i32,
+            y: first_target.1 as i32,
+            width: 36,
+            height: 36,
+            scale: 1.5,
+            last_used: Instant::now(),
+        };
+        let moved_roi = moved
+            .crop(previous_match_region(requested, changed_last).expect("moved ROI"))
+            .expect("moved previous ROI");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with_sequence(
+            vec![first, changed_roi, moved_roi, moved],
+            Arc::clone(&calls),
+            root.clone(),
+        );
+        let asset = super::super::assets::import_asset_file(
+            &root,
+            &[],
+            "button",
+            "button.png",
+            &png_image(24, 24, &rgba),
+        )
+        .expect("asset import");
+        service.set_assets(std::slice::from_ref(&asset));
+        let cancel = AtomicBool::new(false);
+
+        let first_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("first scale search");
+        let first_image = first_result.image.expect("first hit");
+        assert_eq!(
+            (first_image.x, first_image.y),
+            (first_target.0 as i32, first_target.1 as i32)
+        );
+        assert_eq!((first_image.width, first_image.height), (24, 24));
+        assert!((first_result.diagnostics.matched_scale.expect("first scale") - 1.0).abs() < 0.01);
+
+        let changed_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("same position scale change");
+        let changed_image = changed_result.image.expect("changed scale hit");
+        assert_eq!(
+            (changed_image.x, changed_image.y),
+            (first_target.0 as i32, first_target.1 as i32)
+        );
+        assert_eq!((changed_image.width, changed_image.height), (36, 36));
+        assert!(
+            (changed_result
+                .diagnostics
+                .matched_scale
+                .expect("changed scale")
+                - 1.5)
+                .abs()
+                < 0.01
+        );
+        assert!(changed_result.diagnostics.previous_hit_used);
+        assert_eq!(
+            changed_result.diagnostics.scale_candidates.first(),
+            Some(&1.0)
+        );
+
+        let moved_result = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.99,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("moved and scaled search");
+        let moved_image = moved_result.image.expect("moved scale hit");
+        assert_eq!(
+            (moved_image.x, moved_image.y),
+            (moved_target.0 as i32, moved_target.1 as i32)
+        );
+        assert_eq!((moved_image.width, moved_image.height), (36, 36));
+        assert!((moved_result.diagnostics.matched_scale.expect("moved scale") - 1.5).abs() < 0.01);
+        assert!(moved_result.diagnostics.previous_hit_used);
+        assert_eq!(
+            moved_result.diagnostics.scale_candidates.first(),
+            Some(&1.5)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn high_scale_repeats_use_previous_position_and_scale() {
+        let root = std::env::temp_dir().join(format!(
+            "autoflow-vision-high-scale-last-match-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let rgba = vision_template_pixels();
+        let template = CaptureFrame::from_bgra(
+            Point { x: 0, y: 0 },
+            24,
+            24,
+            rgba.iter()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                .collect(),
+        )
+        .expect("template frame");
+        let requested = ScreenRect::from_parts(0, 0, 512, 256);
+        let target = (350, 180);
+        let scale_175 = scaled_screen_frame(target, 1.75, &template, 512, 256);
+        let scale_200 = scaled_screen_frame(target, 2.0, &template, 512, 256);
+        let first_last = LastMatch {
+            x: target.0 as i32,
+            y: target.1 as i32,
+            width: 42,
+            height: 42,
+            scale: 1.75,
+            last_used: Instant::now(),
+        };
+        let first_roi = previous_match_region(requested, first_last).expect("1.75 ROI");
+        let repeat_175_roi = scale_175.crop(first_roi).expect("repeat 1.75 ROI");
+        let changed_roi = scale_200.crop(first_roi).expect("changed scale ROI");
+        let changed_last = LastMatch {
+            x: target.0 as i32,
+            y: target.1 as i32,
+            width: 48,
+            height: 48,
+            scale: 2.0,
+            last_used: Instant::now(),
+        };
+        let repeat_200_roi = scale_200
+            .crop(previous_match_region(requested, changed_last).expect("2.0 ROI"))
+            .expect("repeat 2.0 ROI");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with_sequence(
+            vec![scale_175, repeat_175_roi, changed_roi, repeat_200_roi],
+            Arc::clone(&calls),
+            root.clone(),
+        );
+        let asset = super::super::assets::import_asset_file(
+            &root,
+            &[],
+            "button",
+            "button.png",
+            &png_image(24, 24, &rgba),
+        )
+        .expect("asset import");
+        service.set_assets(std::slice::from_ref(&asset));
+        let cancel = AtomicBool::new(false);
+
+        let first = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("1.75 first");
+        assert_eq!(
+            first
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((42, 42))
+        );
+        assert!((first.diagnostics.matched_scale.expect("1.75") - 1.75).abs() < 0.01);
+
+        let repeat = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("1.75 repeat");
+        assert_eq!(
+            repeat
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((42, 42))
+        );
+        assert!(repeat.diagnostics.previous_hit_used);
+        assert!(repeat.diagnostics.preferred_scale_hit);
+
+        let changed = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("2.0 scale change");
+        assert_eq!(
+            changed
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((48, 48))
+        );
+        assert!((changed.diagnostics.matched_scale.expect("2.0") - 2.0).abs() < 0.01);
+        assert!(!changed.diagnostics.preferred_scale_hit);
+
+        let repeat_200 = service
+            .find_image_diagnostic(
+                &asset.file_name,
+                requested,
+                0.92,
+                &cancel,
+                &MatcherOptions::default(),
+            )
+            .expect("2.0 repeat");
+        assert_eq!(
+            repeat_200
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((48, 48))
+        );
+        assert!(repeat_200.diagnostics.previous_hit_used);
+        assert!(repeat_200.diagnostics.preferred_scale_hit);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

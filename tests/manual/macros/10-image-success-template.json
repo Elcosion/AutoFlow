@@ -1,0 +1,16 @@
+{
+  "id": "manual-acceptance-10-image-success-template",
+  "name": "MANUAL_TEST 10 - Image success prepared template",
+  "enabled": false,
+  "triggerKeys": [],
+  "mode": "once",
+  "repeatCount": 1,
+  "speed": 1.0,
+  "recordMouseMove": false,
+  "recordMouseClicks": false,
+  "program": {
+    "kind": "rhai",
+    "apiVersion": 1,
+    "source": "let w = window_rect(\"AutoFlow Manual Acceptance Harness\");\nif w.found {\n    let hit = wait_image(\"manual-vision-target.png\", w.x, w.y, w.width, w.height, 0.90, 3000, 150);\n    if hit.found {\n        stop_with_message(\"MANUAL_TEST_IMAGE_SUCCESS\", \"MANUAL_TEST_IMAGE_HIT\");\n    } else {\n        stop_with_message(\"MANUAL_TEST_IMAGE_NOT_FOUND\", \"MANUAL_TEST_IMAGE_NOT_FOUND_OR_TIMEOUT\");\n    }\n}"
+  }
+}

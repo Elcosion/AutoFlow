@@ -2,12 +2,15 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "AutoFlow desktop capability",
-  "windows": ["main"],
+  "windows": ["main", "playback-overlay"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-position"
   ]
 }

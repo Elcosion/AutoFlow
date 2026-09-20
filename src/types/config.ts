@@ -61,6 +61,7 @@ export type AutomationAsset = {
 export type MacroRule = {
   id: string;
   name: string;
+  importError?: string;
   enabled: boolean;
   triggerKeys: string[];
   mode: MacroMode;
@@ -69,17 +70,206 @@ export type MacroRule = {
   recordMouseMove: boolean;
   recordMouseClicks: boolean;
   target?: MacroTarget;
+  behaviorPolicy?: BehaviorPolicy;
   program: AutomationProgram;
+};
+
+export type MacroRuleFile = {
+  id: string;
+  name: string;
+  fileName: string;
+};
+
+export type BehaviorDistribution = {
+  samples: number;
+  mean: number;
+  stdDev: number;
+  min: number;
+  max: number;
+  p95: number;
+};
+
+export type BehaviorEvent =
+  | {
+      type: "key";
+      timestampMs: number;
+      vk: number;
+      scanCode: number;
+      isDown: boolean;
+    }
+  | { type: "mouseMove"; timestampMs: number; x: number; y: number }
+  | {
+      type: "mouseButton";
+      timestampMs: number;
+      button: number;
+      isDown: boolean;
+      x: number;
+      y: number;
+    }
+  | {
+      type: "wheel";
+      timestampMs: number;
+      deltaX: number;
+      deltaY: number;
+      x: number;
+      y: number;
+    };
+
+export type BehaviorProfile = {
+  id: string;
+  name: string;
+  apiVersion: 1;
+  sampleCount: number;
+  durationMs: number;
+  keyboardEvents: number;
+  mouseEvents: number;
+  wheelEvents: number;
+  keyHoldMs: BehaviorDistribution;
+  keyIntervalMs: BehaviorDistribution;
+  clickHoldMs: BehaviorDistribution;
+  clickIntervalMs: BehaviorDistribution;
+  mouseSpeedPxPerSec: BehaviorDistribution;
+  mousePauseMs: BehaviorDistribution;
+  mouseDirectionChangeRate: number;
+  mouseJitterPx: number;
+  rawEvents: BehaviorEvent[];
+};
+
+export type BiomimeticInput = {
+  id: string;
+  name: string;
+  apiVersion: number;
+  sourceProfileIds: string[];
+  createdAtMs: number;
+  profile: BehaviorProfile;
+};
+
+export type BehaviorPolicy = {
+  enabled: boolean;
+  profileId: string | null;
+  timingStrength: number;
+  pointerPathStrength: number;
+  pauseStrength: number;
+  correctionStrength: number;
+  speedScale: number;
+  seed?: number;
+};
+
+export type ModelQuality = "insufficient" | "usable" | "good";
+export type BehaviorSourceRetention = "persisted" | "ephemeral";
+
+export type BehaviorModelConfig = {
+  minBucketSamples: number;
+  maxExemplarsPerBucket: number;
+  minQualityEpisodes: number;
+  usableQualityEpisodes: number;
+  goodQualityEpisodes: number;
+  minBucketCoverage: number;
+};
+
+export type PointerFeatureSummary = {
+  samples: number;
+  min: number;
+  p10: number;
+  p25: number;
+  p50: number;
+  p75: number;
+  p90: number;
+  max: number;
+};
+
+export type PointerBucketModel = {
+  key: {
+    distance: string;
+    direction: string;
+    followedByClick: boolean;
+    targetWidth: string;
+  };
+  validSampleCount: number;
+  coverage: number;
+  fallbackLevel: number;
+  trainingReady: boolean;
+  trainingFallbackReason?: string;
+  exemplars: Array<Record<string, number>>;
+  features: Record<string, PointerFeatureSummary>;
+};
+
+export type BehaviorProfileV2 = {
+  id: string;
+  name: string;
+  apiVersion: 2;
+  sourceSessionIds: string[];
+  createdAtMs: number;
+  sourceRetention: BehaviorSourceRetention;
+  modelConfig: BehaviorModelConfig;
+  coverage: {
+    rawEventCount: number;
+    pointerEpisodeCount: number;
+    validPointerEpisodeCount: number;
+    clickAssociatedPointerEpisodeCount: number;
+    clickEpisodeCount: number;
+    discardedEventCount: number;
+    discardedReasons: Record<string, number>;
+    bucketCoverage: Array<{
+      bucket: string;
+      validSampleCount: number;
+      coverage: number;
+      fallbackLevel: number;
+      trainingReady: boolean;
+      trainingFallbackReason?: string;
+    }>;
+    quality: ModelQuality;
+    eligibleEpisodeCount: number;
+    eligibleCoverage: number;
+    qualityFilteredPointerEpisodeCount: number;
+  };
+  pointerModel: {
+    buckets: PointerBucketModel[];
+    totalEpisodeCount: number;
+    validEpisodeCount: number;
+    discardedEpisodeCount: number;
+  };
+  clickModel: {
+    buckets: Array<{
+      button: MouseButton;
+      followedByMove: boolean;
+      validSampleCount: number;
+      coverage: number;
+      preClickDwellMs: PointerFeatureSummary;
+      holdMs: PointerFeatureSummary;
+      postClickDwellMs: PointerFeatureSummary;
+      fallbackLevel: number;
+    }>;
+    totalClickCount: number;
+    validClickCount: number;
+  };
+  typingModel?: unknown;
+  scrollModel?: unknown;
+};
+
+export type BehaviorSessionV2 = {
+  id: string;
+  name: string;
+  apiVersion: 2;
+  createdAtMs: number;
+  durationMs: number;
+  taskTag?: string;
+  captureMetadata: {
+    platform: string;
+    hook: string;
+    screenWidth?: number;
+    screenHeight?: number;
+    retainedRawEvents: boolean;
+    droppedEventCount: number;
+  };
+  rawEvents: BehaviorEvent[];
 };
 
 export function macroSteps(rule: MacroRule): MacroStep[] {
   return rule.program.kind === "macro" ? rule.program.steps : [];
 }
 
-export function withMacroSteps(
-  rule: MacroRule,
-  steps: MacroStep[],
-): MacroRule {
+export function withMacroSteps(rule: MacroRule, steps: MacroStep[]): MacroRule {
   return {
     ...rule,
     program: { kind: "macro", steps },
@@ -92,18 +282,33 @@ export type AppConfig = {
   emergencyStop: string;
   navigationAutoCollapse: boolean;
   launchAtStartup: boolean;
+  showPlaybackOverlay: boolean;
   hotkeys: HotkeyRule[];
   textExpansions: TextExpansionRule[];
   macros: MacroRule[];
+  macroFiles: MacroRuleFile[];
   assets: AutomationAsset[];
+  behaviorProfiles: BehaviorProfile[];
+  biomimeticInputs: BiomimeticInput[];
+  activeBehaviorProfileId: string | null;
+  selectedBehaviorProfileIds: string[];
+  selectedBiomimeticInputIds: string[];
+  biomimeticEnabled: boolean;
+  biomimeticIntensity: number;
+  retainBehaviorRecords: boolean;
+  behaviorSessionsV2: BehaviorSessionV2[];
+  behaviorProfilesV2: BehaviorProfileV2[];
+  activeBehaviorProfileV2Id: string | null;
+  behaviorPolicy: BehaviorPolicy;
 };
 
 export const defaultConfig: AppConfig = {
-  schemaVersion: 2,
+  schemaVersion: 6,
   globalEnabled: true,
   emergencyStop: "F12",
   navigationAutoCollapse: false,
   launchAtStartup: false,
+  showPlaybackOverlay: false,
   hotkeys: [
     {
       id: "capslock-to-escape",
@@ -132,7 +337,28 @@ export const defaultConfig: AppConfig = {
     },
   ],
   macros: [],
+  macroFiles: [],
   assets: [],
+  behaviorProfiles: [],
+  biomimeticInputs: [],
+  activeBehaviorProfileId: null,
+  selectedBehaviorProfileIds: [],
+  selectedBiomimeticInputIds: [],
+  biomimeticEnabled: false,
+  biomimeticIntensity: 0.65,
+  retainBehaviorRecords: true,
+  behaviorSessionsV2: [],
+  behaviorProfilesV2: [],
+  activeBehaviorProfileV2Id: null,
+  behaviorPolicy: {
+    enabled: false,
+    profileId: null,
+    timingStrength: 0,
+    pointerPathStrength: 0,
+    pauseStrength: 0,
+    correctionStrength: 0.15,
+    speedScale: 1,
+  },
 };
 
 export function newRuleId(prefix: string): string {

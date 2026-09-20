@@ -35,6 +35,8 @@ AutoFlow 是面向中文 Windows 用户的快捷键、文本扩展与轻量宏�
 
 宏录制、图形步骤、兼容源码、高级 Rhai、窗口/像素/找图 API 的完整说明见 [宏与 Rhai 脚本详细使用说明](docs/macro-and-script-guide.md)。
 
+连续键鼠行为训练、个人节奏分析和仿生操作 API 的说明见 [仿生键鼠行为训练](docs/biomimetic.md)。
+
 ## 开发环境
 
 - Windows 10/11
