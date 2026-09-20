@@ -1649,7 +1649,9 @@ fn parse_button(value: &str, line: usize) -> Result<MouseButton, CompatibleParse
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation::ImageMatch;
     use crate::KeyAction;
+    use std::sync::atomic::AtomicUsize;
 
     struct TestInput;
 
@@ -1680,6 +1682,112 @@ mod tests {
         }
         fn type_text(&self, _: &str) -> Result<(), String> {
             Ok(())
+        }
+    }
+
+    struct CountingInput {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AutomationInput for CountingInput {
+        fn wait_ms(&self, _: u64, _: f32, _: &AtomicBool) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn wait_random_ms(&self, _: u64, _: u64, _: f32, _: &AtomicBool) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn key_down(&self, _: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn key_up(&self, _: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn move_to(&self, _: i32, _: i32) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn mouse_down(&self, _: &str, _: i32, _: i32) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn mouse_up(&self, _: &str, _: i32, _: i32) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn scroll(&self, _: i32, _: i32) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn type_text(&self, _: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct CancellingVision;
+
+    impl VisionApi for CancellingVision {
+        fn active_window_title(&self) -> Result<String, VisionError> {
+            unreachable!("unused mock vision method")
+        }
+
+        fn window_exists(&self, _: &str) -> Result<bool, VisionError> {
+            unreachable!("unused mock vision method")
+        }
+
+        fn window_rect(&self, _: &str) -> Result<WindowRectValue, VisionError> {
+            unreachable!("unused mock vision method")
+        }
+
+        fn wait_window(&self, _: &str, _: VisionPollOptions<'_>) -> Result<bool, VisionError> {
+            unreachable!("unused mock vision method")
+        }
+
+        fn pixel_matches(
+            &self,
+            _: Point,
+            _: RgbColor,
+            _: u8,
+            _: &AtomicBool,
+        ) -> Result<bool, VisionError> {
+            unreachable!("unused mock vision method")
+        }
+
+        fn wait_pixel(
+            &self,
+            _: Point,
+            _: RgbColor,
+            _: u8,
+            _: VisionPollOptions<'_>,
+        ) -> Result<bool, VisionError> {
+            unreachable!("unused mock vision method")
+        }
+
+        fn find_image(
+            &self,
+            _: &str,
+            _: ScreenRect,
+            _: f32,
+            cancel: &AtomicBool,
+        ) -> Result<Option<ImageMatch>, VisionError> {
+            // Model a vision result that finishes after F12 has invalidated
+            // the run, but still returns a normal value to its caller.
+            cancel.store(true, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        fn wait_image(
+            &self,
+            _: &str,
+            _: ScreenRect,
+            _: f32,
+            _: VisionPollOptions<'_>,
+        ) -> Result<Option<ImageMatch>, VisionError> {
+            unreachable!("unused mock vision method")
         }
     }
 
@@ -1740,6 +1848,31 @@ mod tests {
         let context = ExecutionContext::new(Arc::new(TestInput), cancel, 1.0, None);
         let error = run_rhai_script("key_down(\"A\");", context).expect_err("cancelled script");
         assert!(error.contains("F12"));
+    }
+
+    #[test]
+    fn late_vision_return_cannot_reach_the_next_input_action_after_cancellation() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ExecutionContext::new_with_vision(
+            Arc::new(CountingInput {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::clone(&cancel),
+            1.0,
+            None,
+            Arc::new(CancellingVision),
+        );
+
+        let error = run_rhai_script(
+            r#"find_image("late.png", 0, 0, 100, 100, 0.9); press("A");"#,
+            context,
+        )
+        .expect_err("the next action must observe cancellation");
+
+        assert!(error.contains("F12"));
+        assert!(cancel.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

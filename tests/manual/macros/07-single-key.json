@@ -1,0 +1,16 @@
+{
+  "id": "manual-acceptance-07-single-key",
+  "name": "MANUAL_TEST 07 - Single key",
+  "enabled": false,
+  "triggerKeys": [],
+  "mode": "once",
+  "repeatCount": 1,
+  "speed": 1.0,
+  "recordMouseMove": false,
+  "recordMouseClicks": false,
+  "program": {
+    "kind": "rhai",
+    "apiVersion": 1,
+    "source": "press(\"A\");"
+  }
+}

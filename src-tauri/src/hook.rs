@@ -274,6 +274,9 @@ impl HookService {
                 hotkeys_changed = key_to_vk(&current.emergency_stop)
                     != key_to_vk(&config.emergency_stop)
                     || native_registration_plan(&current) != native_registration_plan(&config);
+                if trigger_permission_snapshot(&current) != trigger_permission_snapshot(&config) {
+                    self.shared.advance_trigger_config_revision()?;
+                }
             }
             *current = config;
         }
@@ -398,6 +401,30 @@ impl HookService {
         ))
     }
 
+    pub fn discard_behavior_recording(&self) -> Result<(), AppError> {
+        #[cfg(windows)]
+        {
+            self.shared.discard_behavior_recording()
+        }
+        #[cfg(not(windows))]
+        Err(AppError::invalid(
+            "recording_unsupported",
+            "behavior recording is only supported on Windows",
+        ))
+    }
+
+    pub fn complete_behavior_recording_claim(&self) -> Result<(), AppError> {
+        #[cfg(windows)]
+        {
+            self.shared.complete_behavior_recording_claim()
+        }
+        #[cfg(not(windows))]
+        Err(AppError::invalid(
+            "recording_unsupported",
+            "behavior recording is only supported on Windows",
+        ))
+    }
+
     pub fn behavior_recording_status(&self) -> BehaviorRecordingStatus {
         #[cfg(windows)]
         {
@@ -406,6 +433,8 @@ impl HookService {
         #[cfg(not(windows))]
         BehaviorRecordingStatus {
             active: false,
+            pending: false,
+            incomplete: false,
             capture_started: false,
             duration_ms: 0,
             event_count: 0,
@@ -465,7 +494,11 @@ impl HookService {
     }
 
     #[cfg(windows)]
-    pub fn recover_input_safety(&self) -> Result<(), AppError> {
+    pub(crate) fn recover_input_safety_at(
+        &self,
+        generation: u64,
+        admission_revision: u64,
+    ) -> Result<(), AppError> {
         if self
             .shared
             .executor_containment_unknown
@@ -491,7 +524,11 @@ impl HookService {
                 "安全通道、执行器退出或输入清理尚未确认，不能解除锁定",
             ));
         }
-        if !self.shared.controller.recover_after_cleanup() {
+        if !self
+            .shared
+            .controller
+            .recover_after_cleanup_at(generation, admission_revision)
+        {
             return Err(AppError::invalid(
                 "safety_recovery_rejected",
                 "当前状态不允许故障恢复",
@@ -565,8 +602,311 @@ type TextExpansionTask = Box<dyn FnOnce(&Arc<HookShared>) + Send>;
 #[cfg(windows)]
 struct MacroTriggerTask {
     rule: MacroRule,
+    start_timing: TriggerStartTiming,
+    hold_epoch: Option<u64>,
     generation: u64,
+    controller_generation: u64,
     admission_revision: u64,
+    config_revision: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldLifecyclePhase {
+    Pending,
+    Bound {
+        run_token: RunToken,
+    },
+    Active {
+        run_token: RunToken,
+        instance_id: u64,
+    },
+    Retired,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoldLifecycleIdentity {
+    epoch: u64,
+    macro_id: String,
+    rule_snapshot: TriggerMacroSnapshot,
+    trigger_vks: Vec<u32>,
+    phase: HoldLifecyclePhase,
+    cancelled: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerStartTiming {
+    ReleaseGated,
+    HoldImmediate,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HoldAtomicSnapshot {
+    epoch: u64,
+    trigger_matches: bool,
+    bound_token: Option<RunToken>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TriggerMacroSnapshot {
+    id: String,
+    enabled: bool,
+    trigger_vks: Option<Vec<u32>>,
+    mode: u8,
+    repeat_count: u32,
+    speed_bits: u32,
+    import_error: bool,
+    clicker: bool,
+    program: Vec<u8>,
+    behavior_policy: Vec<u8>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TriggerPermissionSnapshot {
+    global_enabled: bool,
+    emergency_vk: Option<u32>,
+    macros: Vec<TriggerMacroSnapshot>,
+}
+
+#[cfg(windows)]
+fn macro_mode_identity(mode: MacroMode) -> u8 {
+    match mode {
+        MacroMode::Once => 0,
+        MacroMode::Repeat => 1,
+        MacroMode::Hold => 2,
+        MacroMode::Toggle => 3,
+    }
+}
+
+#[cfg(windows)]
+fn trigger_macro_snapshot(rule: &MacroRule) -> TriggerMacroSnapshot {
+    let trigger_vks = rule
+        .trigger_keys
+        .iter()
+        .map(|key| key_to_vk(key))
+        .collect::<Option<Vec<_>>>()
+        .map(|mut keys| {
+            keys.sort_unstable();
+            keys
+        });
+    TriggerMacroSnapshot {
+        id: rule.id.clone(),
+        enabled: rule.enabled,
+        trigger_vks,
+        mode: macro_mode_identity(rule.mode),
+        repeat_count: rule.repeat_count,
+        speed_bits: rule.speed.to_bits(),
+        import_error: rule.import_error.is_some(),
+        clicker: is_native_clicker_rule(rule),
+        program: serde_json::to_vec(&rule.program).unwrap_or_default(),
+        behavior_policy: serde_json::to_vec(&rule.behavior_policy).unwrap_or_default(),
+    }
+}
+
+#[cfg(windows)]
+fn trigger_permission_snapshot(config: &AppConfig) -> TriggerPermissionSnapshot {
+    let mut macros = config
+        .macros
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(trigger_macro_snapshot)
+        .collect::<Vec<_>>();
+    macros.sort_by(|left, right| left.id.cmp(&right.id));
+    TriggerPermissionSnapshot {
+        global_enabled: config.global_enabled,
+        emergency_vk: key_to_vk(&config.emergency_stop),
+        macros,
+    }
+}
+
+#[cfg(windows)]
+const TRIGGER_RELEASE_POLL: Duration = Duration::from_millis(3);
+#[cfg(windows)]
+const TRIGGER_RELEASE_STABLE: Duration = Duration::from_millis(18);
+#[cfg(windows)]
+const TRIGGER_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerReleaseCancellation {
+    TriggerConfiguration,
+    PhysicalLedgerUncertain,
+    TaskGeneration,
+    ControllerGeneration,
+    AdmissionRevision,
+    ConfigRevision,
+    HoldLifecycle,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerReleaseGateStatus {
+    Current,
+    Shutdown,
+    Cancelled(TriggerReleaseCancellation),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerReleaseGateOutcome {
+    Ready,
+    Timeout,
+    Shutdown,
+    Cancelled(TriggerReleaseCancellation),
+}
+
+#[cfg(all(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerAdmissionCheckpoint {
+    AfterInitialValidation,
+    BeforeActivation,
+    AfterControllerActivation,
+    BeforeInputRegistration,
+    BeforePlaybackPublication,
+}
+
+#[cfg(all(windows, test))]
+type TriggerAdmissionTestHook = Arc<dyn Fn(TriggerAdmissionCheckpoint) + Send + Sync>;
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct TriggerReleaseGate {
+    stable_since: Option<Duration>,
+    stable_window: Duration,
+    timeout: Duration,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct TriggerReleaseSample {
+    elapsed: Duration,
+    any_trigger_key_down: bool,
+    status: TriggerReleaseGateStatus,
+}
+
+#[cfg(windows)]
+impl TriggerReleaseGate {
+    fn new(stable_window: Duration, timeout: Duration) -> Self {
+        Self {
+            stable_since: None,
+            stable_window,
+            timeout,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        elapsed: Duration,
+        any_trigger_key_down: bool,
+        status: TriggerReleaseGateStatus,
+    ) -> Option<TriggerReleaseGateOutcome> {
+        match status {
+            TriggerReleaseGateStatus::Shutdown => return Some(TriggerReleaseGateOutcome::Shutdown),
+            TriggerReleaseGateStatus::Cancelled(reason) => {
+                return Some(TriggerReleaseGateOutcome::Cancelled(reason))
+            }
+            TriggerReleaseGateStatus::Current => {}
+        }
+        if elapsed >= self.timeout {
+            return Some(TriggerReleaseGateOutcome::Timeout);
+        }
+        if any_trigger_key_down {
+            self.stable_since = None;
+            return None;
+        }
+        let stable_since = *self.stable_since.get_or_insert(elapsed);
+        (elapsed.saturating_sub(stable_since) >= self.stable_window)
+            .then_some(TriggerReleaseGateOutcome::Ready)
+    }
+}
+
+#[cfg(windows)]
+fn drive_trigger_release_gate(
+    mut gate: TriggerReleaseGate,
+    mut sample: impl FnMut() -> TriggerReleaseSample,
+    mut pause: impl FnMut(Duration),
+) -> TriggerReleaseGateOutcome {
+    loop {
+        let observation = sample();
+        let Some(outcome) = gate.observe(
+            observation.elapsed,
+            observation.any_trigger_key_down,
+            observation.status,
+        ) else {
+            pause(TRIGGER_RELEASE_POLL);
+            continue;
+        };
+        if !matches!(outcome, TriggerReleaseGateOutcome::Ready) {
+            return outcome;
+        }
+
+        // A key may be pressed again between the observation that completed
+        // the stable window and the final lifecycle check. Resample both from
+        // the same seam. A re-press resets stability and returns to waiting;
+        // cancellation/shutdown remains terminal and takes precedence.
+        let final_observation = sample();
+        if let Some(final_outcome) = gate.observe(
+            final_observation.elapsed,
+            final_observation.any_trigger_key_down,
+            final_observation.status,
+        ) {
+            return final_outcome;
+        }
+        pause(TRIGGER_RELEASE_POLL);
+    }
+}
+
+#[cfg(windows)]
+struct TriggerPendingReset<'a>(&'a AtomicBool);
+
+#[cfg(windows)]
+impl Drop for TriggerPendingReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(windows)]
+struct PendingHoldLifecycleReset<'a> {
+    shared: &'a HookShared,
+    epoch: Option<u64>,
+    transferred_to_playback: bool,
+}
+
+#[cfg(windows)]
+impl PendingHoldLifecycleReset<'_> {
+    fn transfer_to_playback(&mut self) {
+        self.transferred_to_playback = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PendingHoldLifecycleReset<'_> {
+    fn drop(&mut self) {
+        if !self.transferred_to_playback {
+            if let Some(epoch) = self.epoch {
+                self.shared.retire_hold_lifecycle(epoch);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn trigger_release_cancellation_name(reason: TriggerReleaseCancellation) -> &'static str {
+    match reason {
+        TriggerReleaseCancellation::TriggerConfiguration => "trigger_configuration",
+        TriggerReleaseCancellation::PhysicalLedgerUncertain => "physical_ledger_uncertain",
+        TriggerReleaseCancellation::TaskGeneration => "task_generation",
+        TriggerReleaseCancellation::ControllerGeneration => "controller_generation",
+        TriggerReleaseCancellation::AdmissionRevision => "admission_revision",
+        TriggerReleaseCancellation::ConfigRevision => "config_revision",
+        TriggerReleaseCancellation::HoldLifecycle => "hold_lifecycle",
+    }
 }
 #[cfg(windows)]
 struct RemapTask {
@@ -621,6 +961,10 @@ struct HookShared {
     #[cfg(windows)]
     pressed: Mutex<HashSet<u32>>,
     #[cfg(windows)]
+    physical_pressed: Mutex<HashSet<u32>>,
+    #[cfg(windows)]
+    physical_ledger_uncertain: AtomicBool,
+    #[cfg(windows)]
     latched_hotkeys: Mutex<HashSet<String>>,
     #[cfg(windows)]
     active_remaps: Mutex<HashMap<u32, u32>>,
@@ -632,6 +976,33 @@ struct HookShared {
     trigger_tasks: std::sync::OnceLock<crate::bounded_worker::BoundedWorker<MacroTriggerTask>>,
     #[cfg(windows)]
     trigger_pending: AtomicBool,
+    #[cfg(windows)]
+    hold_lifecycle: Mutex<Option<HoldLifecycleIdentity>>,
+    #[cfg(windows)]
+    next_hold_epoch: AtomicU64,
+    #[cfg(windows)]
+    hold_epoch_exhausted: AtomicBool,
+    #[cfg(windows)]
+    hold_lifecycle_epoch: AtomicU64,
+    #[cfg(windows)]
+    hold_cancelled_epoch: AtomicU64,
+    #[cfg(windows)]
+    hold_lifecycle_phase: AtomicU32,
+    #[cfg(windows)]
+    hold_bound_token_id: AtomicU64,
+    #[cfg(windows)]
+    hold_bound_token_generation: AtomicU64,
+    #[cfg(windows)]
+    hold_trigger_words: [AtomicU64; 4],
+    #[cfg(windows)]
+    // Dedicated to hotkey permission/config identity. Background admission
+    // also changes for playback lifecycle events, so it cannot distinguish an
+    // equivalent focus refresh from a rule being disabled or rewritten.
+    trigger_config_revision: AtomicU64,
+    #[cfg(windows)]
+    trigger_config_revision_exhausted: AtomicBool,
+    #[cfg(all(windows, test))]
+    trigger_admission_test_hook: Mutex<Option<TriggerAdmissionTestHook>>,
     #[cfg(windows)]
     remap_tasks: std::sync::OnceLock<crate::bounded_worker::BoundedWorker<RemapTask>>,
     #[cfg(windows)]
@@ -757,6 +1128,10 @@ impl HookShared {
             #[cfg(windows)]
             pressed: Mutex::new(HashSet::new()),
             #[cfg(windows)]
+            physical_pressed: Mutex::new(HashSet::new()),
+            #[cfg(windows)]
+            physical_ledger_uncertain: AtomicBool::new(false),
+            #[cfg(windows)]
             latched_hotkeys: Mutex::new(HashSet::new()),
             #[cfg(windows)]
             active_remaps: Mutex::new(HashMap::new()),
@@ -768,6 +1143,21 @@ impl HookShared {
             trigger_tasks: std::sync::OnceLock::new(),
             #[cfg(windows)]
             trigger_pending: AtomicBool::new(false),
+            hold_lifecycle: Mutex::new(None),
+            next_hold_epoch: AtomicU64::new(0),
+            hold_epoch_exhausted: AtomicBool::new(false),
+            hold_lifecycle_epoch: AtomicU64::new(0),
+            hold_cancelled_epoch: AtomicU64::new(0),
+            hold_lifecycle_phase: AtomicU32::new(0),
+            hold_bound_token_id: AtomicU64::new(0),
+            hold_bound_token_generation: AtomicU64::new(0),
+            hold_trigger_words: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(windows)]
+            trigger_config_revision: AtomicU64::new(0),
+            #[cfg(windows)]
+            trigger_config_revision_exhausted: AtomicBool::new(false),
+            #[cfg(all(windows, test))]
+            trigger_admission_test_hook: Mutex::new(None),
             #[cfg(windows)]
             remap_tasks: std::sync::OnceLock::new(),
             #[cfg(windows)]
@@ -943,6 +1333,49 @@ impl HookShared {
             })
             .ok()
             .and_then(|id| i32::try_from(id).ok())
+    }
+
+    #[cfg(windows)]
+    fn advance_trigger_config_revision(&self) -> Result<u64, AppError> {
+        loop {
+            let current = self.trigger_config_revision.load(Ordering::Acquire);
+            let Some(next) = current.checked_add(1) else {
+                self.trigger_config_revision_exhausted
+                    .store(true, Ordering::Release);
+                self.controller.lock_fault();
+                return Err(AppError::invalid(
+                    "trigger_config_revision_exhausted",
+                    "快捷键配置版本已耗尽，已锁定新的快捷键启动；请重启 AutoFlow",
+                ));
+            };
+            if self
+                .trigger_config_revision
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(next);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn trigger_config_revision_is_current(&self, expected: u64) -> bool {
+        !self
+            .trigger_config_revision_exhausted
+            .load(Ordering::Acquire)
+            && self.trigger_config_revision.load(Ordering::Acquire) == expected
+    }
+
+    #[cfg(all(windows, test))]
+    fn run_trigger_admission_test_hook(&self, checkpoint: TriggerAdmissionCheckpoint) {
+        let hook = self
+            .trigger_admission_test_hook
+            .lock()
+            .expect("trigger admission test hook")
+            .clone();
+        if let Some(hook) = hook {
+            hook(checkpoint);
+        }
     }
 
     #[cfg(windows)]
@@ -1165,8 +1598,8 @@ impl HookShared {
                 self.emergency_request_sequence
                     .fetch_max(sequence, Ordering::AcqRel);
             } else if !(worker.is_closed() && self.controller.is_shutting_down()) {
-                self.input_recovery_required.store(true, Ordering::Release);
                 self.controller.lock_fault();
+                self.input_recovery_required.store(true, Ordering::Release);
             }
             return; // prestarted lane: no callback locks, posts or thread spawn
         }
@@ -1232,10 +1665,10 @@ impl HookShared {
                 cleanup(Arc::clone(&shared), sequence);
             }));
             if result.is_err() {
+                shared.controller.lock_fault();
                 shared
                     .input_recovery_required
                     .store(true, Ordering::Release);
-                shared.controller.lock_fault();
                 shared.record_safety("priority_cleanup_panicked", &[]);
                 return false;
             }
@@ -1337,10 +1770,10 @@ impl HookShared {
                     // Leave scheduled/completed evidence unconfirmed. Never
                     // retry a panicked cleanup or authorize a new run from an
                     // apparently empty ledger.
+                    shared.controller.lock_fault();
                     shared
                         .input_recovery_required
                         .store(true, Ordering::Release);
-                    shared.controller.lock_fault();
                     shared.record_safety("emergency_cleanup_panicked", &[]);
                     return;
                 }
@@ -1355,6 +1788,7 @@ impl HookShared {
             Err(_) => {
                 self.emergency_cleanup_scheduled
                     .store(false, Ordering::SeqCst);
+                self.controller.lock_fault();
                 self.input_recovery_required.store(true, Ordering::SeqCst);
                 self.safety_diagnostics.record(
                     "emergency_cleanup_worker_start_failed",
@@ -1640,12 +2074,56 @@ impl HookShared {
     }
 
     #[cfg(windows)]
-    fn behavior_recording_status(&self) -> BehaviorRecordingStatus {
+    fn discard_behavior_recording(&self) -> Result<(), AppError> {
+        let queue = self.behavior_capture.get().ok_or_else(|| {
+            AppError::invalid("capture_not_ready", "behavior capture queue is unavailable")
+        })?;
+        queue
+            .confirm_discard(Duration::from_millis(500))
+            .map_err(|code| {
+            if let Ok(mut behavior) = self.behavior.try_lock() {
+                behavior.freeze_capture(false);
+            }
+            let statistics = queue.statistics();
+            self.record_safety("behavior_capture_discard_failed", &[
+                ("reason", code.to_string()),
+                ("accepted", statistics.accepted.to_string()),
+                ("dropped", statistics.dropped.to_string()),
+                ("processing_failed", statistics.processing_failed.to_string()),
+            ]);
+            AppError::with_detail(
+                code,
+                "behavior capture could not confirm its worker barrier; the pending recording was retained",
+                format!("{statistics:?}"),
+            )
+            })?;
+        let mut behavior = self.behavior.lock().map_err(|_| {
+            AppError::internal("behavior recorder state is unavailable; pending data was retained")
+        })?;
+        behavior.discard()?;
+        queue.reset_discarded();
+        self.behavior_capture_error.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn complete_behavior_recording_claim(&self) -> Result<(), AppError> {
         self.behavior
+            .lock()
+            .map_err(|_| AppError::internal("behavior recorder state is unavailable"))?
+            .complete_claim()
+    }
+
+    #[cfg(windows)]
+    fn behavior_recording_status(&self) -> BehaviorRecordingStatus {
+        let mut status = self
+            .behavior
             .lock()
             .map(|behavior| behavior.status())
             .unwrap_or(BehaviorRecordingStatus {
                 active: false,
+                pending: true,
+                incomplete: true,
                 capture_started: false,
                 duration_ms: 0,
                 event_count: 0,
@@ -1655,7 +2133,15 @@ impl HookShared {
                 capped: false,
                 persisting_raw_session: false,
                 session_name: None,
-            })
+            });
+        if let Some(queue) = self.behavior_capture.get() {
+            status.active &= queue.is_active();
+            status.pending |= !queue.is_active() && queue.is_pending();
+            if self.behavior_capture_error.load(Ordering::Acquire) || queue.is_failed() {
+                status.incomplete = true;
+            }
+        }
+        status
     }
 
     #[cfg(windows)]
@@ -2211,6 +2697,50 @@ impl HookShared {
     }
 
     #[cfg(windows)]
+    fn track_physical_key_event(self: &Arc<Self>, raw_vk: u32, is_down: bool, is_up: bool) -> bool {
+        let Ok(mut ledger) = self.physical_pressed.try_lock() else {
+            self.physical_ledger_uncertain
+                .store(true, Ordering::Release);
+            self.trigger_rearm_required.store(true, Ordering::Release);
+            self.request_emergency_stop(EmergencyEntryPoint::LowLevelHook, false);
+            self.record_safety_async(
+                "physical_key_ledger_unavailable",
+                vec![("phase".to_string(), "hook_event".to_string())],
+            );
+            return false;
+        };
+        update_physical_pressed_ledger(&mut ledger, raw_vk, is_down, is_up, false);
+        true
+    }
+
+    #[cfg(windows)]
+    fn initialize_physical_key_ledger(&self) -> bool {
+        match self.physical_pressed.lock() {
+            Ok(mut ledger) => {
+                ledger.clear();
+                self.physical_ledger_uncertain
+                    .store(false, Ordering::Release);
+                true
+            }
+            Err(_) => {
+                self.physical_ledger_uncertain
+                    .store(true, Ordering::Release);
+                self.controller.lock_fault();
+                false
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn retire_physical_key_ledger(&self) {
+        self.physical_ledger_uncertain
+            .store(true, Ordering::Release);
+        if let Ok(mut ledger) = self.physical_pressed.try_lock() {
+            ledger.clear();
+        }
+    }
+
+    #[cfg(windows)]
     fn reject_hook_event(self: &Arc<Self>, reason: &'static str, released_key: bool) {
         let graph_loss = self
             .graph_capture
@@ -2465,6 +2995,378 @@ impl HookShared {
     }
 
     #[cfg(windows)]
+    fn allocate_hold_epoch(&self) -> Option<u64> {
+        loop {
+            let current = self.next_hold_epoch.load(Ordering::Acquire);
+            if current == u64::MAX || self.hold_epoch_exhausted.load(Ordering::Acquire) {
+                self.hold_epoch_exhausted.store(true, Ordering::Release);
+                return None;
+            }
+            let next = current + 1;
+            if self
+                .next_hold_epoch
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(next);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn publish_hold_lifecycle(&self, rule: &MacroRule) -> Option<u64> {
+        let mut trigger_vks = macro_trigger_vks(&rule.trigger_keys)?;
+        trigger_vks.sort_unstable();
+        trigger_vks.dedup();
+        let epoch = self.allocate_hold_epoch()?;
+        let Ok(mut current) = self.hold_lifecycle.try_lock() else {
+            return None;
+        };
+        if current.is_some() || self.hold_lifecycle_epoch.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+
+        let mut words = [0_u64; 4];
+        for vk in &trigger_vks {
+            let index = usize::try_from(*vk / 64).ok()?;
+            let bit = *vk % 64;
+            if index >= words.len() {
+                return None;
+            }
+            words[index] |= 1_u64 << bit;
+        }
+        *current = Some(HoldLifecycleIdentity {
+            epoch,
+            macro_id: rule.id.clone(),
+            rule_snapshot: trigger_macro_snapshot(rule),
+            trigger_vks,
+            phase: HoldLifecyclePhase::Pending,
+            cancelled: false,
+        });
+        for (target, value) in self.hold_trigger_words.iter().zip(words) {
+            target.store(value, Ordering::Release);
+        }
+        self.hold_bound_token_id.store(0, Ordering::Release);
+        self.hold_bound_token_generation.store(0, Ordering::Release);
+        self.hold_lifecycle_phase.store(1, Ordering::Release);
+        // Publish the epoch last. Callback readers use it as the ownership
+        // fence for all other immutable/atomic identity fields.
+        self.hold_lifecycle_epoch.store(epoch, Ordering::Release);
+        Some(epoch)
+    }
+
+    #[cfg(windows)]
+    fn validate_hold_lifecycle(
+        &self,
+        rule: &MacroRule,
+        expected_epoch: Option<u64>,
+    ) -> Result<(), AppError> {
+        let Some(epoch) = expected_epoch else {
+            return Ok(());
+        };
+        if self.hold_lifecycle_epoch.load(Ordering::Acquire) != epoch
+            || self.hold_cancelled_epoch.load(Ordering::Acquire) >= epoch
+        {
+            return Err(AppError::invalid(
+                "macro_hold_released",
+                "Hold 快捷键已松开或生命周期已失效，本次启动已取消",
+            ));
+        }
+        let current = self.hold_lifecycle.lock().map_err(|_| {
+            AppError::invalid(
+                "macro_hold_lifecycle_unavailable",
+                "Hold 快捷键生命周期不可确认，本次启动已取消",
+            )
+        })?;
+        let valid = current.as_ref().is_some_and(|identity| {
+            identity.epoch == epoch
+                && !identity.cancelled
+                && identity.macro_id == rule.id
+                && identity.rule_snapshot == trigger_macro_snapshot(rule)
+                && !matches!(identity.phase, HoldLifecyclePhase::Retired)
+        });
+        if valid
+            && self.hold_lifecycle_epoch.load(Ordering::Acquire) == epoch
+            && self.hold_cancelled_epoch.load(Ordering::Acquire) < epoch
+        {
+            Ok(())
+        } else {
+            Err(AppError::invalid(
+                "macro_hold_released",
+                "Hold 快捷键已松开或生命周期已失效，本次启动已取消",
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn bind_hold_lifecycle_run(
+        &self,
+        rule: &MacroRule,
+        expected_epoch: Option<u64>,
+        run_token: RunToken,
+    ) -> Result<(), AppError> {
+        let Some(epoch) = expected_epoch else {
+            return Ok(());
+        };
+        self.validate_hold_lifecycle(rule, expected_epoch)?;
+        let mut current = self.hold_lifecycle.lock().map_err(|_| {
+            AppError::invalid(
+                "macro_hold_lifecycle_unavailable",
+                "Hold 快捷键生命周期不可确认，本次启动已取消",
+            )
+        })?;
+        let Some(identity) = current.as_mut().filter(|identity| {
+            identity.epoch == epoch
+                && !identity.cancelled
+                && matches!(identity.phase, HoldLifecyclePhase::Pending)
+        }) else {
+            return Err(AppError::invalid(
+                "macro_hold_released",
+                "Hold 快捷键已松开或生命周期已失效，本次启动已取消",
+            ));
+        };
+        if self.hold_cancelled_epoch.load(Ordering::Acquire) >= epoch {
+            identity.cancelled = true;
+            return Err(AppError::invalid(
+                "macro_hold_released",
+                "Hold 快捷键已松开，本次启动已取消",
+            ));
+        }
+        identity.phase = HoldLifecyclePhase::Bound { run_token };
+        self.hold_bound_token_id
+            .store(run_token.id, Ordering::Release);
+        self.hold_bound_token_generation
+            .store(run_token.generation, Ordering::Release);
+        self.hold_lifecycle_phase.store(2, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn activate_hold_lifecycle(
+        &self,
+        rule: &MacroRule,
+        expected_epoch: Option<u64>,
+        run_token: RunToken,
+        instance_id: u64,
+    ) -> Result<(), AppError> {
+        let Some(epoch) = expected_epoch else {
+            return Ok(());
+        };
+        self.validate_hold_lifecycle(rule, expected_epoch)?;
+        let mut current = self.hold_lifecycle.lock().map_err(|_| {
+            AppError::invalid(
+                "macro_hold_lifecycle_unavailable",
+                "Hold 快捷键生命周期不可确认，本次启动已取消",
+            )
+        })?;
+        let Some(identity) = current.as_mut().filter(|identity| {
+            identity.epoch == epoch
+                && !identity.cancelled
+                && matches!(
+                    identity.phase,
+                    HoldLifecyclePhase::Bound { run_token: token } if token == run_token
+                )
+        }) else {
+            return Err(AppError::invalid(
+                "macro_hold_released",
+                "Hold 快捷键已松开或生命周期已失效，本次启动已取消",
+            ));
+        };
+        if self.hold_cancelled_epoch.load(Ordering::Acquire) >= epoch {
+            identity.cancelled = true;
+            return Err(AppError::invalid(
+                "macro_hold_released",
+                "Hold 快捷键已松开，本次启动已取消",
+            ));
+        }
+        identity.phase = HoldLifecyclePhase::Active {
+            run_token,
+            instance_id,
+        };
+        self.hold_lifecycle_phase.store(3, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn abort_activated_hold_start(
+        &self,
+        expected_epoch: Option<u64>,
+        run_token: RunToken,
+        registered_instance: Option<u64>,
+    ) {
+        self.controller.revoke_token(run_token);
+        if let Some(instance_id) = registered_instance {
+            self.unregister_playback_input(instance_id);
+        }
+        if let Some(epoch) = expected_epoch {
+            // Retire before making the controller idle. A stale keyup from this
+            // Hold must never revoke a newer unrelated run.
+            self.retire_hold_lifecycle(epoch);
+        }
+        let _ = self.controller.begin_cleaning(run_token);
+        let _ = self.controller.finish(run_token, true);
+    }
+
+    #[cfg(windows)]
+    fn retire_hold_lifecycle(&self, epoch: u64) {
+        let Ok(mut current) = self.hold_lifecycle.lock() else {
+            self.controller.lock_fault();
+            return;
+        };
+        if !current
+            .as_ref()
+            .is_some_and(|identity| identity.epoch == epoch)
+        {
+            return;
+        }
+        if let Some(identity) = current.as_mut() {
+            identity.phase = HoldLifecyclePhase::Retired;
+        }
+        self.hold_lifecycle_phase.store(0, Ordering::Release);
+        self.hold_lifecycle_epoch.store(0, Ordering::Release);
+        self.hold_bound_token_id.store(0, Ordering::Release);
+        self.hold_bound_token_generation.store(0, Ordering::Release);
+        for word in &self.hold_trigger_words {
+            word.store(0, Ordering::Release);
+        }
+        *current = None;
+    }
+
+    #[cfg(windows)]
+    fn revoke_current_hold_for_key_up(&self, vk: u32) -> bool {
+        let mut bound_token = None;
+        let mut matched_epoch = None;
+        let matched = match self.hold_lifecycle.try_lock() {
+            Ok(mut current) => {
+                let matched = cancel_hold_identity_for_key(
+                    &mut current,
+                    vk,
+                    &mut matched_epoch,
+                    &mut bound_token,
+                );
+                if let Some(epoch) = matched_epoch {
+                    self.hold_cancelled_epoch.fetch_max(epoch, Ordering::AcqRel);
+                }
+                if let Some(token) = bound_token.filter(|token| token.id != 0) {
+                    self.revoke_bound_hold_token(token);
+                }
+                matched
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let mut current = error.into_inner();
+                let matched = cancel_hold_identity_for_key(
+                    &mut current,
+                    vk,
+                    &mut matched_epoch,
+                    &mut bound_token,
+                );
+                if let Some(epoch) = matched_epoch {
+                    self.hold_cancelled_epoch.fetch_max(epoch, Ordering::AcqRel);
+                }
+                if let Some(token) = bound_token.filter(|token| token.id != 0) {
+                    self.revoke_bound_hold_token(token);
+                }
+                matched
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let Some(epoch) = self.cancel_matching_hold_epoch_atomic(vk) else {
+                    return false;
+                };
+                bound_token = self
+                    .load_hold_atomic_snapshot(vk)
+                    .filter(|snapshot| snapshot.epoch == epoch && snapshot.trigger_matches)
+                    .and_then(|snapshot| snapshot.bound_token);
+
+                // A Pending snapshot can become Bound immediately after it is
+                // read. Re-read the same epoch after publishing cancellation
+                // so that an exact token which raced with key-up is revoked as
+                // well. If it remains Pending, the worker's lifecycle checks
+                // observe the cancellation watermark before activation.
+                if bound_token.is_none() {
+                    if let Some(after_cancel) = self
+                        .load_hold_atomic_snapshot(vk)
+                        .filter(|after| after.epoch == epoch && after.trigger_matches)
+                    {
+                        bound_token = after_cancel.bound_token;
+                    }
+                }
+                if let Some(token) = bound_token.filter(|token| token.id != 0) {
+                    self.revoke_bound_hold_token(token);
+                }
+                true
+            }
+        };
+        if !matched {
+            return false;
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn revoke_bound_hold_token(&self, expected_token: RunToken) {
+        self.controller.revoke_token(expected_token);
+    }
+
+    #[cfg(windows)]
+    fn load_hold_atomic_snapshot(&self, vk: u32) -> Option<HoldAtomicSnapshot> {
+        // Phase transitions are monotonic within an epoch (Pending -> Bound ->
+        // Active -> Retired). Reading phase and epoch again therefore rejects
+        // both an in-progress transition and fields from a replacement
+        // identity without ever blocking the keyboard callback.
+        for _ in 0..4 {
+            let epoch_before = self.hold_lifecycle_epoch.load(Ordering::Acquire);
+            if epoch_before == 0 {
+                return None;
+            }
+            let trigger_matches = hold_trigger_word_contains(&self.hold_trigger_words, vk);
+            let phase_before = self.hold_lifecycle_phase.load(Ordering::Acquire);
+            let token = RunToken {
+                id: self.hold_bound_token_id.load(Ordering::Acquire),
+                generation: self.hold_bound_token_generation.load(Ordering::Acquire),
+            };
+            let phase_after = self.hold_lifecycle_phase.load(Ordering::Acquire);
+            let epoch_after = self.hold_lifecycle_epoch.load(Ordering::Acquire);
+            if let Some(snapshot) = consistent_hold_atomic_snapshot(
+                epoch_before,
+                trigger_matches,
+                phase_before,
+                token,
+                phase_after,
+                epoch_after,
+            ) {
+                return Some(snapshot);
+            }
+        }
+        None
+    }
+
+    #[cfg(windows)]
+    fn cancel_matching_hold_epoch_atomic(&self, vk: u32) -> Option<u64> {
+        // Publish cancellation as soon as a matching epoch/bitmap pair is
+        // observed. If the identity changes while it is read, cancelling the
+        // older unique epoch is harmless and the retry handles the current
+        // identity as well.
+        let mut matched = None;
+        for _ in 0..4 {
+            let epoch_before = self.hold_lifecycle_epoch.load(Ordering::Acquire);
+            if epoch_before == 0 {
+                return matched;
+            }
+            let trigger_matches = hold_trigger_word_contains(&self.hold_trigger_words, vk);
+            if trigger_matches {
+                self.hold_cancelled_epoch
+                    .fetch_max(epoch_before, Ordering::AcqRel);
+                matched = Some(epoch_before);
+            }
+            let epoch_after = self.hold_lifecycle_epoch.load(Ordering::Acquire);
+            if epoch_before == epoch_after {
+                return trigger_matches.then_some(epoch_before).or(matched);
+            }
+        }
+        matched
+    }
+
+    #[cfg(windows)]
     fn start_trigger_worker(self: &Arc<Self>) -> Result<(), AppError> {
         let weak = Arc::downgrade(self);
         let worker = crate::bounded_worker::BoundedWorker::spawn(
@@ -2474,38 +3376,72 @@ impl HookShared {
                 let Some(shared) = weak.upgrade() else {
                     return;
                 };
-                struct Reset<'a>(&'a AtomicBool);
-                impl Drop for Reset<'_> {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
+                let _reset = TriggerPendingReset(&shared.trigger_pending);
+                let mut hold_reset = PendingHoldLifecycleReset {
+                    shared: &shared,
+                    epoch: task.hold_epoch,
+                    transferred_to_playback: false,
+                };
+                let outcome = match task.start_timing {
+                    TriggerStartTiming::ReleaseGated => wait_for_trigger_release(&shared, &task),
+                    TriggerStartTiming::HoldImmediate => {
+                        match trigger_release_gate_status(&shared, &task) {
+                            TriggerReleaseGateStatus::Current => TriggerReleaseGateOutcome::Ready,
+                            TriggerReleaseGateStatus::Shutdown => {
+                                TriggerReleaseGateOutcome::Shutdown
+                            }
+                            TriggerReleaseGateStatus::Cancelled(reason) => {
+                                TriggerReleaseGateOutcome::Cancelled(reason)
+                            }
+                        }
                     }
-                }
-                let _reset = Reset(&shared.trigger_pending);
-                if shared.shutdown.load(Ordering::Acquire)
-                    || shared.emergency_generation.load(Ordering::Acquire) != task.generation
-                {
+                };
+                if !matches!(outcome, TriggerReleaseGateOutcome::Ready) {
+                    let (event, reason) = match outcome {
+                        TriggerReleaseGateOutcome::Timeout => {
+                            ("macro_trigger_release_timeout", "physical_release_timeout")
+                        }
+                        TriggerReleaseGateOutcome::Shutdown => (
+                            if matches!(task.start_timing, TriggerStartTiming::HoldImmediate) {
+                                "macro_trigger_immediate_shutdown"
+                            } else {
+                                "macro_trigger_release_shutdown"
+                            },
+                            "shutdown",
+                        ),
+                        TriggerReleaseGateOutcome::Cancelled(reason) => (
+                            if matches!(task.start_timing, TriggerStartTiming::HoldImmediate) {
+                                "macro_trigger_immediate_cancelled"
+                            } else {
+                                "macro_trigger_release_cancelled"
+                            },
+                            trigger_release_cancellation_name(reason),
+                        ),
+                        TriggerReleaseGateOutcome::Ready => unreachable!(),
+                    };
+                    shared.record_safety(
+                        event,
+                        &[
+                            ("macro_id", task.rule.id.clone()),
+                            ("reason", reason.to_string()),
+                            (
+                                "start_timing",
+                                match task.start_timing {
+                                    TriggerStartTiming::ReleaseGated => "release_gated",
+                                    TriggerStartTiming::HoldImmediate => "hold_immediate",
+                                }
+                                .to_string(),
+                            ),
+                        ],
+                    );
                     return;
                 }
-                if matches!(task.rule.mode, MacroMode::Hold)
-                    && !task
-                        .rule
-                        .trigger_keys
-                        .iter()
-                        .filter_map(|key| key_to_vk(key))
-                        .all(|key| unsafe {
-                            windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
-                                key as i32,
-                            ) as u16
-                                & 0x8000
-                                != 0
-                        })
-                {
-                    return;
-                }
-                if let Err(error) = shared.start_playback_at_revision(
+                if let Err(error) = shared.start_hotkey_playback_at_revision(
                     task.rule.clone(),
                     task.generation,
                     task.admission_revision,
+                    task.config_revision,
+                    task.hold_epoch,
                 ) {
                     if should_show_start_error(&error.code) {
                         shared.set_playback_start_error(error.message.clone());
@@ -2514,6 +3450,8 @@ impl HookShared {
                             .publish(&format!("{} · 启动失败", task.rule.name), &error.message);
                     }
                     shared.record_safety("macro_trigger_failed", &[("error", error.message)]);
+                } else {
+                    hold_reset.transfer_to_playback();
                 }
             },
         )
@@ -2530,12 +3468,27 @@ impl HookShared {
     }
 
     #[cfg(windows)]
-    fn submit_macro_trigger(&self, rule: &MacroRule, generation: u64) -> bool {
+    fn submit_macro_trigger(
+        &self,
+        rule: &MacroRule,
+        generation: u64,
+        config_revision: u64,
+    ) -> bool {
         let admission_revision = self.controller.background_generation();
+        let controller_generation = self.controller.generation();
+        let emergency_vk = self.emergency_vk.load(Ordering::Acquire);
         // At most one admitted startup, including the task currently handled.
         // This is not a deferred playback queue: busy starts are never stored.
         if self.shutdown.load(Ordering::Acquire)
             || self.emergency_generation.load(Ordering::Acquire) != generation
+            || controller_generation != generation
+            || !self.trigger_config_revision_is_current(config_revision)
+            || self.physical_ledger_uncertain.load(Ordering::Acquire)
+            || rule
+                .trigger_keys
+                .iter()
+                .filter_map(|key| key_to_vk(key))
+                .any(|vk| vk == emergency_vk)
             || self
                 .trigger_pending
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2543,16 +3496,39 @@ impl HookShared {
         {
             return false;
         }
+        let start_timing = trigger_start_timing(rule);
+        let hold_epoch = if matches!(start_timing, TriggerStartTiming::HoldImmediate) {
+            match self.publish_hold_lifecycle(rule) {
+                Some(epoch) => Some(epoch),
+                None => {
+                    self.trigger_pending.store(false, Ordering::Release);
+                    self.record_safety_async(
+                        "macro_hold_lifecycle_not_admitted",
+                        vec![("macro_id".into(), rule.id.clone())],
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         let task = MacroTriggerTask {
             rule: rule.clone(),
+            start_timing,
+            hold_epoch,
             generation,
+            controller_generation,
             admission_revision,
+            config_revision,
         };
         if self
             .trigger_tasks
             .get()
             .is_none_or(|worker| worker.try_submit(task).is_err())
         {
+            if let Some(epoch) = hold_epoch {
+                self.retire_hold_lifecycle(epoch);
+            }
             self.trigger_pending.store(false, Ordering::Release);
             self.record_safety_async(
                 "macro_trigger_not_admitted",
@@ -2577,12 +3553,104 @@ impl HookShared {
     }
 
     #[cfg(windows)]
+    fn validate_pending_trigger_config(
+        &self,
+        task_rule: &MacroRule,
+        expected_revision: u64,
+    ) -> Result<(), AppError> {
+        drop(self.lock_pending_trigger_config(task_rule, expected_revision)?);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn lock_pending_trigger_config<'a>(
+        &'a self,
+        task_rule: &MacroRule,
+        expected_revision: u64,
+    ) -> Result<std::sync::MutexGuard<'a, AppConfig>, AppError> {
+        if !self.trigger_config_revision_is_current(expected_revision) {
+            return Err(AppError::invalid(
+                "macro_trigger_config_stale",
+                "快捷键配置在等待期间已变化，本次启动已取消",
+            ));
+        }
+        let config = self.config.try_lock().map_err(|_| {
+            AppError::invalid(
+                "macro_trigger_config_stale",
+                "快捷键配置当前不可确认，本次启动已取消",
+            )
+        })?;
+        let still_admitted = config.global_enabled
+            && config
+                .macros
+                .iter()
+                .find(|rule| rule.id == task_rule.id)
+                .is_some_and(|rule| {
+                    rule.enabled
+                        && trigger_macro_snapshot(rule) == trigger_macro_snapshot(task_rule)
+                });
+        if !still_admitted || !self.trigger_config_revision_is_current(expected_revision) {
+            return Err(AppError::invalid(
+                "macro_trigger_config_stale",
+                "快捷键配置在等待期间已变化，本次启动已取消",
+            ));
+        }
+        Ok(config)
+    }
+
+    #[cfg(windows)]
     fn start_playback_at_revision(
         self: &Arc<Self>,
         macro_rule: MacroRule,
         expected_generation: u64,
         admission_revision: u64,
     ) -> Result<(), AppError> {
+        self.start_playback_with_trigger_revision(
+            macro_rule,
+            expected_generation,
+            admission_revision,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(windows)]
+    fn start_hotkey_playback_at_revision(
+        self: &Arc<Self>,
+        macro_rule: MacroRule,
+        expected_generation: u64,
+        admission_revision: u64,
+        config_revision: u64,
+        expected_hold_epoch: Option<u64>,
+    ) -> Result<(), AppError> {
+        self.start_playback_with_trigger_revision(
+            macro_rule,
+            expected_generation,
+            admission_revision,
+            Some(config_revision),
+            expected_hold_epoch,
+        )
+    }
+
+    #[cfg(windows)]
+    fn start_playback_with_trigger_revision(
+        self: &Arc<Self>,
+        macro_rule: MacroRule,
+        expected_generation: u64,
+        admission_revision: u64,
+        trigger_config_revision: Option<u64>,
+        expected_hold_epoch: Option<u64>,
+    ) -> Result<(), AppError> {
+        // Keep the exact rule admitted from config for every identity check.
+        // Clicker normalization is execution-only and must not manufacture a
+        // different config identity halfway through hotkey admission.
+        let admitted_rule = macro_rule;
+        self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch)?;
+        if let Some(revision) = trigger_config_revision {
+            self.validate_pending_trigger_config(&admitted_rule, revision)?;
+        }
+        #[cfg(test)]
+        self.run_trigger_admission_test_hook(TriggerAdmissionCheckpoint::AfterInitialValidation);
         let _admission = self.acquire_mode_admission()?;
         let mut thread_registry = self.playback_thread_handle.try_lock().map_err(|_| {
             AppError::invalid(
@@ -2618,6 +3686,10 @@ impl HookShared {
                 "宏启动已被 F12 取消",
             ));
         }
+        self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch)?;
+        if let Some(revision) = trigger_config_revision {
+            self.validate_pending_trigger_config(&admitted_rule, revision)?;
+        }
         let mut start_lease = self
             .controller
             .begin_start_at_revision(Some(expected_generation), admission_revision)
@@ -2633,6 +3705,13 @@ impl HookShared {
                 StartError::StatePoisoned => AppError::internal(error.to_string()),
             })?;
         let run_token = start_lease.token();
+        self.bind_hold_lifecycle_run(&admitted_rule, expected_hold_epoch, run_token)?;
+        let mut bound_hold_reset = PendingHoldLifecycleReset {
+            shared: self,
+            epoch: expected_hold_epoch,
+            transferred_to_playback: false,
+        };
+        self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch)?;
         if self.shutdown.load(Ordering::SeqCst) {
             return Err(AppError::invalid(
                 "app_shutting_down",
@@ -2659,9 +3738,9 @@ impl HookShared {
                 "上一次输入清理未确认安全，已禁止重新播放；请先按 F12 再次清理并确认安全诊断",
             ));
         }
-        let macro_rule = normalize_playback_rule(macro_rule);
-        let total_steps = macro_rule.macro_steps().map_or(0, |steps| steps.len());
-        if total_steps == 0 && matches!(&macro_rule.program, AutomationProgram::Macro { .. }) {
+        let execution_rule = normalize_playback_rule(admitted_rule.clone());
+        let total_steps = execution_rule.macro_steps().map_or(0, |steps| steps.len());
+        if total_steps == 0 && matches!(&execution_rule.program, AutomationProgram::Macro { .. }) {
             let error =
                 AppError::invalid("macro_empty", "这个宏还没有步骤，录制或添加步骤后才能播放");
             self.set_playback_start_error(error.message.clone());
@@ -2670,7 +3749,7 @@ impl HookShared {
         if let AutomationProgram::Rhai {
             source,
             api_version,
-        } = &macro_rule.program
+        } = &execution_rule.program
         {
             if *api_version != crate::rhai_runtime::RHAI_API_VERSION {
                 let error = AppError::invalid(
@@ -2686,6 +3765,9 @@ impl HookShared {
                 return Err(error);
             }
         }
+        if let Some(revision) = trigger_config_revision {
+            self.validate_pending_trigger_config(&admitted_rule, revision)?;
+        }
         // Macros always act on the current foreground program. A saved target
         // from older versions is intentionally ignored so the same macro can
         // be used everywhere.
@@ -2699,14 +3781,32 @@ impl HookShared {
                 "宏启动已被 F12 取消",
             ));
         }
+        self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch)?;
         if playback.running {
             return Err(AppError::invalid("macro_busy", "已有一个宏正在运行"));
         }
+        #[cfg(test)]
+        self.run_trigger_admission_test_hook(TriggerAdmissionCheckpoint::BeforeActivation);
+        // update_config advances trigger_config_revision while holding this
+        // same short-lived config lock. Retaining the validated guard through
+        // controller activation closes the final check-to-activate race.
+        let trigger_config_guard = match trigger_config_revision {
+            Some(revision) => Some(self.lock_pending_trigger_config(&admitted_rule, revision)?),
+            None => None,
+        };
+        self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch)?;
         if !self.controller.activate(run_token) {
             return Err(AppError::invalid(
                 "playback_cancelled",
                 "宏启动已被停止请求取消",
             ));
+        }
+        drop(trigger_config_guard);
+        #[cfg(test)]
+        self.run_trigger_admission_test_hook(TriggerAdmissionCheckpoint::AfterControllerActivation);
+        if let Err(error) = self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch) {
+            self.abort_activated_hold_start(expected_hold_epoch, run_token, None);
+            return Err(error);
         }
         let stop = Arc::new(AtomicBool::new(false));
         let instance_id = self
@@ -2715,9 +3815,35 @@ impl HookShared {
             .saturating_add(1);
         let emergency_generation = expected_generation;
         let input_state = Arc::new(InjectedInputState::with_broker(self.input_broker.clone()));
+        #[cfg(test)]
+        self.run_trigger_admission_test_hook(TriggerAdmissionCheckpoint::BeforeInputRegistration);
+        if let Err(error) = self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch) {
+            self.abort_activated_hold_start(expected_hold_epoch, run_token, None);
+            return Err(error);
+        }
         if let Err(error) = self.register_playback_input(instance_id, Arc::clone(&input_state)) {
+            if let Some(epoch) = expected_hold_epoch {
+                self.retire_hold_lifecycle(epoch);
+            }
             let _ = self.controller.finish(run_token, false);
             self.input_recovery_required.store(true, Ordering::Release);
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.run_trigger_admission_test_hook(TriggerAdmissionCheckpoint::BeforePlaybackPublication);
+        if let Err(error) = self.validate_hold_lifecycle(&admitted_rule, expected_hold_epoch) {
+            self.unregister_playback_input(instance_id);
+            self.abort_activated_hold_start(expected_hold_epoch, run_token, None);
+            return Err(error);
+        }
+        if let Err(error) = self.activate_hold_lifecycle(
+            &admitted_rule,
+            expected_hold_epoch,
+            run_token,
+            instance_id,
+        ) {
+            self.unregister_playback_input(instance_id);
+            self.abort_activated_hold_start(expected_hold_epoch, run_token, None);
             return Err(error);
         }
         let restore_window = foreground_window_handle();
@@ -2732,9 +3858,9 @@ impl HookShared {
         playback.current_step_kind = None;
         playback.total_steps = total_steps;
         playback.last_error = None;
-        playback.macro_id = Some(macro_rule.id.clone());
-        playback.macro_name = Some(macro_rule.name.clone());
-        playback.program_kind = Some(match &macro_rule.program {
+        playback.macro_id = Some(execution_rule.id.clone());
+        playback.macro_name = Some(execution_rule.name.clone());
+        playback.program_kind = Some(match &execution_rule.program {
             AutomationProgram::Macro { .. } => "macro".to_string(),
             AutomationProgram::Rhai { .. } => "rhai".to_string(),
         });
@@ -2747,16 +3873,16 @@ impl HookShared {
         self.record_safety(
             "playback_started",
             &[
-                ("macro_id", macro_rule.id.clone()),
-                ("macro_name", macro_rule.name.clone()),
+                ("macro_id", execution_rule.id.clone()),
+                ("macro_name", execution_rule.name.clone()),
                 ("instance_id", instance_id.to_string()),
                 ("total_steps", total_steps.to_string()),
             ],
         );
         let shared = Arc::clone(self);
-        let trigger_keys = macro_rule.trigger_keys.clone();
-        let diagnostics_id = macro_rule.id.clone();
-        let diagnostics_name = macro_rule.name.clone();
+        let trigger_keys = execution_rule.trigger_keys.clone();
+        let diagnostics_id = execution_rule.id.clone();
+        let diagnostics_name = execution_rule.name.clone();
         self.playback_thread_owner
             .store(instance_id, Ordering::Release);
         let thread_lease = PlaybackThreadLease {
@@ -2776,7 +3902,7 @@ impl HookShared {
                 let _ = sleep_interruptible(20.0, &stop);
                 let result = play_macro_thread(
                     &shared,
-                    &macro_rule,
+                    &execution_rule,
                     &stop,
                     emergency_generation,
                     instance_id,
@@ -2788,11 +3914,16 @@ impl HookShared {
                     Err(error) => (None, Some(error)),
                 };
                 if let Some(error) = &playback_error {
-                    log::warn!("宏“{}”运行失败: {error}", macro_rule.name);
+                    log::warn!("宏“{}”运行失败: {error}", execution_rule.name);
                 }
                 let cleanup_safe = input_state.counts() == (0, 0)
                     && !shared.input_recovery_required.load(Ordering::SeqCst)
                     && !shared.executor_containment_unknown.load(Ordering::Acquire);
+                if let Some(epoch) = expected_hold_epoch {
+                    // Cleanup has completed and no further input can be sent.
+                    // Retire this exact owner before allowing a newer run.
+                    shared.retire_hold_lifecycle(epoch);
+                }
                 let controller_finalized = shared.controller.finish(run_token, cleanup_safe);
                 if !controller_finalized {
                     shared.record_safety(
@@ -2867,7 +3998,7 @@ impl HookShared {
                 {
                     shared
                         .notifications
-                        .publish(&format!("{} · 运行失败", macro_rule.name), &error);
+                        .publish(&format!("{} · 运行失败", execution_rule.name), &error);
                 } else if cleanup_safe && controller_finalized {
                     if let Some((title, message)) = script_stop_message {
                         // Presentation happens only after the run has relinquished
@@ -2886,11 +4017,15 @@ impl HookShared {
                 playback.phase = "failed".to_string();
                 playback.cleanup_status = "safe".to_string();
                 playback.last_error = Some(error.to_string());
+                if let Some(epoch) = expected_hold_epoch {
+                    self.retire_hold_lifecycle(epoch);
+                }
                 let _ = self.controller.finish(run_token, true);
                 AppError::with_detail("playback_start_failed", "宏播放启动失败", error.to_string())
             })?;
         *thread_registry = Some((instance_id, playback_handle));
         start_lease.commit();
+        bound_hold_reset.transfer_to_playback();
         Ok(())
     }
 
@@ -3023,6 +4158,112 @@ impl HookShared {
             .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
             .map_err(|error| error.message)
     }
+}
+
+#[cfg(windows)]
+fn trigger_release_gate_status(
+    shared: &HookShared,
+    task: &MacroTriggerTask,
+) -> TriggerReleaseGateStatus {
+    if shared.shutdown.load(Ordering::Acquire) || shared.controller.is_shutting_down() {
+        TriggerReleaseGateStatus::Shutdown
+    } else if shared.emergency_generation.load(Ordering::Acquire) != task.generation {
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::TaskGeneration)
+    } else if shared.controller.generation() != task.controller_generation {
+        // request_emergency_stop changes the controller generation before it
+        // publishes emergency_generation. This check closes that race.
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::ControllerGeneration)
+    } else if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::PhysicalLedgerUncertain)
+    } else if shared.controller.background_generation() != task.admission_revision {
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::AdmissionRevision)
+    } else if !shared.trigger_config_revision_is_current(task.config_revision) {
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::ConfigRevision)
+    } else if task.hold_epoch.is_some_and(|epoch| {
+        shared.hold_lifecycle_epoch.load(Ordering::Acquire) != epoch
+            || shared.hold_cancelled_epoch.load(Ordering::Acquire) >= epoch
+    }) {
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::HoldLifecycle)
+    } else {
+        TriggerReleaseGateStatus::Current
+    }
+}
+
+#[cfg(windows)]
+fn trigger_vk_is_physically_down(vk: u32) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    let down = |key| unsafe { GetAsyncKeyState(key as i32) as u16 & 0x8000 != 0 };
+    if vk == 0x5B {
+        // The hook canonicalizes both Windows keys to VK_LWIN. Query both
+        // physical variants before admitting a shortcut-triggered start.
+        down(0x5B) || down(0x5C)
+    } else {
+        down(vk)
+    }
+}
+
+#[cfg(windows)]
+fn trigger_keys_are_physically_down(
+    shared: &HookShared,
+    trigger_vks: &[u32],
+) -> Result<bool, TriggerReleaseCancellation> {
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        return Err(TriggerReleaseCancellation::PhysicalLedgerUncertain);
+    }
+    let ledger = shared
+        .physical_pressed
+        .try_lock()
+        .map(|ledger| ledger.clone())
+        .map_err(|_| {
+            shared
+                .physical_ledger_uncertain
+                .store(true, Ordering::Release);
+            TriggerReleaseCancellation::PhysicalLedgerUncertain
+        })?;
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        return Err(TriggerReleaseCancellation::PhysicalLedgerUncertain);
+    }
+    Ok(trigger_vks
+        .iter()
+        .copied()
+        .any(|vk| trigger_down_from_ledger_or_async(&ledger, vk, trigger_vk_is_physically_down)))
+}
+
+#[cfg(windows)]
+fn wait_for_trigger_release(
+    shared: &HookShared,
+    task: &MacroTriggerTask,
+) -> TriggerReleaseGateOutcome {
+    let Some(trigger_vks) = macro_trigger_vks(&task.rule.trigger_keys) else {
+        return TriggerReleaseGateOutcome::Cancelled(
+            TriggerReleaseCancellation::TriggerConfiguration,
+        );
+    };
+    let started = Instant::now();
+    drive_trigger_release_gate(
+        TriggerReleaseGate::new(TRIGGER_RELEASE_STABLE, TRIGGER_RELEASE_TIMEOUT),
+        || {
+            let mut status = trigger_release_gate_status(shared, task);
+            let any_trigger_key_down = if matches!(status, TriggerReleaseGateStatus::Current) {
+                match trigger_keys_are_physically_down(shared, &trigger_vks) {
+                    Ok(down) => down,
+                    Err(reason) => {
+                        status = TriggerReleaseGateStatus::Cancelled(reason);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            TriggerReleaseSample {
+                elapsed: started.elapsed(),
+                any_trigger_key_down,
+                status,
+            }
+        },
+        thread::sleep,
+    )
 }
 
 #[cfg(windows)]
@@ -3534,6 +4775,13 @@ fn hook_thread(shared: Arc<HookShared>) {
         .thread_id
         .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
     shared.record_safety("hook_thread_started", &[("status", "starting".to_string())]);
+    if !shared.initialize_physical_key_ledger() {
+        shared.record_safety(
+            "hook_thread_start_failed",
+            &[("kind", "physical_key_ledger".to_string())],
+        );
+        return;
+    }
     let hook = unsafe {
         SetWindowsHookExW(
             WH_KEYBOARD_LL,
@@ -3545,6 +4793,7 @@ fn hook_thread(shared: Arc<HookShared>) {
     let hook = match hook {
         Ok(hook) => hook,
         Err(error) => {
+            shared.retire_physical_key_ledger();
             log::error!("全局键盘监听启动失败: {error}");
             shared.record_safety(
                 "hook_thread_start_failed",
@@ -3561,6 +4810,7 @@ fn hook_thread(shared: Arc<HookShared>) {
     let mouse_hook = match mouse_hook {
         Ok(hook) => hook,
         Err(error) => {
+            shared.retire_physical_key_ledger();
             log::error!("全局鼠标监听启动失败: {error}");
             shared.record_safety(
                 "hook_thread_start_failed",
@@ -3580,19 +4830,24 @@ fn hook_thread(shared: Arc<HookShared>) {
     // Use Windows' native hotkey delivery for the clicker. Low-level keyboard
     // hooks are still needed for F12, recording and general macros, but they
     // are not a dependable foundation for a Ctrl+function-key toggle.
-    let native_clicker_hotkey = unsafe {
-        RegisterHotKey(
-            None,
-            CLICKER_HOTKEY_ID,
-            HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_NOREPEAT.0),
-            0x77,
-        )
-    }
-    .is_ok();
+    let native_clicker_allowed = shared
+        .config
+        .try_lock()
+        .is_ok_and(|config| native_clicker_registration_allowed(&config));
+    let native_clicker_hotkey = native_clicker_allowed
+        && unsafe {
+            RegisterHotKey(
+                None,
+                CLICKER_HOTKEY_ID,
+                HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_NOREPEAT.0),
+                0x77,
+            )
+        }
+        .is_ok();
     shared
         .native_clicker_hotkey_registered
         .store(native_clicker_hotkey, Ordering::SeqCst);
-    if !native_clicker_hotkey {
+    if native_clicker_allowed && !native_clicker_hotkey {
         log::warn!("Ctrl+F8 原生热键注册失败，将使用兼容监听方式");
     }
     refresh_native_macro_hotkeys(&shared);
@@ -3634,6 +4889,7 @@ fn hook_thread(shared: Arc<HookShared>) {
     }
 
     shared.hook_ready.store(false, Ordering::Release);
+    shared.retire_physical_key_ledger();
     let keyboard_removed = shared.confirm_hook_removal(
         "keyboard",
         unsafe { UnhookWindowsHookEx(hook) }.map_err(|error| error.to_string()),
@@ -3705,6 +4961,9 @@ unsafe extern "system" fn keyboard_hook(
     let Some(shared) = HOOK_SHARED.get() else {
         return CallNextHookEx(None, code, message, data);
     };
+    if !shared.track_physical_key_event(info.vkCode, is_down, is_up) {
+        return CallNextHookEx(None, code, message, data);
+    }
     // Low-level hooks report left/right modifiers as distinct keys. Rules are
     // configured with the user-facing Ctrl / Alt / Shift names, so normalize
     // before tracking or matching a combination.
@@ -3724,8 +4983,18 @@ unsafe extern "system" fn keyboard_hook(
         return LRESULT(1);
     }
 
-    let config = match shared.config.try_lock() {
-        Ok(config) => config.clone(),
+    // Hold release is a lifecycle revocation, not configuration dispatch.
+    // Resolve it before config/playback/pressed locks so disable/delete/rekey
+    // and callback lock contention cannot delay or lose the stop.
+    if is_up {
+        shared.revoke_current_hold_for_key_up(vk);
+    }
+
+    let (config, trigger_config_revision) = match shared.config.try_lock() {
+        Ok(config) => (
+            config.clone(),
+            shared.trigger_config_revision.load(Ordering::Acquire),
+        ),
         Err(_) => {
             shared.reject_hook_event("configuration_unavailable", is_up);
             return CallNextHookEx(None, code, message, data);
@@ -3784,7 +5053,6 @@ unsafe extern "system" fn keyboard_hook(
     }
 
     if is_up {
-        stop_hold_macros_on_key_up(shared, &config, vk);
         if shared.submit_remap_up(vk) {
             return LRESULT(1);
         }
@@ -3796,13 +5064,20 @@ unsafe extern "system" fn keyboard_hook(
     }
 
     if shared.trigger_rearm_required.load(Ordering::Acquire) {
-        if is_macro_trigger_key(&config, vk) {
+        if should_suppress_for_trigger_rearm(shared, &config, vk) {
             return LRESULT(1);
         }
         return CallNextHookEx(None, code, message, data);
     }
 
-    if process_macro_key_down(shared, &config, vk, was_pressed, &pressed) {
+    if process_macro_key_down(
+        shared,
+        &config,
+        trigger_config_revision,
+        vk,
+        was_pressed,
+        &pressed,
+    ) {
         return LRESULT(1);
     }
 
@@ -4216,6 +5491,44 @@ fn canonical_virtual_key(vk: u32) -> u32 {
         0x5B | 0x5C => 0x5B, // left / right Windows key
         _ => vk,
     }
+}
+
+#[cfg(windows)]
+fn update_physical_pressed_ledger(
+    ledger: &mut HashSet<u32>,
+    raw_vk: u32,
+    is_down: bool,
+    is_up: bool,
+    injected: bool,
+) {
+    if injected {
+        return;
+    }
+    if is_down {
+        ledger.insert(raw_vk);
+    } else if is_up {
+        ledger.remove(&raw_vk);
+    }
+}
+
+#[cfg(windows)]
+fn physical_ledger_contains_trigger(ledger: &HashSet<u32>, trigger_vk: u32) -> bool {
+    match trigger_vk {
+        0x10 => [0x10, 0xA0, 0xA1].iter().any(|vk| ledger.contains(vk)),
+        0x11 => [0x11, 0xA2, 0xA3].iter().any(|vk| ledger.contains(vk)),
+        0x12 => [0x12, 0xA4, 0xA5].iter().any(|vk| ledger.contains(vk)),
+        0x5B => [0x5B, 0x5C].iter().any(|vk| ledger.contains(vk)),
+        vk => ledger.contains(&vk),
+    }
+}
+
+#[cfg(windows)]
+fn trigger_down_from_ledger_or_async(
+    ledger: &HashSet<u32>,
+    trigger_vk: u32,
+    is_async_down: impl FnOnce(u32) -> bool,
+) -> bool {
+    physical_ledger_contains_trigger(ledger, trigger_vk) || is_async_down(trigger_vk)
 }
 
 #[cfg(windows)]
@@ -4650,9 +5963,32 @@ fn key_name_from_vk(vk: u32) -> String {
 }
 
 #[cfg(windows)]
+fn macro_rule_matches_key_down(rule: &MacroRule, current_vk: u32, pressed: &HashSet<u32>) -> bool {
+    let trigger_vks = rule
+        .trigger_keys
+        .iter()
+        .filter_map(|key| key_to_vk(key))
+        .collect::<Vec<_>>();
+    !trigger_vks.is_empty()
+        && trigger_vks.len() == rule.trigger_keys.len()
+        && trigger_vks.contains(&current_vk)
+        && trigger_vks.iter().all(|key| pressed.contains(key))
+}
+
+#[cfg(windows)]
+fn effective_hotkey_mode(rule: &MacroRule) -> MacroMode {
+    if rule.name.trim() == "连点器" {
+        MacroMode::Toggle
+    } else {
+        rule.mode
+    }
+}
+
+#[cfg(windows)]
 fn process_macro_key_down(
     shared: &Arc<HookShared>,
     config: &AppConfig,
+    config_revision: u64,
     current_vk: u32,
     was_pressed: bool,
     pressed: &HashSet<u32>,
@@ -4661,11 +5997,49 @@ fn process_macro_key_down(
     if shared.is_recording() {
         return false;
     }
-    let native_macro_ids = shared
-        .native_macro_hotkeys
-        .lock()
-        .map(|registered| registered.values().cloned().collect::<HashSet<_>>())
-        .unwrap_or_default();
+    // Stopping an already-running Toggle/clicker is a revocation operation,
+    // not a new start. Derive it entirely from the immutable config snapshot
+    // and pressed-key snapshot before touching start-only registry/latch locks.
+    // Rearm fencing prevents a native WM_HOTKEY for the same physical press
+    // from becoming a fresh start if the playback thread exits immediately.
+    let immediate_stop = !was_pressed
+        && config
+            .macros
+            .iter()
+            .filter(|rule| rule.enabled)
+            .any(|rule| {
+                matches!(effective_hotkey_mode(rule), MacroMode::Toggle)
+                    && macro_rule_matches_key_down(rule, current_vk, pressed)
+            });
+    if immediate_stop && shared.is_playback_running() {
+        shared.trigger_rearm_required.store(true, Ordering::Release);
+        shared.stop_playback();
+        return true;
+    }
+    let native_macro_ids = match shared.native_macro_hotkeys.try_lock() {
+        Ok(registered) => registered.values().cloned().collect::<HashSet<_>>(),
+        Err(error) => {
+            // This function runs directly on the low-level keyboard callback.
+            // If registration identity cannot be read immediately, never risk
+            // submitting the same trigger through both native and fallback
+            // paths. Consume only a configured macro key and fail closed.
+            let consume = is_macro_trigger_key(config, current_vk);
+            if consume {
+                let kind = match error {
+                    std::sync::TryLockError::WouldBlock => "would_block",
+                    std::sync::TryLockError::Poisoned(_) => "poisoned",
+                };
+                shared.record_safety_async(
+                    "fallback_macro_lock_unavailable",
+                    vec![
+                        ("lock".to_string(), "native_macro_hotkeys".to_string()),
+                        ("kind".to_string(), kind.to_string()),
+                    ],
+                );
+            }
+            return consume;
+        }
+    };
     for rule in config.macros.iter().filter(|rule| rule.enabled) {
         if shared
             .native_clicker_hotkey_registered
@@ -4677,16 +6051,7 @@ fn process_macro_key_down(
         if native_macro_ids.contains(&rule.id) {
             continue;
         }
-        let trigger_vks = rule
-            .trigger_keys
-            .iter()
-            .filter_map(|key| key_to_vk(key))
-            .collect::<Vec<_>>();
-        if trigger_vks.is_empty()
-            || trigger_vks.len() != rule.trigger_keys.len()
-            || !trigger_vks.contains(&current_vk)
-            || !trigger_vks.iter().all(|key| pressed.contains(key))
-        {
+        if !macro_rule_matches_key_down(rule, current_vk, pressed) {
             continue;
         }
         if was_pressed {
@@ -4695,28 +6060,138 @@ fn process_macro_key_down(
         let Some(signature) = macro_latch_signature(&rule.trigger_keys) else {
             continue;
         };
-        let Ok(mut latched) = shared.latched_hotkeys.lock() else {
-            continue;
+        let mut latched = match shared.latched_hotkeys.try_lock() {
+            Ok(latched) => latched,
+            Err(error) => {
+                let kind = match error {
+                    std::sync::TryLockError::WouldBlock => "would_block",
+                    std::sync::TryLockError::Poisoned(_) => "poisoned",
+                };
+                shared.record_safety_async(
+                    "fallback_macro_lock_unavailable",
+                    vec![
+                        ("lock".to_string(), "latched_hotkeys".to_string()),
+                        ("kind".to_string(), kind.to_string()),
+                        ("macro_id".to_string(), rule.id.clone()),
+                    ],
+                );
+                // The full combination matched, but it cannot be latched
+                // without waiting. Consume this keydown and submit nothing;
+                // the next physical press may retry after normal keyup.
+                return true;
+            }
         };
         if !latched.insert(signature) {
             continue;
         }
         drop(latched);
-        if !matches!(rule.mode, MacroMode::Toggle) && shared.is_playback_running() {
-            shared.record_safety_async(
-                "macro_trigger_ignored_while_running",
-                vec![("macro_id".to_string(), rule.id.clone())],
-            );
-            return true;
+        match hotkey_playback_action(effective_hotkey_mode(rule), shared.is_playback_running()) {
+            HotkeyPlaybackAction::Ignore => {
+                shared.record_safety_async(
+                    "macro_trigger_ignored_while_running",
+                    vec![("macro_id".to_string(), rule.id.clone())],
+                );
+                return true;
+            }
+            HotkeyPlaybackAction::StopImmediate => {
+                shared.stop_playback();
+                return true;
+            }
+            HotkeyPlaybackAction::StartAfterRelease | HotkeyPlaybackAction::StartImmediate => {}
         }
-        if matches!(rule.mode, MacroMode::Toggle) && shared.is_playback_running() {
-            shared.stop_playback();
-            return true;
-        }
-        shared.submit_macro_trigger(rule, request_generation);
+        shared.submit_macro_trigger(rule, request_generation, config_revision);
         return true;
     }
     false
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyPlaybackAction {
+    StartAfterRelease,
+    StartImmediate,
+    StopImmediate,
+    Ignore,
+}
+
+#[cfg(windows)]
+fn hotkey_playback_action(mode: MacroMode, playback_running: bool) -> HotkeyPlaybackAction {
+    match (mode, playback_running) {
+        (MacroMode::Hold, true) => HotkeyPlaybackAction::Ignore,
+        (MacroMode::Hold, false) => HotkeyPlaybackAction::StartImmediate,
+        (MacroMode::Toggle, true) => HotkeyPlaybackAction::StopImmediate,
+        (MacroMode::Once | MacroMode::Repeat, true) => HotkeyPlaybackAction::Ignore,
+        (MacroMode::Once | MacroMode::Repeat | MacroMode::Toggle, false) => {
+            HotkeyPlaybackAction::StartAfterRelease
+        }
+    }
+}
+
+#[cfg(windows)]
+fn trigger_start_timing(rule: &MacroRule) -> TriggerStartTiming {
+    if matches!(effective_hotkey_mode(rule), MacroMode::Hold) {
+        TriggerStartTiming::HoldImmediate
+    } else {
+        TriggerStartTiming::ReleaseGated
+    }
+}
+
+#[cfg(windows)]
+fn hold_trigger_word_contains(words: &[AtomicU64; 4], vk: u32) -> bool {
+    let Ok(index) = usize::try_from(vk / 64) else {
+        return false;
+    };
+    index < words.len() && words[index].load(Ordering::Acquire) & (1_u64 << (vk % 64)) != 0
+}
+
+#[cfg(windows)]
+fn consistent_hold_atomic_snapshot(
+    epoch_before: u64,
+    trigger_matches: bool,
+    phase_before: u32,
+    token: RunToken,
+    phase_after: u32,
+    epoch_after: u64,
+) -> Option<HoldAtomicSnapshot> {
+    if epoch_before == 0
+        || epoch_before != epoch_after
+        || phase_before != phase_after
+        || !(1..=3).contains(&phase_before)
+    {
+        return None;
+    }
+    Some(HoldAtomicSnapshot {
+        epoch: epoch_before,
+        trigger_matches,
+        bound_token: (phase_before >= 2 && token.id != 0).then_some(token),
+    })
+}
+
+#[cfg(windows)]
+fn cancel_hold_identity_for_key(
+    current: &mut Option<HoldLifecycleIdentity>,
+    vk: u32,
+    matched_epoch: &mut Option<u64>,
+    bound_token: &mut Option<RunToken>,
+) -> bool {
+    let Some(identity) = current
+        .as_mut()
+        .filter(|identity| identity.trigger_vks.contains(&vk))
+    else {
+        return false;
+    };
+    *matched_epoch = Some(identity.epoch);
+    if identity.cancelled || matches!(identity.phase, HoldLifecyclePhase::Retired) {
+        return true;
+    }
+    identity.cancelled = true;
+    *bound_token = match identity.phase {
+        HoldLifecyclePhase::Bound { run_token } | HoldLifecyclePhase::Active { run_token, .. } => {
+            Some(run_token)
+        }
+        HoldLifecyclePhase::Pending | HoldLifecyclePhase::Retired => None,
+    };
+    true
 }
 
 #[cfg(windows)]
@@ -4781,44 +6256,73 @@ fn is_macro_trigger_key(config: &AppConfig, vk: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn rearm_macro_triggers_if_released(shared: &HookShared, config: &AppConfig) {
+fn should_suppress_for_trigger_rearm(shared: &HookShared, config: &AppConfig, vk: u32) -> bool {
+    shared.trigger_rearm_required.load(Ordering::Acquire) && is_macro_trigger_key(config, vk)
+}
+
+#[cfg(windows)]
+fn rearm_macro_triggers_if_released_with(
+    shared: &HookShared,
+    config: &AppConfig,
+    mut is_async_down: impl FnMut(u32) -> bool,
+) {
     if !shared.trigger_rearm_required.load(Ordering::Acquire) {
         return;
     }
-    let all_released = config
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        return;
+    }
+    let ledger = match shared.physical_pressed.try_lock() {
+        Ok(ledger) => ledger.clone(),
+        Err(_) => {
+            shared
+                .physical_ledger_uncertain
+                .store(true, Ordering::Release);
+            return;
+        }
+    };
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        return;
+    }
+    let trigger_vks = config
         .macros
         .iter()
         .filter(|rule| rule.enabled)
         .flat_map(|rule| rule.trigger_keys.iter())
         .filter_map(|key| key_to_vk(key))
-        .all(|vk| unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-            GetAsyncKeyState(vk as i32) as u16 & 0x8000 == 0
-        });
-    if !all_released {
+        .collect::<HashSet<_>>();
+    if trigger_vks
+        .iter()
+        .copied()
+        .any(|vk| trigger_down_from_ledger_or_async(&ledger, vk, &mut is_async_down))
+    {
         return;
     }
-    shared
-        .trigger_rearm_required
-        .store(false, Ordering::Release);
     let Ok(mut pressed) = shared.pressed.try_lock() else {
-        shared.trigger_rearm_required.store(true, Ordering::Release);
         return;
     };
     let Ok(mut latched) = shared.latched_hotkeys.try_lock() else {
-        shared.trigger_rearm_required.store(true, Ordering::Release);
         return;
     };
-    config
-        .macros
-        .iter()
-        .filter(|rule| rule.enabled)
-        .flat_map(|rule| rule.trigger_keys.iter())
-        .filter_map(|key| key_to_vk(key))
-        .for_each(|vk| {
-            pressed.remove(&vk);
-        });
+    // Async state can change after the first sample even though hook callbacks
+    // are serialized. Recheck immediately before clearing logical identity.
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire)
+        || trigger_vks.iter().copied().any(is_async_down)
+    {
+        return;
+    }
+    for vk in trigger_vks {
+        pressed.remove(&vk);
+    }
     latched.retain(|signature| !signature.starts_with("macro+"));
+    shared
+        .trigger_rearm_required
+        .store(false, Ordering::Release);
+}
+
+#[cfg(windows)]
+fn rearm_macro_triggers_if_released(shared: &HookShared, config: &AppConfig) {
+    rearm_macro_triggers_if_released_with(shared, config, trigger_vk_is_physically_down);
 }
 
 #[cfg(windows)]
@@ -4835,22 +6339,9 @@ fn should_show_start_error(code: &str) -> bool {
             | "app_shutting_down"
             | "playback_cancelled"
             | "emergency_stop_unavailable"
+            | "macro_trigger_config_stale"
+            | "macro_hold_released"
     )
-}
-
-#[cfg(windows)]
-fn stop_hold_macros_on_key_up(shared: &HookShared, config: &AppConfig, vk: u32) {
-    if config.macros.iter().any(|rule| {
-        rule.enabled
-            && matches!(rule.mode, MacroMode::Hold)
-            && rule
-                .trigger_keys
-                .iter()
-                .filter_map(|key| key_to_vk(key))
-                .any(|key| key == vk)
-    }) {
-        shared.stop_playback();
-    }
 }
 
 #[cfg(windows)]
@@ -4957,7 +6448,12 @@ fn native_registration_plan(config: &AppConfig) -> Vec<(String, u32, u32)> {
         })
         .filter_map(|rule| {
             let (modifiers, key) = native_hotkey_spec(&rule.trigger_keys)?;
-            if rule.trigger_keys.len() == 1 && emergency_vk == Some(key) {
+            if rule
+                .trigger_keys
+                .iter()
+                .filter_map(|trigger| key_to_vk(trigger))
+                .any(|trigger_vk| Some(trigger_vk) == emergency_vk)
+            {
                 return None;
             }
             Some((rule.id.clone(), modifiers, key))
@@ -5012,7 +6508,12 @@ fn process_native_macro_hotkey(shared: &Arc<HookShared>, hotkey_id: i32) {
     let Some(macro_id) = macro_id else {
         return;
     };
-    let Ok(config) = shared.config.try_lock().map(|config| config.clone()) else {
+    let Ok((config, config_revision)) = shared.config.try_lock().map(|config| {
+        (
+            config.clone(),
+            shared.trigger_config_revision.load(Ordering::Acquire),
+        )
+    }) else {
         return;
     };
     if !config.global_enabled {
@@ -5025,18 +6526,21 @@ fn process_native_macro_hotkey(shared: &Arc<HookShared>, hotkey_id: i32) {
     else {
         return;
     };
-    if !matches!(rule.mode, MacroMode::Toggle) && shared.is_playback_running() {
-        shared.record_safety_async(
-            "native_macro_trigger_ignored_while_running",
-            vec![("macro_id".to_string(), rule.id.clone())],
-        );
-        return;
+    match hotkey_playback_action(effective_hotkey_mode(rule), shared.is_playback_running()) {
+        HotkeyPlaybackAction::Ignore => {
+            shared.record_safety_async(
+                "native_macro_trigger_ignored_while_running",
+                vec![("macro_id".to_string(), rule.id.clone())],
+            );
+            return;
+        }
+        HotkeyPlaybackAction::StopImmediate => {
+            shared.stop_playback();
+            return;
+        }
+        HotkeyPlaybackAction::StartAfterRelease | HotkeyPlaybackAction::StartImmediate => {}
     }
-    if matches!(rule.mode, MacroMode::Toggle) && shared.is_playback_running() {
-        shared.stop_playback();
-        return;
-    }
-    shared.submit_macro_trigger(rule, request_generation);
+    shared.submit_macro_trigger(rule, request_generation, config_revision);
 }
 
 #[cfg(windows)]
@@ -5054,6 +6558,12 @@ fn is_native_clicker_rule(rule: &MacroRule) -> bool {
 }
 
 #[cfg(windows)]
+fn native_clicker_registration_allowed(config: &AppConfig) -> bool {
+    let emergency_vk = key_to_vk(&config.emergency_stop);
+    [0x11, 0x77].iter().all(|vk| Some(*vk) != emergency_vk)
+}
+
+#[cfg(windows)]
 fn process_native_clicker_hotkey(shared: &Arc<HookShared>) {
     let request_generation = shared.emergency_generation.load(Ordering::SeqCst);
     if shared.is_recording() {
@@ -5064,7 +6574,12 @@ fn process_native_clicker_hotkey(shared: &Arc<HookShared>) {
     {
         return;
     }
-    let Ok(config) = shared.config.try_lock().map(|config| config.clone()) else {
+    let Ok((config, config_revision)) = shared.config.try_lock().map(|config| {
+        (
+            config.clone(),
+            shared.trigger_config_revision.load(Ordering::Acquire),
+        )
+    }) else {
         return;
     };
     if !config.global_enabled {
@@ -5077,52 +6592,20 @@ fn process_native_clicker_hotkey(shared: &Arc<HookShared>) {
     else {
         return;
     };
-    if shared.is_playback_running() {
-        shared.stop_playback();
-        return;
+    match hotkey_playback_action(MacroMode::Toggle, shared.is_playback_running()) {
+        HotkeyPlaybackAction::StopImmediate => {
+            shared.stop_playback();
+            return;
+        }
+        HotkeyPlaybackAction::StartAfterRelease => {}
+        HotkeyPlaybackAction::StartImmediate | HotkeyPlaybackAction::Ignore => return,
     }
-    shared.submit_macro_trigger(rule, request_generation);
+    shared.submit_macro_trigger(rule, request_generation, config_revision);
 }
 
 #[cfg(windows)]
 fn key_to_vk(key: &str) -> Option<u32> {
-    let normalized = key.trim().to_ascii_uppercase();
-    let named = HashMap::from([
-        ("CTRL", 0x11),
-        ("CONTROL", 0x11),
-        ("ALT", 0x12),
-        ("SHIFT", 0x10),
-        ("WIN", 0x5B),
-        ("ESC", 0x1B),
-        ("ENTER", 0x0D),
-        ("SPACE", 0x20),
-        ("TAB", 0x09),
-        ("BACKSPACE", 0x08),
-        ("CAPSLOCK", 0x14),
-        ("F12", 0x7B),
-        ("LEFT", 0x25),
-        ("RIGHT", 0x27),
-        ("UP", 0x26),
-        ("DOWN", 0x28),
-    ]);
-    if let Some(value) = named.get(normalized.as_str()) {
-        return Some(*value);
-    }
-    if normalized.len() == 1 {
-        let byte = normalized.as_bytes()[0];
-        if byte.is_ascii_uppercase() || byte.is_ascii_digit() {
-            return Some(u32::from(byte));
-        }
-    }
-    if let Some(number) = normalized
-        .strip_prefix('F')
-        .and_then(|number| number.parse::<u32>().ok())
-    {
-        if (1..=24).contains(&number) {
-            return Some(0x70 + number - 1);
-        }
-    }
-    None
+    crate::config::normalized_virtual_key(key)
 }
 
 #[cfg(windows)]
@@ -5271,6 +6754,7 @@ fn play_macro_thread(
                 && !watcher_shared.shutdown.load(Ordering::SeqCst)
                 && watcher_shared.emergency_generation.load(Ordering::SeqCst)
                     == emergency_generation
+                && !watcher_shared.controller.token_revoked(run_token)
             {
                 if !watcher_shared.emergency_stop_ready() {
                     watcher_shared
@@ -5549,22 +7033,32 @@ impl WindowsAutomationInput {
         trajectory: crate::behavior::v2::PointerTrajectory,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        for point in &trajectory.points {
+        self.execute_pointer_points_with_writer(&trajectory.points, cancel, send_mouse_move)?;
+        if let Some(last) = trajectory.points.last() {
+            if let Ok(mut cursor) = self.cursor.lock() {
+                *cursor = Some((last.x, last.y));
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_pointer_points_with_writer(
+        &self,
+        points: &[crate::behavior::v2::PointerTrajectoryPoint],
+        cancel: &AtomicBool,
+        mut writer: impl FnMut(i32, i32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for point in points {
             if cancel.load(Ordering::SeqCst) {
                 return Err("脚本已被 F12 停止".to_string());
             }
             self.permit.perform(
                 format!("mouse_move:{},{}", point.x, point.y),
                 Some(cancel),
-                || send_mouse_move(point.x, point.y),
+                || writer(point.x, point.y),
             )?;
             if point.delay_ms > 0 && !sleep_interruptible(point.delay_ms as f32, cancel) {
                 return Err("脚本已被 F12 停止".to_string());
-            }
-        }
-        if let Some(last) = trajectory.points.last() {
-            if let Ok(mut cursor) = self.cursor.lock() {
-                *cursor = Some((last.x, last.y));
             }
         }
         Ok(())
@@ -6445,6 +7939,47 @@ mod tests {
     }
 
     #[test]
+    fn late_biomimetic_trajectory_cannot_write_after_permit_revocation() {
+        let controller = crate::runtime_control::RuntimeController::new();
+        let mut lease = controller.begin_start(None).expect("admit playback");
+        let token = lease.token();
+        assert!(controller.activate(token));
+        lease.commit();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let input_state = Arc::new(crate::input_safety::InjectedInputState::default());
+        let input = super::WindowsAutomationInput {
+            behavior: None,
+            cursor: std::sync::Mutex::new(None),
+            cancel: Arc::clone(&cancel),
+            input_state: Arc::clone(&input_state),
+            permit: crate::input_safety::InputPermit::new(
+                input_state,
+                Arc::clone(&controller),
+                token,
+            ),
+        };
+        let planned = [crate::behavior::v2::PointerTrajectoryPoint {
+            x: 640,
+            y: 480,
+            delay_ms: 0,
+        }];
+
+        // Model a planner returning after F12 changed the controller
+        // generation. The trajectory executor must recheck the permit before
+        // invoking its platform writer.
+        controller.request_stop();
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+        assert!(input
+            .execute_pointer_points_with_writer(&planned, cancel.as_ref(), |_, _| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn explicit_recovery_cannot_bypass_unavailable_emergency_channel() {
         let hook = HookService::isolated(
             AppConfig::default(),
@@ -6452,7 +7987,7 @@ mod tests {
         );
         hook.shared.controller.lock_fault();
         let error = hook
-            .recover_input_safety()
+            .recover_input_safety_at(hook.service_generation(), hook.service_admission_revision())
             .expect_err("channel is deliberately unavailable");
         assert_eq!(error.code, "safety_recovery_not_ready");
         assert_eq!(
@@ -6615,7 +8150,10 @@ mod tests {
         service.shared.controller.lock_fault();
         assert_eq!(
             service
-                .recover_input_safety()
+                .recover_input_safety_at(
+                    service.service_generation(),
+                    service.service_admission_revision(),
+                )
                 .expect_err("thread still alive")
                 .code,
             "safety_recovery_not_ready"
@@ -6680,7 +8218,10 @@ mod tests {
             .load(Ordering::Acquire));
         assert_eq!(
             service
-                .recover_input_safety()
+                .recover_input_safety_at(
+                    service.service_generation(),
+                    service.service_admission_revision(),
+                )
                 .expect_err("containment is separate from cleanup")
                 .code,
             "executor_containment_unconfirmed"
@@ -6900,7 +8441,10 @@ mod tests {
         );
         assert_eq!(
             service
-                .recover_input_safety()
+                .recover_input_safety_at(
+                    service.service_generation(),
+                    service.service_admission_revision(),
+                )
                 .expect_err("recovery cannot bypass live thread")
                 .code,
             "safety_recovery_not_ready"
@@ -7849,6 +9393,23 @@ mod tests {
         config.macros[0].enabled = true;
         config.macros[0].trigger_keys = vec!["F12".into()];
         assert!(super::native_registration_plan(&config).is_empty());
+        config.macros[0].trigger_keys = vec!["Ctrl".into(), "F12".into()];
+        assert!(super::native_registration_plan(&config).is_empty());
+        config.emergency_stop = "F11".into();
+        config.macros[0].trigger_keys = vec!["Shift".into(), "F11".into()];
+        assert!(super::native_registration_plan(&config).is_empty());
+        config.macros[0].trigger_keys = vec!["Shift".into(), "F10".into()];
+        assert!(!super::native_registration_plan(&config).is_empty());
+    }
+
+    #[test]
+    fn native_clicker_registration_rejects_any_emergency_key_in_ctrl_f8() {
+        let mut config = AppConfig::default();
+        assert!(super::native_clicker_registration_allowed(&config));
+        config.emergency_stop = "F8".into();
+        assert!(!super::native_clicker_registration_allowed(&config));
+        config.emergency_stop = "Control".into();
+        assert!(!super::native_clicker_registration_allowed(&config));
     }
 
     #[test]
@@ -8293,10 +9854,17 @@ mod tests {
             8,
             "stop emits the pending raw events once"
         );
-        assert!(
-            service.shared.stop_behavior_recording().is_err(),
-            "the pending claim is consumed only once"
-        );
+        let retried = service
+            .shared
+            .stop_behavior_recording()
+            .expect("uncommitted claim remains retryable");
+        assert_eq!(retried.profile.id, result.profile.id);
+        service
+            .shared
+            .complete_behavior_recording_claim()
+            .expect("commit claim once");
+        assert!(service.shared.stop_behavior_recording().is_err());
+        assert!(service.shared.complete_behavior_recording_claim().is_err());
     }
 
     #[test]
@@ -8361,6 +9929,8 @@ mod tests {
         );
         let status = service.behavior_recording_status();
         assert!(!status.active, "rejected stop still clears active state");
+        assert!(status.pending, "failed stop retains an explicit decision");
+        assert!(status.incomplete, "failed stop cannot be trained");
         assert_eq!(status.event_count, 8, "rejected stop preserves events");
         assert!(
             service.shared.stop_behavior_recording().is_err(),
@@ -8370,6 +9940,52 @@ mod tests {
             service.shared.start_behavior_recording("again").is_err(),
             "new start denied while unusable events remain"
         );
+        service
+            .shared
+            .discard_behavior_recording()
+            .expect("explicit discard after confirmed barrier");
+        let discarded = service.behavior_recording_status();
+        assert!(!discarded.pending);
+        assert!(!discarded.incomplete);
+        service
+            .shared
+            .start_behavior_recording("after discard")
+            .expect("new session after explicit discard");
+    }
+
+    #[test]
+    fn behavior_discard_timeout_retains_pending_incomplete_state() {
+        let service = test_hook_service();
+        service
+            .shared
+            .start_behavior_recording("fixture")
+            .expect("start behavior recording");
+        let behavior = service.shared.behavior.lock().expect("block worker");
+        service
+            .shared
+            .record_behavior_mouse_move(10, 20, std::time::Instant::now());
+        let error = service
+            .shared
+            .discard_behavior_recording()
+            .expect_err("blocked worker barrier must preserve capture");
+        assert_eq!(error.code, "capture_drain_timeout");
+        drop(behavior);
+        let status = service.behavior_recording_status();
+        assert!(!status.active);
+        assert!(status.pending);
+        assert!(status.incomplete);
+        assert!(service
+            .shared
+            .start_behavior_recording("too early")
+            .is_err());
+        service
+            .shared
+            .discard_behavior_recording()
+            .expect("later barrier confirms explicit discard");
+        service
+            .shared
+            .start_behavior_recording("after barrier")
+            .expect("new session after confirmed discard");
     }
 
     #[test]
@@ -8594,7 +10210,13 @@ mod tests {
             program: AutomationProgram::Macro { steps: Vec::new() },
         };
         let generation = service.shared.emergency_generation.load(Ordering::Acquire);
-        assert!(!service.shared.submit_macro_trigger(&rule, generation));
+        let config_revision = service
+            .shared
+            .trigger_config_revision
+            .load(Ordering::Acquire);
+        assert!(!service
+            .shared
+            .submit_macro_trigger(&rule, generation, config_revision));
         assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -8610,22 +10232,2056 @@ mod tests {
         )
         .expect("worker");
         assert!(service.shared.trigger_tasks.set(worker).is_ok());
-        assert!(service.shared.submit_macro_trigger(&rule, generation));
+        assert!(service
+            .shared
+            .submit_macro_trigger(&rule, generation, config_revision));
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("handling");
         for _ in 0..100 {
-            assert!(!service.shared.submit_macro_trigger(&rule, generation));
+            assert!(!service
+                .shared
+                .submit_macro_trigger(&rule, generation, config_revision));
         }
         service
             .shared
             .emergency_generation
             .fetch_add(1, Ordering::AcqRel);
-        assert!(!service.shared.submit_macro_trigger(&rule, generation));
+        assert!(!service
+            .shared
+            .submit_macro_trigger(&rule, generation, config_revision));
         service.shared.trigger_tasks.get().expect("queue").close();
         release_tx.send(()).expect("release fixture");
         assert!(service.shared.controller.is_quiescent());
         assert_eq!(service.shared.injected_input.counts(), (0, 0));
+    }
+
+    #[test]
+    fn ctrl_f9_gate_waits_for_every_key_and_a_stable_release_window() {
+        let mut gate = super::TriggerReleaseGate::new(
+            std::time::Duration::from_millis(18),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::ZERO,
+                true,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        // F9 is up, but Ctrl remains down: startup is still forbidden.
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(12),
+                true,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(20),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(37),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(38),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            Some(super::TriggerReleaseGateOutcome::Ready)
+        );
+    }
+
+    #[test]
+    fn single_key_gate_never_starts_before_key_up() {
+        let mut gate = super::TriggerReleaseGate::new(
+            std::time::Duration::from_millis(18),
+            std::time::Duration::from_secs(5),
+        );
+        for millis in [0, 20, 200] {
+            assert_eq!(
+                gate.observe(
+                    std::time::Duration::from_millis(millis),
+                    true,
+                    super::TriggerReleaseGateStatus::Current,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(201),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(219),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            Some(super::TriggerReleaseGateOutcome::Ready)
+        );
+    }
+
+    #[test]
+    fn final_admission_repress_resets_stability_and_never_returns_ready() {
+        use std::collections::VecDeque;
+
+        let mut samples = VecDeque::from([
+            super::TriggerReleaseSample {
+                elapsed: std::time::Duration::ZERO,
+                any_trigger_key_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::TriggerReleaseSample {
+                elapsed: std::time::Duration::from_millis(20),
+                any_trigger_key_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::TriggerReleaseSample {
+                elapsed: std::time::Duration::from_millis(38),
+                any_trigger_key_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            // This is the final-admission resample after the stable window.
+            // Re-pressing F9 must reset the window, not return Ready.
+            super::TriggerReleaseSample {
+                elapsed: std::time::Duration::from_millis(39),
+                any_trigger_key_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            // Prove the driver re-entered its wait loop. A later shutdown is
+            // terminal, so the earlier Ready candidate cannot leak through.
+            super::TriggerReleaseSample {
+                elapsed: std::time::Duration::from_millis(40),
+                any_trigger_key_down: false,
+                status: super::TriggerReleaseGateStatus::Shutdown,
+            },
+        ]);
+        let outcome = super::drive_trigger_release_gate(
+            super::TriggerReleaseGate::new(
+                std::time::Duration::from_millis(18),
+                std::time::Duration::from_secs(5),
+            ),
+            || samples.pop_front().expect("deterministic gate sample"),
+            |_| {},
+        );
+        assert_eq!(outcome, super::TriggerReleaseGateOutcome::Shutdown);
+        assert!(samples.is_empty());
+    }
+
+    fn pending_trigger_task(service: &HookService) -> super::MacroTriggerTask {
+        super::MacroTriggerTask {
+            rule: MacroRule {
+                id: "pending-gate".into(),
+                name: "pending-gate".into(),
+                import_error: None,
+                enabled: true,
+                trigger_keys: vec!["Ctrl".into(), "F9".into()],
+                mode: MacroMode::Repeat,
+                repeat_count: 7,
+                speed: 1.0,
+                record_mouse_move: true,
+                record_mouse_clicks: true,
+                target: None,
+                behavior_policy: None,
+                program: AutomationProgram::Macro { steps: Vec::new() },
+            },
+            start_timing: super::TriggerStartTiming::ReleaseGated,
+            hold_epoch: None,
+            generation: service.shared.emergency_generation.load(Ordering::Acquire),
+            controller_generation: service.shared.controller.generation(),
+            admission_revision: service.shared.controller.background_generation(),
+            config_revision: service
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+        }
+    }
+
+    fn trigger_config_fixture() -> AppConfig {
+        AppConfig {
+            macros: vec![MacroRule {
+                id: "revision-gate".into(),
+                name: "revision-gate".into(),
+                import_error: None,
+                enabled: true,
+                trigger_keys: vec!["Ctrl".into(), "F9".into()],
+                mode: MacroMode::Once,
+                repeat_count: 1,
+                speed: 1.0,
+                record_mouse_move: true,
+                record_mouse_clicks: true,
+                target: None,
+                behavior_policy: None,
+                program: AutomationProgram::Macro {
+                    steps: vec![MacroStep::Delay {
+                        duration_ms: 10,
+                        duration_max_ms: None,
+                    }],
+                },
+            }],
+            ..AppConfig::default()
+        }
+    }
+
+    fn configured_trigger_task(service: &HookService) -> super::MacroTriggerTask {
+        let rule = service.shared.config.lock().expect("config").macros[0].clone();
+        let start_timing = super::trigger_start_timing(&rule);
+        let hold_epoch =
+            matches!(start_timing, super::TriggerStartTiming::HoldImmediate).then(|| {
+                service
+                    .shared
+                    .publish_hold_lifecycle(&rule)
+                    .expect("publish test Hold lifecycle")
+            });
+        super::MacroTriggerTask {
+            rule,
+            start_timing,
+            hold_epoch,
+            generation: service.shared.emergency_generation.load(Ordering::Acquire),
+            controller_generation: service.shared.controller.generation(),
+            admission_revision: service.shared.controller.background_generation(),
+            config_revision: service
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+        }
+    }
+
+    fn assert_trigger_config_change_cancels(mut change: impl FnMut(&mut AppConfig)) {
+        let service = HookService::isolated(
+            trigger_config_fixture(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let task = configured_trigger_task(&service);
+        service
+            .shared
+            .validate_pending_trigger_config(&task.rule, task.config_revision)
+            .expect("initial trigger permission");
+        let mut next = service.shared.config.lock().expect("config").clone();
+        change(&mut next);
+        service.update_config(next).expect("valid config update");
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ConfigRevision
+            )
+        );
+        assert_eq!(service.shared.injected_input.counts(), (0, 0));
+        assert_eq!(
+            service
+                .shared
+                .validate_pending_trigger_config(&task.rule, task.config_revision)
+                .expect_err("final admission must reject stale config")
+                .code,
+            "macro_trigger_config_stale"
+        );
+    }
+
+    #[test]
+    fn permission_relevant_config_changes_cancel_pending_trigger() {
+        assert_trigger_config_change_cancels(|config| config.global_enabled = false);
+        assert_trigger_config_change_cancels(|config| config.macros[0].enabled = false);
+        assert_trigger_config_change_cancels(|config| config.macros.clear());
+        assert_trigger_config_change_cancels(|config| {
+            config.macros[0].trigger_keys = vec!["Ctrl".into(), "F10".into()]
+        });
+        assert_trigger_config_change_cancels(|config| config.macros[0].mode = MacroMode::Toggle);
+        assert_trigger_config_change_cancels(|config| {
+            config.macros[0].program = AutomationProgram::Macro {
+                steps: vec![MacroStep::Delay {
+                    duration_ms: 11,
+                    duration_max_ms: None,
+                }],
+            }
+        });
+        assert_trigger_config_change_cancels(|config| config.emergency_stop = "F11".into());
+        assert_trigger_config_change_cancels(|config| {
+            config.macros[0].trigger_keys = vec!["Ctrl".into(), "F8".into()];
+            config.macros[0].name = "连点器".into();
+            config.macros[0].mode = MacroMode::Toggle;
+        });
+    }
+
+    #[test]
+    fn equivalent_and_non_trigger_config_updates_preserve_pending_revision() {
+        let service = HookService::isolated(
+            trigger_config_fixture(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let task = configured_trigger_task(&service);
+        let unchanged = service.shared.config.lock().expect("config").clone();
+        service
+            .update_config(unchanged.clone())
+            .expect("identical refresh");
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Current
+        );
+
+        let mut presentation_only = unchanged;
+        presentation_only.navigation_auto_collapse = !presentation_only.navigation_auto_collapse;
+        presentation_only.show_playback_overlay = !presentation_only.show_playback_overlay;
+        let mut disabled = presentation_only.macros[0].clone();
+        disabled.id = "disabled-editor-only".into();
+        disabled.enabled = false;
+        disabled.trigger_keys = vec!["F7".into()];
+        presentation_only.macros.push(disabled);
+        service
+            .update_config(presentation_only)
+            .expect("presentation-only refresh");
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Current
+        );
+        service
+            .shared
+            .validate_pending_trigger_config(&task.rule, task.config_revision)
+            .expect("same trigger permission remains admitted");
+    }
+
+    #[test]
+    fn legacy_clicker_keeps_raw_config_identity_and_uses_normalized_execution() {
+        let raw_rule = MacroRule {
+            id: "legacy-clicker".into(),
+            name: "连点器".into(),
+            import_error: None,
+            enabled: true,
+            trigger_keys: vec!["Ctrl".into(), "F8".into()],
+            mode: MacroMode::Once,
+            repeat_count: 1,
+            speed: 1.0,
+            record_mouse_move: true,
+            record_mouse_clicks: true,
+            target: None,
+            behavior_policy: None,
+            program: AutomationProgram::Macro { steps: Vec::new() },
+        };
+        let execution_rule = super::normalize_playback_rule(raw_rule.clone());
+        assert!(matches!(execution_rule.mode, MacroMode::Toggle));
+        assert_eq!(
+            execution_rule
+                .macro_steps()
+                .expect("normalized steps")
+                .len(),
+            4
+        );
+        assert_ne!(
+            super::trigger_macro_snapshot(&raw_rule),
+            super::trigger_macro_snapshot(&execution_rule),
+            "execution normalization must not become config identity"
+        );
+
+        let service = test_hook_service();
+        service
+            .update_config(AppConfig {
+                macros: vec![raw_rule.clone()],
+                ..AppConfig::default()
+            })
+            .expect("install legacy clicker");
+        let task = configured_trigger_task(&service);
+        service
+            .shared
+            .validate_pending_trigger_config(&raw_rule, task.config_revision)
+            .expect("unchanged raw config identity remains admitted");
+        assert_eq!(
+            service
+                .shared
+                .validate_pending_trigger_config(&execution_rule, task.config_revision)
+                .expect_err("normalized execution clone is not config identity")
+                .code,
+            "macro_trigger_config_stale"
+        );
+
+        let reached_post_normalization = Arc::new(AtomicBool::new(false));
+        let reached_for_hook = Arc::clone(&reached_post_normalization);
+        let weak = Arc::downgrade(&service.shared);
+        *service
+            .shared
+            .trigger_admission_test_hook
+            .lock()
+            .expect("test hook") = Some(Arc::new(move |checkpoint| {
+            if checkpoint != super::TriggerAdmissionCheckpoint::BeforeActivation
+                || reached_for_hook.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            let shared = weak.upgrade().expect("service remains alive");
+            let mut config = shared.config.lock().expect("config");
+            config.macros[0].speed = 2.0;
+            shared
+                .advance_trigger_config_revision()
+                .expect("changed clicker config revision");
+        }));
+        let error = service
+            .shared
+            .start_hotkey_playback_at_revision(
+                task.rule,
+                task.generation,
+                task.admission_revision,
+                task.config_revision,
+                None,
+            )
+            .expect_err("changed config must cancel before activation");
+        assert!(reached_post_normalization.load(Ordering::Acquire));
+        assert_eq!(error.code, "macro_trigger_config_stale");
+        assert_eq!(
+            service.shared.controller.phase(),
+            crate::runtime_control::RuntimePhase::Idle
+        );
+        assert_eq!(service.shared.injected_input.counts(), (0, 0));
+        *service
+            .shared
+            .trigger_admission_test_hook
+            .lock()
+            .expect("test hook") = None;
+    }
+
+    #[test]
+    fn config_revision_changes_in_final_start_windows_never_activate_playback() {
+        fn assert_rejected_at(checkpoint: super::TriggerAdmissionCheckpoint) {
+            let service = test_hook_service();
+            service
+                .update_config(trigger_config_fixture())
+                .expect("install trigger config");
+            let task = configured_trigger_task(&service);
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_for_hook = Arc::clone(&fired);
+            let weak = Arc::downgrade(&service.shared);
+            *service
+                .shared
+                .trigger_admission_test_hook
+                .lock()
+                .expect("test hook") = Some(Arc::new(move |observed| {
+                if observed != checkpoint || fired_for_hook.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let shared = weak.upgrade().expect("service remains alive");
+                let mut current = shared.config.lock().expect("config");
+                let mut changed = current.clone();
+                changed.macros[0].program = AutomationProgram::Macro {
+                    steps: vec![MacroStep::Delay {
+                        duration_ms: 11,
+                        duration_max_ms: None,
+                    }],
+                };
+                shared
+                    .advance_trigger_config_revision()
+                    .expect("permission-relevant config revision");
+                *current = changed;
+            }));
+
+            let error = service
+                .shared
+                .start_hotkey_playback_at_revision(
+                    task.rule,
+                    task.generation,
+                    task.admission_revision,
+                    task.config_revision,
+                    None,
+                )
+                .expect_err("stale hotkey start must not activate");
+            assert_eq!(
+                error.code, "macro_trigger_config_stale",
+                "checkpoint: {checkpoint:?}"
+            );
+            assert!(fired.load(Ordering::Acquire));
+            assert_eq!(
+                service.shared.controller.phase(),
+                crate::runtime_control::RuntimePhase::Idle
+            );
+            assert!(!service.shared.playback.lock().expect("playback").running);
+            assert_eq!(
+                service
+                    .shared
+                    .playback_instance_counter
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert!(service
+                .shared
+                .playback_inputs
+                .lock()
+                .expect("playback inputs")
+                .is_empty());
+            assert_eq!(service.shared.injected_input.counts(), (0, 0));
+            *service
+                .shared
+                .trigger_admission_test_hook
+                .lock()
+                .expect("test hook") = None;
+        }
+
+        assert_rejected_at(super::TriggerAdmissionCheckpoint::AfterInitialValidation);
+        assert_rejected_at(super::TriggerAdmissionCheckpoint::BeforeActivation);
+    }
+
+    #[test]
+    fn clicker_identity_is_trigger_permission_relevant() {
+        let mut ordinary = trigger_config_fixture();
+        ordinary.macros[0].trigger_keys = vec!["Ctrl".into(), "F8".into()];
+        ordinary.macros[0].mode = MacroMode::Toggle;
+        let mut clicker = ordinary.clone();
+        clicker.macros[0].name = "连点器".into();
+        assert_ne!(
+            super::trigger_permission_snapshot(&ordinary),
+            super::trigger_permission_snapshot(&clicker)
+        );
+    }
+
+    #[test]
+    fn trigger_config_revision_exhaustion_fails_closed_without_wrap() {
+        let service = HookService::isolated(
+            trigger_config_fixture(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let original = service.shared.config.lock().expect("config").clone();
+        service
+            .shared
+            .trigger_config_revision
+            .store(u64::MAX, Ordering::Release);
+        let mut changed = original.clone();
+        changed.global_enabled = false;
+        let error = service
+            .update_config(changed)
+            .expect_err("revision exhaustion must reject update");
+        assert_eq!(error.code, "trigger_config_revision_exhausted");
+        assert!(service
+            .shared
+            .trigger_config_revision_exhausted
+            .load(Ordering::Acquire));
+        assert_eq!(
+            service
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert!(service.shared.config.lock().expect("config").global_enabled);
+        assert_eq!(
+            service.shared.controller.phase(),
+            crate::runtime_control::RuntimePhase::FaultLocked
+        );
+    }
+
+    #[test]
+    fn f12_controller_generation_race_cancels_pending_gate_and_revokes_old_token() {
+        let service = test_hook_service();
+        let mut lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("start token");
+        let old_token = lease.token();
+        assert!(service.shared.controller.activate(old_token));
+        lease.commit();
+        assert!(service.shared.controller.input_allowed(old_token));
+        let task = pending_trigger_task(&service);
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Current
+        );
+
+        // Model the exact request_emergency_stop interval where the controller
+        // changed but emergency_generation has not yet been published.
+        let before = service.shared.controller.generation();
+        assert!(service.shared.controller.request_stop() > before);
+        assert!(!service.shared.controller.input_allowed(old_token));
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ControllerGeneration
+            )
+        );
+        let mut gate = super::TriggerReleaseGate::new(
+            std::time::Duration::from_millis(18),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(30),
+                false,
+                super::trigger_release_gate_status(&service.shared, &task),
+            ),
+            Some(super::TriggerReleaseGateOutcome::Cancelled(
+                super::TriggerReleaseCancellation::ControllerGeneration
+            ))
+        );
+    }
+
+    #[test]
+    fn release_gate_distinguishes_timeout_shutdown_and_stale_revisions() {
+        let mut gate = super::TriggerReleaseGate::new(
+            std::time::Duration::from_millis(18),
+            std::time::Duration::from_millis(50),
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(50),
+                true,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            Some(super::TriggerReleaseGateOutcome::Timeout)
+        );
+
+        let service = test_hook_service();
+        let task = pending_trigger_task(&service);
+        service.shared.controller.invalidate_background_admission();
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::AdmissionRevision
+            )
+        );
+
+        let service = test_hook_service();
+        let task = pending_trigger_task(&service);
+        service
+            .shared
+            .emergency_generation
+            .fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::TaskGeneration
+            )
+        );
+
+        let service = test_hook_service();
+        let task = pending_trigger_task(&service);
+        service.shared.shutdown.store(true, Ordering::Release);
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Shutdown
+        );
+    }
+
+    #[test]
+    fn pending_claim_clears_on_every_gate_exit_and_can_be_reclaimed() {
+        let terminal_statuses = [
+            super::TriggerReleaseGateStatus::Current,
+            super::TriggerReleaseGateStatus::Shutdown,
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::TaskGeneration,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ControllerGeneration,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::AdmissionRevision,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ConfigRevision,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::PhysicalLedgerUncertain,
+            ),
+        ];
+        for status in terminal_statuses {
+            let pending = AtomicBool::new(true);
+            {
+                let _reset = super::TriggerPendingReset(&pending);
+                let mut gate = super::TriggerReleaseGate::new(
+                    std::time::Duration::from_millis(18),
+                    std::time::Duration::from_millis(10),
+                );
+                assert!(gate
+                    .observe(std::time::Duration::from_millis(10), true, status)
+                    .is_some());
+                assert!(pending.load(Ordering::Acquire));
+            }
+            assert!(!pending.load(Ordering::Acquire));
+            assert!(pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn hold_starts_immediately_while_existing_toggle_and_release_gate_semantics_remain() {
+        use super::HotkeyPlaybackAction::{
+            Ignore, StartAfterRelease, StartImmediate, StopImmediate,
+        };
+
+        assert_eq!(
+            super::hotkey_playback_action(MacroMode::Toggle, false),
+            StartAfterRelease
+        );
+        assert_eq!(
+            super::hotkey_playback_action(MacroMode::Toggle, true),
+            StopImmediate
+        );
+        // The clicker is a Toggle and uses this same dispatch decision.
+        assert_eq!(
+            super::hotkey_playback_action(MacroMode::Toggle, true),
+            StopImmediate
+        );
+        assert_eq!(
+            super::hotkey_playback_action(MacroMode::Repeat, false),
+            StartAfterRelease
+        );
+        assert_eq!(
+            super::hotkey_playback_action(MacroMode::Repeat, true),
+            Ignore
+        );
+        assert_eq!(
+            super::hotkey_playback_action(MacroMode::Hold, false),
+            StartImmediate
+        );
+        assert_eq!(super::hotkey_playback_action(MacroMode::Hold, true), Ignore);
+
+        let service = test_hook_service();
+        let mut task = pending_trigger_task(&service);
+        assert_eq!(
+            task.rule.repeat_count, 7,
+            "gate must not alter Repeat count"
+        );
+        task.rule.mode = MacroMode::Hold;
+        assert_eq!(
+            super::trigger_start_timing(&task.rule),
+            super::TriggerStartTiming::HoldImmediate
+        );
+        assert_eq!(service.shared.injected_input.counts(), (0, 0));
+    }
+
+    #[test]
+    fn direct_ui_play_never_claims_the_hotkey_release_gate() {
+        let service = test_hook_service();
+        let task = pending_trigger_task(&service);
+        assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
+        let _ = service.play_with_generation(
+            task.rule,
+            service.service_generation(),
+            service.service_admission_revision(),
+        );
+        assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hold_keydown_submits_immediately_repeat_is_ignored_and_keyup_cancels_pending() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let worker = crate::bounded_worker::BoundedWorker::spawn(
+            "input-free-hold-immediate-capture",
+            1,
+            move |task| tx.send(task).expect("capture Hold task"),
+        )
+        .expect("capture worker");
+        service
+            .shared
+            .trigger_tasks
+            .set(worker)
+            .map_err(drop)
+            .expect("set capture worker");
+
+        let revision = service
+            .shared
+            .trigger_config_revision
+            .load(Ordering::Acquire);
+        let pressed = HashSet::from([0x11, 0x78]);
+        assert!(super::process_macro_key_down(
+            &service.shared,
+            &config,
+            revision,
+            0x78,
+            false,
+            &pressed,
+        ));
+        let task = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("Hold keydown must submit without waiting for keyup");
+        assert_eq!(task.start_timing, super::TriggerStartTiming::HoldImmediate);
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Current
+        );
+
+        assert!(super::process_macro_key_down(
+            &service.shared,
+            &config,
+            revision,
+            0x78,
+            true,
+            &pressed,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(service.shared.revoke_current_hold_for_key_up(0x11));
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::HoldLifecycle
+            )
+        );
+        service
+            .shared
+            .retire_hold_lifecycle(task.hold_epoch.expect("Hold epoch"));
+        service
+            .shared
+            .trigger_pending
+            .store(false, Ordering::Release);
+        service.shared.trigger_tasks.get().expect("worker").close();
+    }
+
+    #[test]
+    fn any_hold_component_keyup_stops_only_the_matching_hotkey_hold() {
+        for released_vk in [0x11, 0x78] {
+            let mut config = trigger_config_fixture();
+            config.macros[0].mode = MacroMode::Hold;
+            let service = HookService::isolated(
+                config.clone(),
+                crate::automation::VisionService::new(std::env::temp_dir()),
+            );
+            let epoch = service
+                .shared
+                .publish_hold_lifecycle(&config.macros[0])
+                .expect("publish Hold identity");
+            let mut lease = service
+                .shared
+                .controller
+                .begin_start(None)
+                .expect("admit active Hold");
+            let token = lease.token();
+            service
+                .shared
+                .bind_hold_lifecycle_run(&config.macros[0], Some(epoch), token)
+                .expect("bind Hold token");
+            assert!(service.shared.controller.activate(token));
+            lease.commit();
+            service
+                .shared
+                .activate_hold_lifecycle(&config.macros[0], Some(epoch), token, 1)
+                .expect("activate Hold identity");
+            let playback_guard = service.shared.playback.lock().expect("playback lock");
+            assert!(service.shared.revoke_current_hold_for_key_up(released_vk));
+            assert!(
+                !service.shared.controller.input_allowed(token),
+                "releasing VK {released_vk:#x} must revoke the matching Hold"
+            );
+            drop(playback_guard);
+            service.shared.retire_hold_lifecycle(epoch);
+            let _ = service.shared.controller.begin_cleaning(token);
+            let _ = service.shared.controller.finish(token, true);
+        }
+
+        for unrelated_mode in [MacroMode::Once, MacroMode::Repeat, MacroMode::Toggle] {
+            let mut config = trigger_config_fixture();
+            config.macros[0].mode = MacroMode::Hold;
+            let service = HookService::isolated(
+                config,
+                crate::automation::VisionService::new(std::env::temp_dir()),
+            );
+            let mut lease = service
+                .shared
+                .controller
+                .begin_start(None)
+                .expect("admit unrelated playback");
+            let token = lease.token();
+            assert!(service.shared.controller.activate(token));
+            lease.commit();
+            {
+                let mut playback = service.shared.playback.lock().expect("playback lock");
+                playback.running = true;
+                playback.macro_id = Some(format!("unrelated-{unrelated_mode:?}"));
+                assert!(!service.shared.revoke_current_hold_for_key_up(0x78));
+                assert!(
+                    service.shared.controller.input_allowed(token),
+                    "configured Hold keyup must not stop unrelated {unrelated_mode:?}"
+                );
+            }
+            service.shared.controller.request_stop();
+            let _ = service.shared.controller.begin_cleaning(token);
+            let _ = service.shared.controller.finish(token, true);
+        }
+    }
+
+    #[test]
+    fn hold_config_change_cancels_stale_immediate_task() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let task = configured_trigger_task(&service);
+        assert_eq!(task.start_timing, super::TriggerStartTiming::HoldImmediate);
+        {
+            let mut current = service.shared.config.lock().expect("config");
+            current.macros[0].enabled = false;
+            service
+                .shared
+                .advance_trigger_config_revision()
+                .expect("disable Hold");
+        }
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ConfigRevision
+            )
+        );
+        service
+            .shared
+            .retire_hold_lifecycle(task.hold_epoch.expect("Hold epoch"));
+    }
+
+    #[test]
+    fn active_hold_uses_original_identity_after_disable_delete_or_rekey() {
+        for mutation in 0..3 {
+            let mut config = trigger_config_fixture();
+            config.macros[0].mode = MacroMode::Hold;
+            let service = HookService::isolated(
+                config.clone(),
+                crate::automation::VisionService::new(std::env::temp_dir()),
+            );
+            let rule = config.macros[0].clone();
+            let epoch = service
+                .shared
+                .publish_hold_lifecycle(&rule)
+                .expect("publish Hold identity");
+            let mut lease = service
+                .shared
+                .controller
+                .begin_start(None)
+                .expect("admit Hold");
+            let token = lease.token();
+            service
+                .shared
+                .bind_hold_lifecycle_run(&rule, Some(epoch), token)
+                .expect("bind Hold");
+            assert!(service.shared.controller.activate(token));
+            lease.commit();
+            service
+                .shared
+                .activate_hold_lifecycle(&rule, Some(epoch), token, 41)
+                .expect("activate Hold identity");
+            {
+                let mut current = service.shared.config.lock().expect("config");
+                match mutation {
+                    0 => current.macros[0].enabled = false,
+                    1 => current.macros.clear(),
+                    2 => current.macros[0].trigger_keys = vec!["F8".into()],
+                    _ => unreachable!(),
+                }
+                service
+                    .shared
+                    .advance_trigger_config_revision()
+                    .expect("mutate active Hold config");
+            }
+            let playback_guard = service.shared.playback.lock().expect("playback lock");
+            assert!(service.shared.revoke_current_hold_for_key_up(0x78));
+            assert!(!service.shared.controller.input_allowed(token));
+            drop(playback_guard);
+            service.shared.retire_hold_lifecycle(epoch);
+            let _ = service.shared.controller.begin_cleaning(token);
+            let _ = service.shared.controller.finish(token, true);
+        }
+    }
+
+    #[test]
+    fn pending_hold_identity_ignores_other_rules_and_cancels_shared_components() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let rule_a = config.macros[0].clone();
+        let mut rule_b = rule_a.clone();
+        rule_b.id = "other-hold".into();
+        rule_b.name = "other-hold".into();
+        rule_b.trigger_keys = vec!["Ctrl".into(), "F8".into()];
+        config.macros.push(rule_b);
+        let service = HookService::isolated(
+            config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let epoch = service
+            .shared
+            .publish_hold_lifecycle(&rule_a)
+            .expect("publish Hold A");
+
+        assert!(!service.shared.revoke_current_hold_for_key_up(0x77));
+        service
+            .shared
+            .validate_hold_lifecycle(&rule_a, Some(epoch))
+            .expect("Hold B unique key must not cancel Hold A");
+        assert!(service.shared.revoke_current_hold_for_key_up(0x11));
+        assert_eq!(
+            service
+                .shared
+                .validate_hold_lifecycle(&rule_a, Some(epoch))
+                .expect_err("shared Ctrl release cancels current Hold A")
+                .code,
+            "macro_hold_released"
+        );
+        service.shared.retire_hold_lifecycle(epoch);
+    }
+
+    #[test]
+    fn hold_keyup_is_nonblocking_while_lifecycle_and_playback_locks_are_held() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let epoch = service
+            .shared
+            .publish_hold_lifecycle(&config.macros[0])
+            .expect("publish Hold");
+        let lifecycle_guard = service
+            .shared
+            .hold_lifecycle
+            .lock()
+            .expect("lifecycle lock");
+        let playback_guard = service.shared.playback.lock().expect("playback lock");
+        let shared = Arc::clone(&service.shared);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let callback = std::thread::spawn(move || {
+            done_tx
+                .send(shared.revoke_current_hold_for_key_up(0x78))
+                .expect("report Hold callback");
+        });
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("Hold keyup callback must not block"));
+        callback.join().expect("Hold callback");
+        drop(playback_guard);
+        drop(lifecycle_guard);
+        assert_eq!(
+            service
+                .shared
+                .validate_hold_lifecycle(&config.macros[0], Some(epoch))
+                .expect_err("contended callback still cancels Hold")
+                .code,
+            "macro_hold_released"
+        );
+        service.shared.retire_hold_lifecycle(epoch);
+    }
+
+    #[test]
+    fn hold_atomic_snapshot_rejects_mixed_epoch_phase_and_token_reads() {
+        let old = crate::runtime_control::RunToken {
+            id: 7,
+            generation: 3,
+        };
+        let stable = super::consistent_hold_atomic_snapshot(11, true, 2, old, 2, 11)
+            .expect("stable Bound snapshot");
+        assert_eq!(stable.epoch, 11);
+        assert!(stable.trigger_matches);
+        assert_eq!(stable.bound_token, Some(old));
+
+        // Retirement/replacement between dependent field loads must not
+        // combine an old trigger bitmap with a new lifecycle token.
+        let replacement = crate::runtime_control::RunToken {
+            id: 8,
+            generation: 3,
+        };
+        assert!(super::consistent_hold_atomic_snapshot(11, true, 2, replacement, 2, 12).is_none());
+        // A Pending -> Bound publication observed halfway through is retried,
+        // rather than accepting the token under the old phase.
+        assert!(super::consistent_hold_atomic_snapshot(11, true, 1, old, 2, 11).is_none());
+        assert!(super::consistent_hold_atomic_snapshot(11, true, 3, old, 0, 0).is_none());
+    }
+
+    #[test]
+    fn contended_active_hold_keyup_revokes_the_exact_published_token() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let epoch = service
+            .shared
+            .publish_hold_lifecycle(&config.macros[0])
+            .expect("publish Hold");
+        let mut lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("admit Hold");
+        let token = lease.token();
+        service
+            .shared
+            .bind_hold_lifecycle_run(&config.macros[0], Some(epoch), token)
+            .expect("bind Hold");
+        assert!(service.shared.controller.activate(token));
+        lease.commit();
+        service
+            .shared
+            .activate_hold_lifecycle(&config.macros[0], Some(epoch), token, 9)
+            .expect("activate Hold lifecycle");
+
+        let lifecycle_guard = service
+            .shared
+            .hold_lifecycle
+            .lock()
+            .expect("lifecycle lock");
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
+        assert!(service.shared.controller.token_revoked(token));
+        drop(lifecycle_guard);
+        assert!(!service.shared.controller.input_allowed(token));
+        service.shared.retire_hold_lifecycle(epoch);
+        let _ = service.shared.controller.begin_cleaning(token);
+        let _ = service.shared.controller.finish(token, true);
+    }
+
+    #[test]
+    fn hold_keyup_at_every_admission_checkpoint_never_leaves_permission_or_identity() {
+        for checkpoint in [
+            super::TriggerAdmissionCheckpoint::AfterInitialValidation,
+            super::TriggerAdmissionCheckpoint::BeforeActivation,
+            super::TriggerAdmissionCheckpoint::AfterControllerActivation,
+            super::TriggerAdmissionCheckpoint::BeforeInputRegistration,
+            super::TriggerAdmissionCheckpoint::BeforePlaybackPublication,
+        ] {
+            let mut config = trigger_config_fixture();
+            config.macros[0].mode = MacroMode::Hold;
+            let service = HookService::isolated(
+                config,
+                crate::automation::VisionService::new(std::env::temp_dir()),
+            );
+            service
+                .shared
+                .emergency_detector_ready
+                .store(true, Ordering::Release);
+            service
+                .shared
+                .emergency_thread_id
+                .store(1, Ordering::Release);
+            service.shared.emergency_heartbeat_ms.store(
+                service.shared.emergency_clock.elapsed().as_millis() as u64 + 1,
+                Ordering::Release,
+            );
+            let task = configured_trigger_task(&service);
+            let epoch = task.hold_epoch.expect("Hold epoch");
+            let reset = super::PendingHoldLifecycleReset {
+                shared: &service.shared,
+                epoch: Some(epoch),
+                transferred_to_playback: false,
+            };
+            let weak = Arc::downgrade(&service.shared);
+            *service
+                .shared
+                .trigger_admission_test_hook
+                .lock()
+                .expect("test hook") = Some(Arc::new(move |observed| {
+                if observed == checkpoint {
+                    let shared = weak.upgrade().expect("service remains alive");
+                    assert!(shared.revoke_current_hold_for_key_up(0x78));
+                }
+            }));
+            let error = service
+                .shared
+                .start_hotkey_playback_at_revision(
+                    task.rule,
+                    task.generation,
+                    task.admission_revision,
+                    task.config_revision,
+                    task.hold_epoch,
+                )
+                .expect_err("checkpoint keyup must cancel Hold start");
+            assert!(
+                matches!(
+                    error.code.as_str(),
+                    "macro_hold_released" | "playback_cancelled"
+                ),
+                "checkpoint {checkpoint:?} returned {}",
+                error.code
+            );
+            drop(reset);
+            assert_eq!(
+                service.shared.hold_lifecycle_epoch.load(Ordering::Acquire),
+                0
+            );
+            assert!(!service
+                .shared
+                .controller
+                .input_allowed(crate::runtime_control::RunToken {
+                    id: 1,
+                    generation: task.generation,
+                }));
+            assert_eq!(service.shared.tracked_input_counts(), (0, 0));
+            assert!(service
+                .shared
+                .playback_inputs
+                .lock()
+                .expect("playback inputs")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn stale_hold_owner_cannot_clear_new_identity_and_epoch_exhaustion_fails_closed() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let rule = config.macros[0].clone();
+        let service = HookService::isolated(
+            config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let old_epoch = service
+            .shared
+            .publish_hold_lifecycle(&rule)
+            .expect("publish old Hold");
+        service.shared.retire_hold_lifecycle(old_epoch);
+        let new_epoch = service
+            .shared
+            .publish_hold_lifecycle(&rule)
+            .expect("publish new Hold");
+        service.shared.retire_hold_lifecycle(old_epoch);
+        assert_eq!(
+            service.shared.hold_lifecycle_epoch.load(Ordering::Acquire),
+            new_epoch
+        );
+        service
+            .shared
+            .validate_hold_lifecycle(&rule, Some(new_epoch))
+            .expect("stale retirement must not clear newer Hold");
+        service.shared.retire_hold_lifecycle(new_epoch);
+
+        service
+            .shared
+            .next_hold_epoch
+            .store(u64::MAX, Ordering::Release);
+        assert!(service.shared.publish_hold_lifecycle(&rule).is_none());
+        assert!(service.shared.hold_epoch_exhausted.load(Ordering::Acquire));
+        assert_eq!(
+            service.shared.hold_lifecycle_epoch.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn stale_bound_hold_token_cannot_revoke_a_newer_unrelated_run() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let rule = config.macros[0].clone();
+        let service = HookService::isolated(
+            config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let epoch = service
+            .shared
+            .publish_hold_lifecycle(&rule)
+            .expect("publish stale Hold");
+        let mut old_lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("admit old Hold");
+        let old_token = old_lease.token();
+        service
+            .shared
+            .bind_hold_lifecycle_run(&rule, Some(epoch), old_token)
+            .expect("bind old Hold");
+        assert!(service.shared.controller.activate(old_token));
+        old_lease.commit();
+        service.shared.controller.request_stop();
+        let _ = service.shared.controller.begin_cleaning(old_token);
+        assert!(service.shared.controller.finish(old_token, true));
+
+        let mut new_lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("admit newer unrelated run");
+        let new_token = new_lease.token();
+        assert!(service.shared.controller.activate(new_token));
+        new_lease.commit();
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
+        assert!(
+            service.shared.controller.input_allowed(new_token),
+            "stale Hold identity must not revoke a different active token"
+        );
+        service.shared.retire_hold_lifecycle(epoch);
+        service.shared.controller.request_stop();
+        let _ = service.shared.controller.begin_cleaning(new_token);
+        let _ = service.shared.controller.finish(new_token, true);
+    }
+
+    #[test]
+    fn native_and_fallback_hotkeys_submit_to_the_same_release_gate_worker() {
+        fn config_with_macro() -> AppConfig {
+            AppConfig {
+                macros: vec![MacroRule {
+                    id: "shared-gate".into(),
+                    name: "shared-gate".into(),
+                    import_error: None,
+                    enabled: true,
+                    trigger_keys: vec!["F9".into()],
+                    mode: MacroMode::Once,
+                    repeat_count: 1,
+                    speed: 1.0,
+                    record_mouse_move: true,
+                    record_mouse_clicks: true,
+                    target: None,
+                    behavior_policy: None,
+                    program: AutomationProgram::Macro { steps: Vec::new() },
+                }],
+                ..AppConfig::default()
+            }
+        }
+
+        fn capture_worker(
+            service: &HookService,
+        ) -> std::sync::mpsc::Receiver<super::MacroTriggerTask> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = crate::bounded_worker::BoundedWorker::spawn(
+                "input-free-release-gate-capture",
+                1,
+                move |task| tx.send(task).expect("capture trigger task"),
+            )
+            .expect("capture worker");
+            service
+                .shared
+                .trigger_tasks
+                .set(worker)
+                .map_err(drop)
+                .expect("set capture worker");
+            rx
+        }
+
+        let fallback = HookService::isolated(
+            config_with_macro(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let fallback_rx = capture_worker(&fallback);
+        let fallback_config = fallback.shared.config.lock().expect("config").clone();
+        assert!(super::process_macro_key_down(
+            &fallback.shared,
+            &fallback_config,
+            fallback
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+            0x78,
+            false,
+            &HashSet::from([0x78]),
+        ));
+        let fallback_task = fallback_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fallback task");
+
+        let native = HookService::isolated(
+            config_with_macro(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        native
+            .shared
+            .native_refresh_pending
+            .store(false, Ordering::Release);
+        native
+            .shared
+            .native_macro_hotkeys
+            .lock()
+            .expect("native registry")
+            .insert(0x5000, "shared-gate".into());
+        let native_rx = capture_worker(&native);
+        super::process_native_macro_hotkey(&native.shared, 0x5000);
+        let native_task = native_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("native task");
+
+        assert_eq!(fallback_task.rule.id, native_task.rule.id);
+        assert_eq!(
+            fallback_task.rule.trigger_keys,
+            native_task.rule.trigger_keys
+        );
+        assert_eq!(fallback_task.generation, native_task.generation);
+        assert_eq!(
+            fallback_task.controller_generation,
+            native_task.controller_generation
+        );
+        assert_eq!(
+            fallback_task.admission_revision,
+            native_task.admission_revision
+        );
+        assert_eq!(fallback_task.config_revision, native_task.config_revision);
+        fallback.shared.trigger_tasks.get().expect("worker").close();
+        native.shared.trigger_tasks.get().expect("worker").close();
+    }
+
+    #[test]
+    fn fallback_macro_callback_fails_closed_when_registry_or_latch_is_busy() {
+        fn capture_worker(
+            service: &HookService,
+        ) -> std::sync::mpsc::Receiver<super::MacroTriggerTask> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = crate::bounded_worker::BoundedWorker::spawn(
+                "input-free-fallback-lock-capture",
+                1,
+                move |task| tx.send(task).expect("capture trigger task"),
+            )
+            .expect("capture worker");
+            service
+                .shared
+                .trigger_tasks
+                .set(worker)
+                .map_err(drop)
+                .expect("set capture worker");
+            rx
+        }
+
+        fn invoke_while_lock_is_held(
+            shared: Arc<HookShared>,
+            config: AppConfig,
+            revision: u64,
+        ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<bool>) {
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::spawn(move || {
+                let consumed = super::process_macro_key_down(
+                    &shared,
+                    &config,
+                    revision,
+                    0x78,
+                    false,
+                    &HashSet::from([0x11, 0x78]),
+                );
+                done_tx.send(consumed).expect("report callback result");
+            });
+            (handle, done_rx)
+        }
+
+        let registry_busy = HookService::isolated(
+            trigger_config_fixture(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let registry_rx = capture_worker(&registry_busy);
+        let registry_config = registry_busy.shared.config.lock().expect("config").clone();
+        let registry_revision = registry_busy
+            .shared
+            .trigger_config_revision
+            .load(Ordering::Acquire);
+        registry_busy
+            .shared
+            .latched_hotkeys
+            .lock()
+            .expect("latch")
+            .insert("sentinel".into());
+        let registry_guard = registry_busy
+            .shared
+            .native_macro_hotkeys
+            .lock()
+            .expect("native registry");
+        let (registry_call, registry_done) = invoke_while_lock_is_held(
+            Arc::clone(&registry_busy.shared),
+            registry_config,
+            registry_revision,
+        );
+        assert!(registry_done
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("callback seam must return while registry lock is held"));
+        registry_call.join().expect("registry contention callback");
+        assert!(matches!(
+            registry_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(!registry_busy.shared.trigger_pending.load(Ordering::Acquire));
+        drop(registry_guard);
+        let registry_latch = registry_busy.shared.latched_hotkeys.lock().expect("latch");
+        assert_eq!(registry_latch.len(), 1);
+        assert!(registry_latch.contains("sentinel"));
+        drop(registry_latch);
+        registry_busy
+            .shared
+            .trigger_tasks
+            .get()
+            .expect("worker")
+            .close();
+
+        let latch_busy = HookService::isolated(
+            trigger_config_fixture(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let latch_rx = capture_worker(&latch_busy);
+        let latch_config = latch_busy.shared.config.lock().expect("config").clone();
+        let latch_revision = latch_busy
+            .shared
+            .trigger_config_revision
+            .load(Ordering::Acquire);
+        let mut latch_guard = latch_busy.shared.latched_hotkeys.lock().expect("latch");
+        latch_guard.insert("sentinel".into());
+        let (latch_call, latch_done) =
+            invoke_while_lock_is_held(Arc::clone(&latch_busy.shared), latch_config, latch_revision);
+        assert!(latch_done
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("callback seam must return while latch lock is held"));
+        latch_call.join().expect("latch contention callback");
+        assert_eq!(latch_guard.len(), 1);
+        assert!(latch_guard.contains("sentinel"));
+        assert!(matches!(
+            latch_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(!latch_busy.shared.trigger_pending.load(Ordering::Acquire));
+        drop(latch_guard);
+        latch_busy
+            .shared
+            .trigger_tasks
+            .get()
+            .expect("worker")
+            .close();
+    }
+
+    #[test]
+    fn running_toggle_and_clicker_stop_before_contended_start_only_locks() {
+        fn capture_worker(
+            service: &HookService,
+        ) -> std::sync::mpsc::Receiver<super::MacroTriggerTask> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = crate::bounded_worker::BoundedWorker::spawn(
+                "input-free-immediate-stop-capture",
+                1,
+                move |task| tx.send(task).expect("capture trigger task"),
+            )
+            .expect("capture worker");
+            service
+                .shared
+                .trigger_tasks
+                .set(worker)
+                .map_err(drop)
+                .expect("set capture worker");
+            rx
+        }
+
+        fn mark_playback_running(service: &HookService) -> crate::runtime_control::RunToken {
+            let mut lease = service
+                .shared
+                .controller
+                .begin_start(None)
+                .expect("admit active playback");
+            let token = lease.token();
+            assert!(service.shared.controller.activate(token));
+            lease.commit();
+            let mut playback = service.shared.playback.lock().expect("playback");
+            playback.running = true;
+            playback.stop = Some(Arc::new(AtomicBool::new(false)));
+            playback.run_token = Some(token);
+            token
+        }
+
+        fn invoke(
+            shared: Arc<HookShared>,
+            config: AppConfig,
+            current_vk: u32,
+            pressed: HashSet<u32>,
+        ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<bool>) {
+            let revision = shared.trigger_config_revision.load(Ordering::Acquire);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::spawn(move || {
+                let consumed = super::process_macro_key_down(
+                    &shared, &config, revision, current_vk, false, &pressed,
+                );
+                done_tx.send(consumed).expect("report callback result");
+            });
+            (handle, done_rx)
+        }
+
+        let mut toggle_config = trigger_config_fixture();
+        toggle_config.macros[0].mode = MacroMode::Toggle;
+        let toggle = HookService::isolated(
+            toggle_config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let toggle_rx = capture_worker(&toggle);
+        let toggle_token = mark_playback_running(&toggle);
+        assert!(toggle.shared.controller.input_allowed(toggle_token));
+        let toggle_config = toggle.shared.config.lock().expect("config").clone();
+        let registry_guard = toggle
+            .shared
+            .native_macro_hotkeys
+            .lock()
+            .expect("native registry");
+        let (toggle_call, toggle_done) = invoke(
+            Arc::clone(&toggle.shared),
+            toggle_config,
+            0x78,
+            HashSet::from([0x11, 0x78]),
+        );
+        assert!(toggle_done
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("Toggle stop must not wait for registry lock"));
+        toggle_call.join().expect("Toggle stop callback");
+        assert!(!toggle.shared.controller.input_allowed(toggle_token));
+        assert!(toggle.shared.trigger_rearm_required.load(Ordering::Acquire));
+        assert!(!toggle.shared.trigger_pending.load(Ordering::Acquire));
+        assert!(matches!(
+            toggle_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(registry_guard);
+        toggle.shared.trigger_tasks.get().expect("worker").close();
+
+        let clicker_config = AppConfig {
+            macros: vec![MacroRule {
+                id: "legacy-clicker-stop".into(),
+                name: "连点器".into(),
+                import_error: None,
+                enabled: true,
+                trigger_keys: vec!["Ctrl".into(), "F8".into()],
+                mode: MacroMode::Once,
+                repeat_count: 1,
+                speed: 1.0,
+                record_mouse_move: true,
+                record_mouse_clicks: true,
+                target: None,
+                behavior_policy: None,
+                program: AutomationProgram::Macro { steps: Vec::new() },
+            }],
+            ..AppConfig::default()
+        };
+        let clicker = HookService::isolated(
+            clicker_config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let clicker_rx = capture_worker(&clicker);
+        let clicker_token = mark_playback_running(&clicker);
+        assert!(clicker.shared.controller.input_allowed(clicker_token));
+        let clicker_config = clicker.shared.config.lock().expect("config").clone();
+        let latch_guard = clicker.shared.latched_hotkeys.lock().expect("latch");
+        let (clicker_call, clicker_done) = invoke(
+            Arc::clone(&clicker.shared),
+            clicker_config,
+            0x77,
+            HashSet::from([0x11, 0x77]),
+        );
+        assert!(clicker_done
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("clicker stop must not wait for latch lock"));
+        clicker_call.join().expect("clicker stop callback");
+        assert!(!clicker.shared.controller.input_allowed(clicker_token));
+        assert!(clicker
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        assert!(!clicker.shared.trigger_pending.load(Ordering::Acquire));
+        assert!(matches!(
+            clicker_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(latch_guard);
+        clicker.shared.trigger_tasks.get().expect("worker").close();
+
+        let partial = HookService::isolated(
+            {
+                let mut config = trigger_config_fixture();
+                config.macros[0].mode = MacroMode::Toggle;
+                config
+            },
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let partial_token = mark_playback_running(&partial);
+        let partial_config = partial.shared.config.lock().expect("config").clone();
+        let registry_guard = partial
+            .shared
+            .native_macro_hotkeys
+            .lock()
+            .expect("native registry");
+        assert!(super::process_macro_key_down(
+            &partial.shared,
+            &partial_config,
+            partial
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+            0x78,
+            false,
+            &HashSet::from([0x78]),
+        ));
+        assert!(partial.shared.controller.input_allowed(partial_token));
+        assert!(!super::process_macro_key_down(
+            &partial.shared,
+            &partial_config,
+            partial
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+            0x41,
+            false,
+            &HashSet::from([0x41]),
+        ));
+        assert!(partial.shared.controller.input_allowed(partial_token));
+        assert!(!partial
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        drop(registry_guard);
+    }
+
+    #[test]
+    fn runtime_admission_rejects_default_and_custom_emergency_key_combinations() {
+        let service = test_hook_service();
+        let mut task = pending_trigger_task(&service);
+        for keys in [vec!["F12".into()], vec!["Ctrl".into(), "F12".into()]] {
+            task.rule.trigger_keys = keys;
+            assert!(!service.shared.submit_macro_trigger(
+                &task.rule,
+                task.generation,
+                task.config_revision
+            ));
+            assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
+        }
+        service.shared.emergency_vk.store(0x7A, Ordering::Release);
+        task.rule.trigger_keys = vec!["Shift".into(), "F11".into()];
+        assert!(!service.shared.submit_macro_trigger(
+            &task.rule,
+            task.generation,
+            task.config_revision
+        ));
+        assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
+        assert_eq!(service.shared.injected_input.counts(), (0, 0));
+    }
+
+    #[test]
+    fn native_clicker_start_submits_ctrl_f8_to_release_gate_worker() {
+        let config = AppConfig {
+            macros: vec![MacroRule {
+                id: "clicker-release-gate".into(),
+                name: "连点器".into(),
+                import_error: None,
+                enabled: true,
+                trigger_keys: vec!["Ctrl".into(), "F8".into()],
+                mode: MacroMode::Toggle,
+                repeat_count: 1,
+                speed: 1.0,
+                record_mouse_move: true,
+                record_mouse_clicks: true,
+                target: None,
+                behavior_policy: None,
+                program: AutomationProgram::Macro { steps: Vec::new() },
+            }],
+            ..AppConfig::default()
+        };
+        let service = HookService::isolated(
+            config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        service
+            .shared
+            .native_refresh_pending
+            .store(false, Ordering::Release);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = crate::bounded_worker::BoundedWorker::spawn(
+            "input-free-clicker-gate-capture",
+            1,
+            move |task| tx.send(task).expect("capture clicker task"),
+        )
+        .expect("capture worker");
+        service
+            .shared
+            .trigger_tasks
+            .set(worker)
+            .map_err(drop)
+            .expect("set capture worker");
+
+        super::process_native_clicker_hotkey(&service.shared);
+        let task = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("clicker trigger task");
+        assert_eq!(task.rule.trigger_keys, ["Ctrl", "F8"]);
+        assert!(service.shared.trigger_pending.load(Ordering::Acquire));
+        assert_eq!(service.shared.injected_input.counts(), (0, 0));
+        service.shared.trigger_tasks.get().expect("worker").close();
+    }
+
+    #[test]
+    fn swallowed_toggle_stop_stays_fenced_until_real_keyup_and_async_release() {
+        let config = AppConfig {
+            macros: vec![MacroRule {
+                id: "single-f9-toggle".into(),
+                name: "single-f9-toggle".into(),
+                import_error: None,
+                enabled: true,
+                trigger_keys: vec!["F9".into()],
+                mode: MacroMode::Toggle,
+                repeat_count: 1,
+                speed: 1.0,
+                record_mouse_move: true,
+                record_mouse_clicks: true,
+                target: None,
+                behavior_policy: None,
+                program: AutomationProgram::Macro { steps: Vec::new() },
+            }],
+            ..AppConfig::default()
+        };
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = crate::bounded_worker::BoundedWorker::spawn(
+            "input-free-rearm-capture",
+            1,
+            move |task| task_tx.send(task).expect("capture fresh trigger"),
+        )
+        .expect("capture worker");
+        service
+            .shared
+            .trigger_tasks
+            .set(worker)
+            .map_err(drop)
+            .expect("set capture worker");
+
+        let mut lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("admit active Toggle");
+        let token = lease.token();
+        assert!(service.shared.controller.activate(token));
+        lease.commit();
+        {
+            let mut playback = service.shared.playback.lock().expect("playback");
+            playback.running = true;
+            playback.stop = Some(Arc::new(AtomicBool::new(false)));
+            playback.run_token = Some(token);
+        }
+        super::update_physical_pressed_ledger(
+            &mut service
+                .shared
+                .physical_pressed
+                .lock()
+                .expect("physical ledger"),
+            0x78,
+            true,
+            false,
+            false,
+        );
+        service.shared.pressed.lock().expect("pressed").insert(0x78);
+
+        assert!(super::process_macro_key_down(
+            &service.shared,
+            &config,
+            service
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+            0x78,
+            false,
+            &HashSet::from([0x78]),
+        ));
+        assert!(!service.shared.controller.input_allowed(token));
+        assert!(service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        assert!(matches!(
+            task_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        super::update_physical_pressed_ledger(
+            &mut service
+                .shared
+                .physical_pressed
+                .lock()
+                .expect("physical ledger"),
+            0x41,
+            false,
+            true,
+            false,
+        );
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |_| false);
+        assert!(service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        assert!(service
+            .shared
+            .pressed
+            .lock()
+            .expect("pressed")
+            .contains(&0x78));
+        assert!(super::should_suppress_for_trigger_rearm(
+            &service.shared,
+            &config,
+            0x78
+        ));
+        assert!(matches!(
+            task_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        super::update_physical_pressed_ledger(
+            &mut service
+                .shared
+                .physical_pressed
+                .lock()
+                .expect("physical ledger"),
+            0x78,
+            false,
+            true,
+            false,
+        );
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |_| true);
+        assert!(service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |_| false);
+        assert!(!service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        assert!(!service
+            .shared
+            .pressed
+            .lock()
+            .expect("pressed")
+            .contains(&0x78));
+
+        assert!(service.shared.controller.begin_cleaning(token));
+        assert!(service.shared.controller.finish(token, true));
+        service.shared.playback.lock().expect("playback").running = false;
+        super::update_physical_pressed_ledger(
+            &mut service
+                .shared
+                .physical_pressed
+                .lock()
+                .expect("physical ledger"),
+            0x78,
+            true,
+            false,
+            false,
+        );
+        assert!(super::process_macro_key_down(
+            &service.shared,
+            &config,
+            service
+                .shared
+                .trigger_config_revision
+                .load(Ordering::Acquire),
+            0x78,
+            false,
+            &HashSet::from([0x78]),
+        ));
+        assert_eq!(
+            task_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("later fresh press may submit")
+                .rule
+                .id,
+            "single-f9-toggle"
+        );
+        service
+            .shared
+            .trigger_pending
+            .store(false, Ordering::Release);
+        service.shared.trigger_tasks.get().expect("worker").close();
+    }
+
+    #[test]
+    fn rearm_requires_all_modifier_sides_and_rwin_to_be_released() {
+        let config = AppConfig {
+            macros: vec![MacroRule {
+                id: "modifier-rearm".into(),
+                name: "modifier-rearm".into(),
+                import_error: None,
+                enabled: true,
+                trigger_keys: vec!["Ctrl".into(), "Win".into(), "F9".into()],
+                mode: MacroMode::Toggle,
+                repeat_count: 1,
+                speed: 1.0,
+                record_mouse_move: true,
+                record_mouse_clicks: true,
+                target: None,
+                behavior_policy: None,
+                program: AutomationProgram::Macro { steps: Vec::new() },
+            }],
+            ..AppConfig::default()
+        };
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        service
+            .shared
+            .trigger_rearm_required
+            .store(true, Ordering::Release);
+        service
+            .shared
+            .pressed
+            .lock()
+            .expect("pressed")
+            .extend([0x11, 0x5B, 0x78]);
+        service
+            .shared
+            .physical_pressed
+            .lock()
+            .expect("physical ledger")
+            .extend([0xA3, 0x5C, 0x78]);
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |_| false);
+        assert!(service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        service
+            .shared
+            .physical_pressed
+            .lock()
+            .expect("physical ledger")
+            .clear();
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |vk| vk == 0x5B);
+        assert!(service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |_| false);
+        assert!(!service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        assert!(service.shared.pressed.lock().expect("pressed").is_empty());
+
+        service
+            .shared
+            .trigger_rearm_required
+            .store(true, Ordering::Release);
+        service.shared.pressed.lock().expect("pressed").insert(0x78);
+        let ledger_guard = service
+            .shared
+            .physical_pressed
+            .lock()
+            .expect("physical ledger");
+        super::rearm_macro_triggers_if_released_with(&service.shared, &config, |_| false);
+        assert!(service
+            .shared
+            .trigger_rearm_required
+            .load(Ordering::Acquire));
+        assert!(service
+            .shared
+            .pressed
+            .lock()
+            .expect("pressed")
+            .contains(&0x78));
+        assert!(service
+            .shared
+            .physical_ledger_uncertain
+            .load(Ordering::Acquire));
+        drop(ledger_guard);
     }
 
     #[test]
@@ -8643,6 +12299,132 @@ mod tests {
         assert_eq!(canonical_virtual_key(0xA5), 0x12);
         assert_eq!(canonical_virtual_key(0xA1), 0x10);
         assert_eq!(canonical_virtual_key(0x5C), 0x5B);
+    }
+
+    #[test]
+    fn hook_physical_ledger_is_conservative_when_async_state_is_false() {
+        let mut ledger = HashSet::new();
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, true, false, false);
+        assert!(super::trigger_down_from_ledger_or_async(
+            &ledger,
+            0x78,
+            |_| false
+        ));
+
+        let mut gate = super::TriggerReleaseGate::new(
+            std::time::Duration::from_millis(18),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(100),
+                super::trigger_down_from_ledger_or_async(&ledger, 0x78, |_| false),
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, false, true, false);
+        assert!(!super::trigger_down_from_ledger_or_async(
+            &ledger,
+            0x78,
+            |_| false
+        ));
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(101),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            None
+        );
+        assert_eq!(
+            gate.observe(
+                std::time::Duration::from_millis(119),
+                false,
+                super::TriggerReleaseGateStatus::Current,
+            ),
+            Some(super::TriggerReleaseGateOutcome::Ready)
+        );
+    }
+
+    #[test]
+    fn swallowed_combo_key_and_modifier_sides_require_real_hook_keyups() {
+        let mut ledger = HashSet::new();
+        super::update_physical_pressed_ledger(&mut ledger, 0xA2, true, false, false);
+        super::update_physical_pressed_ledger(&mut ledger, 0xA3, true, false, false);
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, true, false, false);
+        assert!(super::physical_ledger_contains_trigger(&ledger, 0x11));
+        assert!(super::physical_ledger_contains_trigger(&ledger, 0x78));
+
+        // The swallowed final F9 key cannot disappear merely because the
+        // async provider reports false. Its physical keyup is authoritative.
+        assert!(super::trigger_down_from_ledger_or_async(
+            &ledger,
+            0x78,
+            |_| false
+        ));
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, false, true, false);
+        assert!(!super::physical_ledger_contains_trigger(&ledger, 0x78));
+        assert!(super::physical_ledger_contains_trigger(&ledger, 0x11));
+
+        // Releasing one side must not clear the other physical Ctrl.
+        super::update_physical_pressed_ledger(&mut ledger, 0xA2, false, true, false);
+        assert!(super::physical_ledger_contains_trigger(&ledger, 0x11));
+        super::update_physical_pressed_ledger(&mut ledger, 0xA3, false, true, false);
+        assert!(!super::physical_ledger_contains_trigger(&ledger, 0x11));
+    }
+
+    #[test]
+    fn injected_and_repeat_events_do_not_corrupt_physical_ledger() {
+        let mut ledger = HashSet::new();
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, true, false, true);
+        assert!(
+            ledger.is_empty(),
+            "injected keydown is never physical state"
+        );
+
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, true, false, false);
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, true, false, false);
+        assert_eq!(ledger, HashSet::from([0x78]));
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, false, true, true);
+        assert_eq!(ledger, HashSet::from([0x78]));
+        super::update_physical_pressed_ledger(&mut ledger, 0x78, false, true, false);
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn hook_teardown_ledger_is_fail_closed_until_explicit_startup_reset() {
+        let service = test_hook_service();
+        service
+            .shared
+            .physical_pressed
+            .lock()
+            .expect("physical ledger")
+            .insert(0x78);
+        service.shared.retire_physical_key_ledger();
+        assert!(service
+            .shared
+            .physical_ledger_uncertain
+            .load(Ordering::Acquire));
+        assert!(service
+            .shared
+            .physical_pressed
+            .lock()
+            .expect("physical ledger")
+            .is_empty());
+        let task = pending_trigger_task(&service);
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::PhysicalLedgerUncertain
+            )
+        );
+
+        assert!(service.shared.initialize_physical_key_ledger());
+        assert!(!service
+            .shared
+            .physical_ledger_uncertain
+            .load(Ordering::Acquire));
     }
 
     #[test]

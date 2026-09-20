@@ -1,0 +1,16 @@
+{
+  "id": "manual-acceptance-08-short-biomimetic-move",
+  "name": "MANUAL_TEST 08 - Short biomimetic move Level 5",
+  "enabled": false,
+  "triggerKeys": [],
+  "mode": "once",
+  "repeatCount": 1,
+  "speed": 1.0,
+  "recordMouseMove": false,
+  "recordMouseClicks": false,
+  "program": {
+    "kind": "rhai",
+    "apiVersion": 1,
+    "source": "let w = window_rect(\"AutoFlow Manual Acceptance Harness\");\nif w.found {\n    let x = w.x + w.width / 2;\n    let y = w.y + w.height / 2;\n    bio_move_to(x, y, #{ target_width: 96, intent: \"move\" });\n}"
+  }
+}

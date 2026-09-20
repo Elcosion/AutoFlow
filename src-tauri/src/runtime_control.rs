@@ -60,6 +60,8 @@ pub(crate) struct RuntimeController {
     generation: AtomicU64,
     background_generation: AtomicU64,
     next_run_id: AtomicU64,
+    revoked_through_run_id: AtomicU64,
+    run_id_exhausted: AtomicBool,
     shutting_down: AtomicBool,
     input_enabled: AtomicBool,
     fault_latched: AtomicBool,
@@ -75,6 +77,8 @@ impl RuntimeController {
             generation: AtomicU64::new(0),
             background_generation: AtomicU64::new(0),
             next_run_id: AtomicU64::new(0),
+            revoked_through_run_id: AtomicU64::new(0),
+            run_id_exhausted: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             input_enabled: AtomicBool::new(true),
             fault_latched: AtomicBool::new(false),
@@ -100,7 +104,31 @@ impl RuntimeController {
                 state.phase = RuntimePhase::FaultLocked;
             }
         }
+        // A lifecycle transition may have held the state mutex while this
+        // non-blocking fault path ran. Reassert the atomic safety boundary
+        // after the best-effort phase update so that such a transition cannot
+        // leave input enabled from an earlier view of the latch.
+        self.fault_latched.store(true, Ordering::Release);
+        self.input_enabled.store(false, Ordering::Release);
         generation
+    }
+
+    /// Publish an inactive state without allowing a concurrent fault or
+    /// shutdown to be overwritten by a stale transition decision.
+    fn settle_inactive(&self, state: &mut ControllerState) {
+        state.phase = RuntimePhase::Idle;
+        self.input_enabled.store(true, Ordering::Release);
+
+        // Input is enabled before the final safety reads. If a fault/shutdown
+        // happened earlier, this branch revokes it again; if it happens later,
+        // that path's atomic revocation is ordered after this enable.
+        if self.shutting_down.load(Ordering::Acquire) {
+            state.phase = RuntimePhase::ShuttingDown;
+            self.input_enabled.store(false, Ordering::Release);
+        } else if self.fault_latched.load(Ordering::Acquire) {
+            state.phase = RuntimePhase::FaultLocked;
+            self.input_enabled.store(false, Ordering::Release);
+        }
     }
 
     #[cfg(test)]
@@ -147,10 +175,12 @@ impl RuntimeController {
         {
             return Err(StartError::SafetyLocked);
         }
-        let id = self
-            .next_run_id
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
+        let Some(id) = self.allocate_run_id() else {
+            self.fault_latched.store(true, Ordering::Release);
+            self.input_enabled.store(false, Ordering::Release);
+            state.phase = RuntimePhase::FaultLocked;
+            return Err(StartError::SafetyLocked);
+        };
         let token = RunToken { id, generation };
         state.phase = RuntimePhase::Starting;
         state.active = Some(token);
@@ -185,13 +215,7 @@ impl RuntimeController {
                     // An emergency stop while idle must not permanently lock
                     // the application.  The generation still invalidates any
                     // queued start request.
-                    self.input_enabled.store(
-                        !self.fault_latched.load(Ordering::Acquire),
-                        Ordering::Release,
-                    );
-                    if self.fault_latched.load(Ordering::Acquire) {
-                        state.phase = RuntimePhase::FaultLocked;
-                    }
+                    self.settle_inactive(&mut state);
                 }
                 RuntimePhase::FaultLocked | RuntimePhase::ShuttingDown => {
                     self.input_enabled.store(false, Ordering::Release);
@@ -219,8 +243,37 @@ impl RuntimeController {
         generation
     }
 
+    /// Revoke only the run identified by `token`. The monotonic watermark is
+    /// the permission boundary, so this remains immediate even when the
+    /// lifecycle mutex is contended. A stale token can only revoke itself and
+    /// older identities; it can never affect a newer run id.
+    pub(crate) fn revoke_token(&self, token: RunToken) {
+        if token.id == 0 {
+            return;
+        }
+        self.revoked_through_run_id
+            .fetch_max(token.id, Ordering::AcqRel);
+        if let Ok(mut state) = self.state.try_lock() {
+            if state.active == Some(token)
+                && matches!(state.phase, RuntimePhase::Starting | RuntimePhase::Running)
+            {
+                state.phase = RuntimePhase::Stopping;
+            }
+        }
+    }
+
+    /// Lock-free token-specific cancellation check used by playback watches.
+    /// Run ids are never reused, so a high-watermark cancellation cannot
+    /// accidentally revoke a later run.
+    pub(crate) fn token_revoked(&self, token: RunToken) -> bool {
+        token.id == 0 || token.id <= self.revoked_through_run_id.load(Ordering::Acquire)
+    }
+
     pub(crate) fn activate(&self, token: RunToken) -> bool {
-        if self.shutting_down.load(Ordering::Acquire) || self.generation() != token.generation {
+        if self.shutting_down.load(Ordering::Acquire)
+            || self.generation() != token.generation
+            || self.token_revoked(token)
+        {
             return false;
         }
         let Ok(mut state) = self.state.lock() else {
@@ -231,10 +284,28 @@ impl RuntimeController {
             && !self.shutting_down.load(Ordering::Acquire)
             && !self.fault_latched.load(Ordering::Acquire)
             && self.generation() == token.generation
+            && !self.token_revoked(token)
         {
             state.phase = RuntimePhase::Running;
             self.input_enabled.store(true, Ordering::Release);
-            true
+            // Do not let a fault arriving between the admission checks and
+            // the permit publication leave this run enabled. A fault arriving
+            // after these reads performs its own later atomic revocation.
+            if self.shutting_down.load(Ordering::Acquire)
+                || self.fault_latched.load(Ordering::Acquire)
+                || self.generation() != token.generation
+                || self.token_revoked(token)
+            {
+                self.input_enabled.store(false, Ordering::Release);
+                state.phase = if self.shutting_down.load(Ordering::Acquire) {
+                    RuntimePhase::ShuttingDown
+                } else {
+                    RuntimePhase::Stopping
+                };
+                false
+            } else {
+                true
+            }
         } else {
             false
         }
@@ -267,12 +338,8 @@ impl RuntimeController {
         if !safe {
             self.fault_latched.store(true, Ordering::Release);
         }
-        if safe
-            && !self.shutting_down.load(Ordering::Acquire)
-            && !self.fault_latched.load(Ordering::Acquire)
-        {
-            state.phase = RuntimePhase::Idle;
-            self.input_enabled.store(true, Ordering::Release);
+        if safe {
+            self.settle_inactive(&mut state);
         } else {
             state.phase = if self.shutting_down.load(Ordering::Acquire) {
                 RuntimePhase::ShuttingDown
@@ -284,24 +351,33 @@ impl RuntimeController {
         true
     }
 
-    /// Recover a fault-locked controller only after the caller has proved that
-    /// the input ledger is empty.  No automatic replay is performed.
-    pub(crate) fn recover_after_cleanup(&self) -> bool {
-        let generation = self.generation();
+    /// Commit recovery only for the exact request identity that proved the
+    /// cleanup preconditions. Both identities are checked while the lifecycle
+    /// mutex is held and again after publishing the recovered state.
+    pub(crate) fn recover_after_cleanup_at(
+        &self,
+        expected_generation: u64,
+        expected_revision: u64,
+    ) -> bool {
         if self.shutting_down.load(Ordering::Acquire) {
             return false;
         }
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if state.active.is_none() && state.phase == RuntimePhase::FaultLocked {
-            if self.generation() != generation {
+        if state.active.is_none() && self.fault_latched.load(Ordering::Acquire) {
+            if self.generation() != expected_generation
+                || self.background_generation() != expected_revision
+            {
                 return false;
             }
             self.fault_latched.store(false, Ordering::Release);
             state.phase = RuntimePhase::Idle;
             self.input_enabled.store(true, Ordering::Release);
-            if self.generation() != generation || self.shutting_down.load(Ordering::Acquire) {
+            if self.generation() != expected_generation
+                || self.background_generation() != expected_revision
+                || self.shutting_down.load(Ordering::Acquire)
+            {
                 self.fault_latched.store(true, Ordering::Release);
                 self.input_enabled.store(false, Ordering::Release);
                 state.phase = RuntimePhase::FaultLocked;
@@ -333,21 +409,13 @@ impl RuntimeController {
             return false;
         }
         state.active = None;
-        if self.shutting_down.load(Ordering::Acquire) {
-            state.phase = RuntimePhase::ShuttingDown;
-            self.input_enabled.store(false, Ordering::Release);
-        } else if self.fault_latched.load(Ordering::Acquire) {
-            state.phase = RuntimePhase::FaultLocked;
-            self.input_enabled.store(false, Ordering::Release);
-        } else {
-            state.phase = RuntimePhase::Idle;
-            self.input_enabled.store(true, Ordering::Release);
-        }
+        self.settle_inactive(&mut state);
         true
     }
 
     pub(crate) fn input_allowed(&self, token: RunToken) -> bool {
-        self.input_enabled.load(Ordering::Acquire)
+        !self.token_revoked(token)
+            && self.input_enabled.load(Ordering::Acquire)
             && !self.fault_latched.load(Ordering::Acquire)
             && !self.shutting_down.load(Ordering::Acquire)
             && self.generation() == token.generation
@@ -388,6 +456,12 @@ impl RuntimeController {
     }
 
     pub(crate) fn phase(&self) -> RuntimePhase {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return RuntimePhase::ShuttingDown;
+        }
+        if self.fault_latched.load(Ordering::Acquire) {
+            return RuntimePhase::FaultLocked;
+        }
         self.state
             .try_lock()
             .map(|state| state.phase)
@@ -400,6 +474,24 @@ impl RuntimeController {
 
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
+    }
+
+    fn allocate_run_id(&self) -> Option<u64> {
+        loop {
+            let current = self.next_run_id.load(Ordering::Acquire);
+            if current == u64::MAX || self.run_id_exhausted.load(Ordering::Acquire) {
+                self.run_id_exhausted.store(true, Ordering::Release);
+                return None;
+            }
+            let next = current + 1;
+            if self
+                .next_run_id
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(next);
+            }
+        }
     }
 }
 
@@ -430,6 +522,7 @@ impl Drop for StartLease {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeController, RuntimePhase, StartError};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn queued_request_cannot_start_after_competing_run_completes() {
@@ -504,7 +597,78 @@ mod tests {
             controller.begin_start(None),
             Err(StartError::SafetyLocked)
         ));
-        assert!(controller.recover_after_cleanup());
+        assert!(controller
+            .recover_after_cleanup_at(controller.generation(), controller.background_generation()));
+        assert_eq!(controller.phase(), RuntimePhase::Idle);
+    }
+
+    #[test]
+    fn contended_fault_latch_is_authoritative_until_explicit_recovery() {
+        let controller = RuntimeController::new();
+        let state = controller.state.lock().expect("state");
+
+        // The emergency path must not wait for this lifecycle lock. Its atomic
+        // latch is immediately authoritative even though the stored phase
+        // cannot be updated yet.
+        controller.lock_fault();
+        assert_eq!(state.phase, RuntimePhase::Idle);
+        assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        assert!(!controller.background_input_allowed());
+        drop(state);
+
+        assert!(matches!(
+            controller.begin_start(None),
+            Err(StartError::SafetyLocked)
+        ));
+        assert!(controller
+            .recover_after_cleanup_at(controller.generation(), controller.background_generation()));
+        assert_eq!(controller.phase(), RuntimePhase::Idle);
+        assert!(controller.background_input_allowed());
+    }
+
+    #[test]
+    fn clean_finish_after_contended_fault_cannot_restore_idle_or_input() {
+        let controller = RuntimeController::new();
+        let mut lease = controller.begin_start(None).expect("start");
+        let token = lease.token();
+        assert!(controller.activate(token));
+        lease.commit();
+
+        let state = controller.state.lock().expect("state");
+        controller.lock_fault();
+        assert_eq!(state.phase, RuntimePhase::Running);
+        assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        drop(state);
+
+        assert!(controller.begin_cleaning(token));
+        assert!(controller.finish(token, true));
+        assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        assert!(!controller.background_input_allowed());
+        assert!(matches!(
+            controller.begin_start(None),
+            Err(StartError::SafetyLocked)
+        ));
+        assert!(controller
+            .recover_after_cleanup_at(controller.generation(), controller.background_generation()));
+        assert_eq!(controller.phase(), RuntimePhase::Idle);
+    }
+
+    #[test]
+    fn stale_recovery_identity_cannot_clear_a_new_fault_latch() {
+        let controller = RuntimeController::new();
+        controller.lock_fault();
+        let stale_generation = controller.generation();
+        let stale_revision = controller.background_generation();
+
+        // A later fault/stop after an outer service validation advances both
+        // identities. The old recovery must fail at the lifecycle commit.
+        controller.lock_fault();
+        assert!(!controller.recover_after_cleanup_at(stale_generation, stale_revision));
+        assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        assert!(!controller.background_input_allowed());
+
+        assert!(controller
+            .recover_after_cleanup_at(controller.generation(), controller.background_generation()));
         assert_eq!(controller.phase(), RuntimePhase::Idle);
     }
 
@@ -542,6 +706,98 @@ mod tests {
     }
 
     #[test]
+    fn token_revoke_is_immediate_without_the_state_mutex_and_is_identity_scoped() {
+        let controller = RuntimeController::new();
+        let mut lease = controller.begin_start(None).expect("start");
+        let token = lease.token();
+        assert!(controller.activate(token));
+        lease.commit();
+
+        let state = controller.state.lock().expect("state");
+        controller.revoke_token(token);
+        assert!(controller.token_revoked(token));
+        assert!(!controller.input_allowed(token));
+        assert!(!controller.token_revoked(super::RunToken {
+            id: token.id + 1,
+            generation: token.generation,
+        }));
+        drop(state);
+
+        assert!(!controller.input_allowed(token));
+        assert!(controller.begin_cleaning(token));
+        assert!(controller.finish(token, true));
+    }
+
+    #[test]
+    fn stale_token_revoke_cannot_cancel_a_newer_active_run() {
+        let controller = RuntimeController::new();
+        let mut old_lease = controller.begin_start(None).expect("old start");
+        let old_token = old_lease.token();
+        assert!(controller.activate(old_token));
+        old_lease.commit();
+        assert!(controller.begin_cleaning(old_token));
+        assert!(controller.finish(old_token, true));
+
+        let mut new_lease = controller.begin_start(None).expect("new start");
+        let new_token = new_lease.token();
+        assert!(controller.activate(new_token));
+        new_lease.commit();
+
+        // Models a paused key-up callback resuming with the captured old
+        // identity after an unrelated UI run has become active.
+        controller.revoke_token(old_token);
+        assert!(controller.token_revoked(old_token));
+        assert!(!controller.token_revoked(new_token));
+        assert!(controller.input_allowed(new_token));
+
+        assert!(controller.begin_cleaning(new_token));
+        assert!(controller.finish(new_token, true));
+    }
+
+    #[test]
+    fn token_revocation_is_monotonic_and_run_identity_exhaustion_fails_closed() {
+        let controller = RuntimeController::new();
+        let mut first_lease = controller.begin_start(None).expect("first start");
+        let first = first_lease.token();
+        assert!(controller.activate(first));
+        first_lease.commit();
+        controller.revoke_token(first);
+        controller.revoke_token(first);
+        assert_eq!(
+            controller.revoked_through_run_id.load(Ordering::Acquire),
+            first.id
+        );
+        assert!(controller.begin_cleaning(first));
+        assert!(controller.finish(first, true));
+
+        let mut second_lease = controller.begin_start(None).expect("second start");
+        let second = second_lease.token();
+        assert!(controller.activate(second));
+        second_lease.commit();
+        controller.revoke_token(second);
+        controller.revoke_token(first);
+        assert_eq!(
+            controller.revoked_through_run_id.load(Ordering::Acquire),
+            second.id
+        );
+        assert!(!controller.input_allowed(second));
+        assert!(controller.begin_cleaning(second));
+        assert!(controller.finish(second, true));
+
+        let exhausted = RuntimeController::new();
+        exhausted.next_run_id.store(u64::MAX - 1, Ordering::Release);
+        let last = exhausted.begin_start(None).expect("last unique identity");
+        assert_eq!(last.token().id, u64::MAX);
+        drop(last);
+        assert!(matches!(
+            exhausted.begin_start(None),
+            Err(StartError::SafetyLocked)
+        ));
+        assert!(exhausted.run_id_exhausted.load(Ordering::Acquire));
+        assert_eq!(exhausted.phase(), RuntimePhase::FaultLocked);
+    }
+
+    #[test]
     fn stale_worker_cannot_finish_a_newer_run() {
         let controller = RuntimeController::new();
         let first = controller.begin_start(None).expect("first start");
@@ -571,7 +827,8 @@ mod tests {
             controller.begin_start(None),
             Err(StartError::SafetyLocked)
         ));
-        assert!(controller.recover_after_cleanup());
+        assert!(controller
+            .recover_after_cleanup_at(controller.generation(), controller.background_generation()));
         assert!(controller.begin_start(None).is_ok());
     }
 

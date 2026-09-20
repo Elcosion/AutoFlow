@@ -221,9 +221,16 @@ impl RuntimeState {
     }
 
     pub(crate) fn recover_input_safety(&self) -> Result<(), AppError> {
-        #[cfg(windows)]
+        #[cfg(all(windows, not(test)))]
         {
             self.hook.recover_input_safety()
+        }
+        #[cfg(all(windows, test))]
+        {
+            self.hook.recover_input_safety_at(
+                self.hook.service_generation(),
+                self.hook.service_admission_revision(),
+            )
         }
         #[cfg(not(windows))]
         {
@@ -272,6 +279,14 @@ impl RuntimeState {
 
     pub(crate) fn stop_behavior_recording(&self) -> Result<BehaviorRecordingResult, AppError> {
         self.hook.stop_behavior_recording()
+    }
+
+    pub(crate) fn discard_behavior_recording(&self) -> Result<(), AppError> {
+        self.hook.discard_behavior_recording()
+    }
+
+    pub(crate) fn complete_behavior_recording_claim(&self) -> Result<(), AppError> {
+        self.hook.complete_behavior_recording_claim()
     }
 
     pub(crate) fn behavior_recording_status(&self) -> Result<BehaviorRecordingStatus, AppError> {
@@ -405,6 +420,7 @@ pub fn run() {
             commands::validate_rhai_source,
             commands::start_behavior_recording,
             commands::stop_behavior_recording,
+            commands::discard_behavior_recording,
             commands::delete_behavior_profile_v2,
             commands::delete_behavior_session_v2,
             commands::retrain_behavior_profile_v2,

@@ -39,6 +39,12 @@ impl RuntimeBackend {
     pub fn stop_behavior_recording(&self) -> Result<BehaviorRecordingResult, AppError> {
         self.0.call(SafetyCommand::StopBehavior)
     }
+    pub fn discard_behavior_recording(&self) -> Result<(), AppError> {
+        self.0.call(SafetyCommand::DiscardBehavior)
+    }
+    pub fn complete_behavior_recording_claim(&self) -> Result<(), AppError> {
+        self.0.call(SafetyCommand::CompleteBehaviorClaim)
+    }
     pub fn play_macro(&self, rule: MacroRule) -> Result<(), AppError> {
         self.0.call(SafetyCommand::Play {
             rule: Box::new(rule),

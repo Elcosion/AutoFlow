@@ -468,6 +468,8 @@ impl BehaviorProfile {
 #[serde(rename_all = "camelCase")]
 pub struct BehaviorRecordingStatus {
     pub active: bool,
+    pub pending: bool,
+    pub incomplete: bool,
     pub capture_started: bool,
     pub duration_ms: u64,
     pub event_count: u64,
@@ -481,7 +483,7 @@ pub struct BehaviorRecordingStatus {
     pub session_name: Option<String>,
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct BehaviorRecordingResult {
     pub profile: BehaviorProfile,
     pub persist_raw_session: bool,
@@ -580,6 +582,7 @@ pub struct BehaviorRecorder {
     mouse_pause_ms: SampleStats,
     persist_raw_session: bool,
     raw_events: Vec<BehaviorEvent>,
+    pending_result: Option<BehaviorRecordingResult>,
 }
 
 impl BehaviorRecorder {
@@ -632,6 +635,8 @@ impl BehaviorRecorder {
     pub fn status(&self) -> BehaviorRecordingStatus {
         BehaviorRecordingStatus {
             active: self.active,
+            pending: self.stopped_at.is_some(),
+            incomplete: self.capture_incomplete,
             capture_started: self.capture_started,
             duration_ms: self
                 .started_at
@@ -654,6 +659,28 @@ impl BehaviorRecorder {
 
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn discard(&mut self) -> Result<(), AppError> {
+        if !self.active && self.stopped_at.is_none() {
+            return Err(AppError::invalid(
+                "behavior_recording_inactive",
+                "no behavior recording is available to discard",
+            ));
+        }
+        self.reset();
+        Ok(())
+    }
+
+    pub fn complete_claim(&mut self) -> Result<(), AppError> {
+        if self.pending_result.is_none() {
+            return Err(AppError::invalid(
+                "behavior_claim_inactive",
+                "no claimed behavior recording is awaiting completion",
+            ));
+        }
+        self.reset();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -795,12 +822,16 @@ impl BehaviorRecorder {
                 "行为训练录制未完整结束，无法保存",
             ));
         }
+        if let Some(result) = &self.pending_result {
+            return Ok(result.clone());
+        }
         if !self.active && self.stopped_at.is_none() {
             return Err(AppError::invalid(
                 "behavior_recording_inactive",
                 "当前没有正在进行的行为训练录制",
             ));
         }
+        self.freeze_capture(true);
         let duration_ms = self
             .started_at
             .map(|started| {
@@ -811,7 +842,6 @@ impl BehaviorRecorder {
             })
             .unwrap_or(0);
         if self.event_count < MIN_BEHAVIOR_EVENTS {
-            self.reset();
             return Err(AppError::invalid(
                 "behavior_insufficient_data",
                 format!("行为训练样本不足，至少需要 {MIN_BEHAVIOR_EVENTS} 个键鼠事件"),
@@ -847,14 +877,15 @@ impl BehaviorRecorder {
             }
             .clamp(0.0, 1.0),
             mouse_jitter_px: estimate_jitter(&self.mouse_speed_px_per_sec),
-            raw_events: std::mem::take(&mut self.raw_events),
+            raw_events: self.raw_events.clone(),
         };
-        self.reset();
         profile.validate()?;
-        Ok(BehaviorRecordingResult {
+        let result = BehaviorRecordingResult {
             profile,
             persist_raw_session,
-        })
+        };
+        self.pending_result = Some(result.clone());
+        Ok(result)
     }
 
     fn accept_event(&mut self) -> bool {
@@ -1294,6 +1325,8 @@ mod tests {
         recorder.freeze_capture(true);
         recorder.stopped_at = Some(started + std::time::Duration::from_millis(50));
         assert!(!recorder.active);
+        assert!(recorder.status().pending);
+        assert!(!recorder.status().incomplete);
         assert_eq!(recorder.event_count, 8);
         let stopped_first = recorder.stopped_at;
         recorder.freeze_capture(true);
@@ -1305,8 +1338,15 @@ mod tests {
         assert_eq!(result.profile.sample_count, 8);
         assert_eq!(result.profile.duration_ms, 50);
         assert_eq!(result.profile.raw_events.len(), 8);
+        let replayed = recorder.stop().expect("same pending claim is retryable");
+        assert_eq!(replayed.profile.id, result.profile.id);
+        recorder.complete_claim().expect("commit claim once");
         let error = recorder.stop().unwrap_err();
         assert_eq!(error.code, "behavior_recording_inactive");
+        assert_eq!(
+            recorder.complete_claim().unwrap_err().code,
+            "behavior_claim_inactive"
+        );
     }
 
     #[test]
@@ -1318,6 +1358,8 @@ mod tests {
         }
         recorder.freeze_capture(false);
         assert!(!recorder.active);
+        assert!(recorder.status().pending);
+        assert!(recorder.status().incomplete);
         assert_eq!(recorder.event_count, 8);
         let error = recorder.stop().unwrap_err();
         assert_eq!(error.code, "behavior_capture_incomplete");
@@ -1337,6 +1379,11 @@ mod tests {
         recorder.record_key(65, 30, true);
         let error = recorder.stop().unwrap_err();
         assert_eq!(error.code, "behavior_insufficient_data");
+        assert!(recorder.status().pending);
+        assert!(!recorder.status().incomplete);
+        recorder.discard().expect("explicit discard");
+        assert!(!recorder.status().pending);
+        recorder.start("重试", true).expect("new session");
     }
 
     #[test]

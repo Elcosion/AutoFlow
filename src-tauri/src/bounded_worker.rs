@@ -266,6 +266,36 @@ impl<T: Send + 'static> CaptureQueue<T> {
         true
     }
     pub(crate) fn drain(&self, timeout: Duration) -> Result<(), &'static str> {
+        if !self.confirm_barrier(timeout)? {
+            return Err("capture_inactive");
+        }
+        if self.failed.load(Ordering::Acquire) {
+            Err("capture_incomplete")
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Explicitly abandon a capture only after all previously admitted work is
+    /// known to have crossed the worker barrier. A timeout preserves the
+    /// session and its failure latch so callers cannot mistake it for reset.
+    pub(crate) fn confirm_discard(&self, timeout: Duration) -> Result<(), &'static str> {
+        self.confirm_barrier(timeout)?;
+        Ok(())
+    }
+
+    /// Complete a discard only after the owning recorder has also reset. The
+    /// atomic stores cannot fail, and a new session remains fenced until this
+    /// final step clears the failure latch.
+    pub(crate) fn reset_discarded(&self) {
+        debug_assert!(!self.is_pending());
+        self.failed.store(false, Ordering::Release);
+        self.accepted.store(0, Ordering::Release);
+        self.dropped.store(0, Ordering::Release);
+        self.processing_failed.store(0, Ordering::Release);
+    }
+
+    fn confirm_barrier(&self, timeout: Duration) -> Result<bool, &'static str> {
         self.active.store(0, Ordering::Release);
         let deadline = std::time::Instant::now() + timeout.min(Duration::from_millis(500));
         let mut state = loop {
@@ -280,7 +310,7 @@ impl<T: Send + 'static> CaptureQueue<T> {
             }
         };
         if state.is_none() {
-            return Err("capture_inactive");
+            return Ok(false);
         }
         let (reply, response) = sync_channel(1);
         let mut message = CaptureMessage::Barrier(reply);
@@ -307,11 +337,7 @@ impl<T: Send + 'static> CaptureQueue<T> {
             return Err("capture_drain_timeout");
         }
         *state = None;
-        if self.failed.load(Ordering::Acquire) {
-            Err("capture_incomplete")
-        } else {
-            Ok(())
-        }
+        Ok(true)
     }
     pub(crate) fn close(&self) {
         self.active.store(0, Ordering::Release);
@@ -517,6 +543,69 @@ mod tests {
             }
         );
         assert!(queue.begin().is_err());
+        queue.close();
+    }
+
+    #[test]
+    fn explicit_discard_clears_failure_only_after_confirmed_barrier() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let worker_fail = fail.clone();
+        let queue = CaptureQueue::spawn(move |_, _, _: ()| !worker_fail.load(Ordering::Acquire))
+            .expect("capture");
+        queue.begin().expect("failed session");
+        assert!(queue.submit(std::time::Instant::now(), ()));
+        assert_eq!(
+            queue.drain(Duration::from_millis(500)),
+            Err("capture_incomplete")
+        );
+        assert!(queue.begin().is_err());
+
+        queue
+            .confirm_discard(Duration::from_millis(500))
+            .expect("previous barrier already confirmed all work");
+        queue.reset_discarded();
+        fail.store(false, Ordering::Release);
+        queue.begin().expect("new session after explicit discard");
+        assert!(queue.submit(std::time::Instant::now(), ()));
+        queue
+            .drain(Duration::from_millis(500))
+            .expect("new session drains cleanly");
+        queue.close();
+    }
+
+    #[test]
+    fn failed_discard_barrier_retains_pending_session_and_failure_latch() {
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let queue = CaptureQueue::spawn(move |_, _, _: ()| {
+            entered_tx.send(()).expect("entered");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release fixture");
+            true
+        })
+        .expect("capture");
+        queue.begin().expect("session");
+        assert!(queue.submit(std::time::Instant::now(), ()));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked handler");
+        assert_eq!(
+            queue.confirm_discard(Duration::from_millis(20)),
+            Err("capture_drain_timeout")
+        );
+        assert!(queue.is_pending());
+        assert!(queue.is_failed());
+        assert!(queue.begin().is_err());
+        release_tx.send(()).expect("release handler");
+        queue
+            .confirm_discard(Duration::from_millis(500))
+            .expect("later explicit discard confirms barrier");
+        queue.reset_discarded();
+        queue.begin().expect("new session after confirmed discard");
+        queue
+            .drain(Duration::from_millis(500))
+            .expect("empty session drain");
         queue.close();
     }
 

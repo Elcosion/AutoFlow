@@ -24,6 +24,8 @@ pub enum SafetyCommand {
     RecordingStatus,
     StartBehavior { name: String },
     StopBehavior,
+    DiscardBehavior,
+    CompleteBehaviorClaim,
     BehaviorStatus,
     Play { rule: Box<MacroRule> },
     Stop,
@@ -448,6 +450,27 @@ impl ServiceRuntime {
             Self::Mock(control, _) => control.generation(),
         }
     }
+    fn validate_request_identity(
+        &self,
+        command: &SafetyCommand,
+        generation: u64,
+        admission_revision: u64,
+    ) -> Result<(), AppError> {
+        if matches!(command, SafetyCommand::Stop | SafetyCommand::Shutdown) {
+            return Ok(());
+        }
+        let current_generation = self.generation();
+        let current_revision = self.admission_revision();
+        if generation != current_generation || admission_revision != current_revision {
+            return Err(AppError::invalid(
+                "safety_service_stale_request",
+                format!(
+                    "stale safety-service request identity: request generation/revision {generation}/{admission_revision}, current {current_generation}/{current_revision}"
+                ),
+            ));
+        }
+        Ok(())
+    }
     fn stop(&self) {
         match self {
             Self::Live(hook) => hook.emergency_stop(),
@@ -486,7 +509,26 @@ impl ServiceRuntime {
         command: SafetyCommand,
         generation: u64,
         admission_revision: u64,
+        dispatch_hook: Option<fn(&SafetyCommand)>,
     ) -> Result<Value, AppError> {
+        self.execute_inner(command, generation, admission_revision, dispatch_hook, None)
+    }
+
+    fn execute_inner(
+        &self,
+        command: SafetyCommand,
+        generation: u64,
+        admission_revision: u64,
+        dispatch_hook: Option<fn(&SafetyCommand)>,
+        recovery_commit_hook: Option<fn(&RuntimeController)>,
+    ) -> Result<Value, AppError> {
+        self.validate_request_identity(&command, generation, admission_revision)?;
+        if let Some(hook) = dispatch_hook {
+            hook(&command);
+            // A fixture hook may deliberately hold dispatch while the independent
+            // stop path advances identity. Do not execute that now-stale request.
+            self.validate_request_identity(&command, generation, admission_revision)?;
+        }
         if let Self::Mock(control, cleanup_safe) = self {
             return match command {
                 SafetyCommand::Play { .. } => {
@@ -507,9 +549,21 @@ impl ServiceRuntime {
                 SafetyCommand::PlaybackStatus => Ok(
                     serde_json::json!({"running": control.active_token().is_some(), "phase": format!("{:?}", control.phase()), "generation": control.generation()}),
                 ),
-                SafetyCommand::Recover => Ok(Value::Bool(
-                    *cleanup_safe && control.recover_after_cleanup(),
-                )),
+                SafetyCommand::Recover => {
+                    if let Some(hook) = recovery_commit_hook {
+                        hook(control);
+                    }
+                    let recovered = *cleanup_safe
+                        && control.recover_after_cleanup_at(generation, admission_revision);
+                    if !recovered {
+                        self.validate_request_identity(
+                            &SafetyCommand::Recover,
+                            generation,
+                            admission_revision,
+                        )?;
+                    }
+                    Ok(Value::Bool(recovered))
+                }
                 _ => Ok(Value::Null),
             };
         }
@@ -536,6 +590,8 @@ impl ServiceRuntime {
             SafetyCommand::RecordingStatus => value(Ok(hook.recording_status())),
             SafetyCommand::StartBehavior { name } => value(hook.start_behavior_recording(name)),
             SafetyCommand::StopBehavior => value(hook.stop_behavior_recording()),
+            SafetyCommand::DiscardBehavior => value(hook.discard_behavior_recording()),
+            SafetyCommand::CompleteBehaviorClaim => value(hook.complete_behavior_recording_claim()),
             SafetyCommand::BehaviorStatus => value(Ok(hook.behavior_recording_status())),
             SafetyCommand::Play { rule } => {
                 value(hook.play_with_generation(*rule, generation, admission_revision))
@@ -551,7 +607,17 @@ impl ServiceRuntime {
                 value(Ok(hook.acknowledge_runtime_notification(id)))
             }
             SafetyCommand::Shutdown => value(Ok(hook.shutdown())),
-            SafetyCommand::Recover => value(hook.recover_input_safety()),
+            SafetyCommand::Recover => {
+                let result = hook.recover_input_safety_at(generation, admission_revision);
+                if result.is_err() {
+                    self.validate_request_identity(
+                        &SafetyCommand::Recover,
+                        generation,
+                        admission_revision,
+                    )?;
+                }
+                value(result)
+            }
         }
     }
 }
@@ -756,13 +822,11 @@ fn worker_main_inner(
         }
         next_sequence = next_sequence.saturating_add(1);
         let shutting_down = matches!(request.command, SafetyCommand::Shutdown);
-        if let Some(hook) = dispatch_hook {
-            hook(&request.command);
-        }
         let result = runtime.execute(
             request.command,
             request.generation,
             request.admission_revision,
+            dispatch_hook,
         );
         if replies
             .send(
@@ -794,10 +858,141 @@ fn worker_main_inner(
 
 #[cfg(test)]
 mod guardian_tests {
-    use super::controller_loss_cleanup;
+    use super::{controller_loss_cleanup, RuntimeController, SafetyCommand, ServiceRuntime};
+    use crate::MacroRule;
+    use serde_json::Value;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc::sync_channel, Arc};
     use std::time::Duration;
+
+    fn mock_rule() -> MacroRule {
+        serde_json::from_value(serde_json::json!({
+            "id": "identity-test",
+            "name": "input-free",
+            "program": {"kind": "macro", "steps": []}
+        }))
+        .expect("mock rule")
+    }
+
+    #[test]
+    fn stale_non_emergency_request_is_rejected_without_disturbing_active_run() {
+        let control = RuntimeController::new();
+        let runtime = ServiceRuntime::Mock(control, true);
+        runtime
+            .execute(
+                SafetyCommand::Play {
+                    rule: Box::new(mock_rule()),
+                },
+                0,
+                0,
+                None,
+            )
+            .expect("current play identity");
+
+        let rejection = runtime
+            .execute(SafetyCommand::DiscardBehavior, 0, 0, None)
+            .expect_err("pre-admission revision must be stale");
+        assert_eq!(rejection.code, "safety_service_stale_request");
+        let status = runtime
+            .execute(SafetyCommand::PlaybackStatus, 0, 1, None)
+            .expect("current status identity");
+        assert_eq!(status["running"], true);
+    }
+
+    #[test]
+    fn stale_recover_cannot_unlock_a_new_generation() {
+        let control = RuntimeController::new();
+        let runtime = ServiceRuntime::Mock(control.clone(), true);
+        runtime
+            .execute(
+                SafetyCommand::Play {
+                    rule: Box::new(mock_rule()),
+                },
+                0,
+                0,
+                None,
+            )
+            .expect("current play identity");
+        let token = control.active_token().expect("active token");
+        control.request_stop();
+        assert!(control.begin_cleaning(token));
+        assert!(control.finish(token, false));
+
+        let rejection = runtime
+            .execute(SafetyCommand::Recover, 0, 1, None)
+            .expect_err("old generation recovery must be stale");
+        assert_eq!(rejection.code, "safety_service_stale_request");
+        let status = runtime
+            .execute(SafetyCommand::PlaybackStatus, 1, 2, None)
+            .expect("current status identity");
+        assert_eq!(status["phase"], "FaultLocked");
+        assert_eq!(
+            runtime
+                .execute(SafetyCommand::Recover, 1, 2, None)
+                .expect("current recovery identity"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn fault_after_final_dispatch_validation_rejects_recover_at_commit() {
+        fn observe_dispatch(_: &SafetyCommand) {}
+        fn inject_new_fault(control: &RuntimeController) {
+            control.lock_fault();
+        }
+
+        let control = RuntimeController::new();
+        control.lock_fault();
+        let generation = control.generation();
+        let admission_revision = control.background_generation();
+        let runtime = ServiceRuntime::Mock(control.clone(), true);
+
+        let rejection = runtime
+            .execute_inner(
+                SafetyCommand::Recover,
+                generation,
+                admission_revision,
+                Some(observe_dispatch),
+                Some(inject_new_fault),
+            )
+            .expect_err("fault after final dispatch validation must stale recovery");
+
+        assert_eq!(rejection.code, "safety_service_stale_request");
+        assert_eq!(
+            control.phase(),
+            crate::runtime_control::RuntimePhase::FaultLocked
+        );
+        assert!(!control.background_input_allowed());
+        assert!(
+            control.recover_after_cleanup_at(control.generation(), control.background_generation())
+        );
+    }
+
+    #[test]
+    fn emergency_commands_ignore_stale_request_identity() {
+        let control = RuntimeController::new();
+        let runtime = ServiceRuntime::Mock(control, true);
+        runtime
+            .execute(
+                SafetyCommand::Play {
+                    rule: Box::new(mock_rule()),
+                },
+                0,
+                0,
+                None,
+            )
+            .expect("current play identity");
+        runtime
+            .execute(SafetyCommand::Stop, u64::MAX, u64::MAX, None)
+            .expect("stale stop remains emergency-authorized");
+        assert_eq!(runtime.generation(), 1);
+        assert_eq!(
+            runtime
+                .execute(SafetyCommand::Shutdown, 0, 0, None)
+                .expect("stale shutdown remains emergency-authorized"),
+            Value::Bool(true)
+        );
+    }
 
     #[test]
     fn guardian_revokes_and_cleans_without_waiting_for_blocked_business_work() {

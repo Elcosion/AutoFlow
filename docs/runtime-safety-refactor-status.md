@@ -2,6 +2,86 @@
 
 Status: implementation in progress; **not cleared for real-input testing**.
 
+## Manual acceptance package
+
+- Operator handbook: [`manual-runtime-safety-acceptance.md`](manual-runtime-safety-acceptance.md)
+- Offline harness: [`../tests/manual/runtime-safety-harness.html`](../tests/manual/runtime-safety-harness.html)
+- Disabled fixtures: [`../tests/manual/macros/`](../tests/manual/macros/)
+- Auditable vision reference: [`../tests/manual/assets/manual-vision-target.svg`](../tests/manual/assets/manual-vision-target.svg) (manual raster capture/import required)
+- Validate/install helper: [`../scripts/manual-acceptance.ps1`](../scripts/manual-acceptance.ps1)
+- Static validator regression: [`../tests/manual/manual-acceptance-validator.tests.ps1`](../tests/manual/manual-acceptance-validator.tests.ps1)
+- Explicit local harness operation: `-Operation OpenHarness`; isolated Level 7 long-sequence fixture: `12-isolated-long-sequence.json`
+
+**Manual acceptance has not yet been executed.** The package above defines the
+Level 0–7 gates and does not authorize real-input testing by itself.
+
+## 2026-09-19 end-to-end safety acceptance checkpoint
+
+Baseline: commit `26e1d353abb0e3b861fc1c9a51817ac6d8ef5f4e`, with a clean
+working tree at `2026-09-19T03:58:05.6381822Z`. This checkpoint did not run the
+Tauri GUI, install native hooks, execute a user macro, or send desktop input.
+
+### Stage status
+
+| Stage | Status | Evidence and remaining boundary |
+| --- | --- | --- |
+| 0. Baseline and fault inventory | Complete for this checkpoint | The clean Git baseline, current process topology, input paths, cleanup paths, and automated gate commands were recorded before implementation. |
+| 1. Runtime state and identity | Implemented and automatically verified | `RuntimeController` remains the lifecycle authority. Safety-service requests now validate generation and admission revision before dispatch and again after a blocking test hook. Stale ordinary commands, including recovery, are rejected without damaging the current run; emergency Stop and Shutdown remain identity-independent. |
+| 2. Input broker, ownership, and cleanup | Implemented with mock-backend coverage | Input permits and the shared broker remain the only production send boundary. Fault-latch ordering was strengthened so lock contention cannot briefly publish Idle or re-enable input after a cleanup fault. Partial-send, release-failure, retained-ledger, recovery, and fault-lock tests pass. Native Windows system-call completion under driver/session failure is still unproved. |
+| 3. Emergency stop and rearm | Implemented in code; Windows boundary pending | The F12 detector is independent of ordinary RPC work, reports heartbeat/desktop health, revokes before cleanup, and requires trigger release before rearm. Automated tests use injected detector state. Actual lock screen, suspend/resume, integrity-level boundaries, hook starvation, and physical F12 latency remain manual Windows gates. |
+| 4. Graph, Rhai, biomimetic, mapping, and text paths | Implemented and automatically verified | All production sends converge on the permit/broker. New deterministic tests prove a vision result that returns after cancellation cannot reach the next Rhai input action, and a completed biomimetic trajectory cannot reach its writer after permit revocation. No static bypass from an execution path to input sending was found. |
+| 5. GUI, safety service, and executor isolation | Implemented in code and mock-process tests; native acceptance pending | The GUI uses a private safety-service client; the safety service owns hooks/controller/ledgers; execution runs in a separately supervised job process. Authenticated bounded IPC, lease loss, blocked RPC, child death, exit confirmation, stale requests, and unsafe-cleanup quarantine have input-free tests. Real Windows job, pipe, desktop, abrupt-process, and OS input cleanup behavior remains unproved. |
+| 6. Observer UI, diagnostics, and recovery | Implemented for the current operator flows | Status/config/focus/overlay refresh remains observational and cannot start playback. Behavior recording now exposes pending and incomplete results: a complete result can be trained and claimed only after persistence succeeds; incomplete data cannot be trained; explicit confirmed discard uses a two-phase bounded drain and retains state on failure. |
+| 7. Fault injection and automated acceptance | Substantially complete; native fault matrix pending | Rust unit/integration/process suites, frontend component tests, typecheck, strict Clippy, formatting, production web build, and a Tauri CLI no-bundle build pass. The suite uses mock/probe input authorities. Physical-device faults, desktop transitions, and timing/resource stress on supported Windows systems remain outside automated proof. |
+| 8. Candidate and human-test gate | Candidate built; gate not cleared | `src-tauri/target/release/autoflow.exe` was produced only by `tauri build --no-bundle` and was not launched. It is an engineering candidate for further controlled validation, not approval for real macro playback. |
+
+### Architecture decisions in this checkpoint
+
+- Safety-service identity validation applies uniformly to ordinary commands.
+  Stop and Shutdown stay callable with stale identity because they are containment
+  operations. Play and recovery keep their deeper lifecycle checks.
+- A cleanup/release failure latch is authoritative even while the lifecycle
+  state mutex is contended. Normal finish, abort, activation, and recovery must
+  recheck the latch before publishing an input-enabled state.
+- Behavior recording uses a retained, explicit pending/incomplete state. Saving
+  consumes a stable claim only after training and configuration persistence
+  succeed. Discard closes admission, crosses a bounded queue barrier, resets the
+  recorder, and only then clears queue failure state.
+- Vision stays a data-returning API. Any later script action crosses a fresh
+  cancellation/action check and the input broker. Biomimetic trajectories check
+  cancellation and the run-scoped permit for every emitted point.
+- The existing three-process boundary was retained. Replacing it in this
+  checkpoint would add risk without closing the remaining native Windows proof
+  gap; the remaining work is fault acceptance of that boundary, not another
+  process-topology rewrite.
+
+### Automated evidence
+
+- Rust: `cargo test --manifest-path src-tauri/Cargo.toml --all-targets` passes
+  325 tests after the final recovery-identity fix. This includes deterministic
+  late-return tests and the recovery commit-race test.
+- Static Rust gates: `cargo fmt --manifest-path src-tauri/Cargo.toml --all --
+  --check` and strict all-target/all-feature Clippy pass.
+- Frontend: 12 Vitest files / 53 tests pass; TypeScript typecheck and the Vite
+  production build pass.
+- Candidate: `corepack pnpm exec tauri build --no-bundle` succeeds and produces
+  `src-tauri/target/release/autoflow.exe`. Generated `target` output remains
+  ignored and is not source material.
+- Repository: `git diff --check` passes. Independent review found one recovery
+  commit race: an old request could pass dispatch validation before a new fault.
+  The request's original generation and admission revision now reach the locked
+  recovery commit and are checked before and after publication. The reviewer
+  verified the fix and reported no remaining high- or medium-risk finding.
+
+### Human-test gate
+
+Real-input testing remains blocked. Before macro playback, a controlled Windows
+acceptance run must prove physical F12 latency and release/rearm, lock-screen and
+sleep/resume transitions, desktop and integrity-level changes, GUI/safety-service/
+executor crash and hang behavior, native partial SendInput/release failure, and
+cleanup/quarantine recovery. The candidate path above is recorded because the
+required Tauri CLI build succeeded; it is not a safety certification.
+
 ## Release-failure fault-latch checkpoint
 
 The central cleanup-report handler now fault-locks the lifecycle controller on

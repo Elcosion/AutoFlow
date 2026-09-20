@@ -9,6 +9,7 @@ import {
 import {
   deleteBehaviorProfileV2,
   deleteBehaviorSessionV2,
+  discardBehaviorRecording,
   generateBehaviorApi,
   getBehaviorRecordingStatus,
   openDataDirectory,
@@ -22,6 +23,8 @@ import type { BehaviorProfileV2 } from "../types/config";
 
 const idleStatus: BehaviorRecordingStatus = {
   active: false,
+  pending: false,
+  incomplete: false,
   captureStarted: false,
   durationMs: 0,
   eventCount: 0,
@@ -113,8 +116,26 @@ export function BehaviorPage() {
     try {
       const profile = await stopBehaviorRecording();
       await refresh();
+      setStatus(idleStatus);
       setSelectedId(profile.id);
       showNotice("V2 会话与去敏行为档案已分开保存");
+    } catch (reason) {
+      setError(toErrorMessage(reason));
+    }
+  };
+
+  const discard = async () => {
+    if (
+      !window.confirm(
+        "确认丢弃这次行为录制？该操作会永久删除尚未保存的采集结果。",
+      )
+    ) {
+      return;
+    }
+    try {
+      await discardBehaviorRecording();
+      setStatus(idleStatus);
+      showNotice("已丢弃本次行为录制");
     } catch (reason) {
       setError(toErrorMessage(reason));
     }
@@ -268,19 +289,34 @@ export function BehaviorPage() {
           <div className="settings-card-heading">
             <div>
               <span className="editor-kicker">原始会话</span>
-              <h2>{status.active ? "正在采集" : "采集一组训练数据"}</h2>
+              <h2>
+                {status.incomplete
+                  ? "录制不完整"
+                  : status.active
+                    ? "正在采集"
+                    : status.pending
+                      ? "录制结果待处理"
+                      : "采集一组训练数据"}
+              </h2>
             </div>
             <span
               className={`behavior-status ${status.active ? "is-live" : ""}`}
             >
-              <i /> {status.active ? "采集中" : "空闲"}
+              <i />{" "}
+              {status.incomplete
+                ? "不完整"
+                : status.active
+                  ? "采集中"
+                  : status.pending
+                    ? "待处理"
+                    : "空闲"}
             </span>
           </div>
           <div className="form-section">
             <label>
               <span>会话名称</span>
               <input
-                disabled={status.active}
+                disabled={status.active || status.pending || status.incomplete}
                 maxLength={64}
                 onChange={(event) => setSessionName(event.target.value)}
                 value={sessionName}
@@ -288,17 +324,47 @@ export function BehaviorPage() {
             </label>
           </div>
           <div className="behavior-recording-actions">
-            {status.active ? (
+            {status.incomplete ? (
               <button
                 className="button button-danger"
+                data-recording-action="discard"
+                onClick={() => void discard()}
+                type="button"
+              >
+                丢弃录制
+              </button>
+            ) : status.active ? (
+              <button
+                className="button button-danger"
+                data-recording-action="claim"
                 onClick={() => void stop()}
                 type="button"
               >
                 停止并训练 V2 档案
               </button>
+            ) : status.pending ? (
+              <>
+                <button
+                  className="button button-primary"
+                  data-recording-action="claim"
+                  onClick={() => void stop()}
+                  type="button"
+                >
+                  保存并训练
+                </button>
+                <button
+                  className="button button-danger"
+                  data-recording-action="discard"
+                  onClick={() => void discard()}
+                  type="button"
+                >
+                  丢弃录制
+                </button>
+              </>
             ) : (
               <button
                 className="button button-primary"
+                data-recording-action="start"
                 disabled={loading || !sessionName.trim()}
                 onClick={() => void start()}
                 type="button"
@@ -307,13 +373,19 @@ export function BehaviorPage() {
               </button>
             )}
             <span className="form-help">
-              建议包含多段移动、停顿、移动后点击和不同距离。
+              {status.incomplete
+                ? "采集队列未能确认完整排空，不能训练。请明确丢弃；若丢弃失败，请保留诊断并重启。"
+                : status.pending
+                  ? "急停已冻结完整结果。只有显式保存并训练或确认丢弃才会处理它。"
+                  : "建议包含多段移动、停顿、移动后点击和不同距离。"}
             </span>
           </div>
           <label className="behavior-retention-toggle">
             <input
               checked={config.retainBehaviorRecords}
-              disabled={status.active || saving}
+              disabled={
+                status.active || status.pending || status.incomplete || saving
+              }
               onChange={(event) => void updateRetention(event.target.checked)}
               type="checkbox"
             />

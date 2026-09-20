@@ -392,7 +392,13 @@ pub fn stop_behavior_recording(
     config.active_behavior_profile_v2_id = Some(profile.id.clone());
     config.behavior_policy.profile_id = Some(profile.id.clone());
     let _ = persist_config(&app, &state, config)?;
+    state.complete_behavior_recording_claim()?;
     Ok(profile)
+}
+
+#[tauri::command]
+pub fn discard_behavior_recording(state: State<'_, RuntimeState>) -> Result<(), AppError> {
+    state.discard_behavior_recording()
 }
 
 #[tauri::command]

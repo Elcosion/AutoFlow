@@ -85,6 +85,8 @@ export type MacroPlaybackStatus = {
 
 export type BehaviorRecordingStatus = {
   active: boolean;
+  pending: boolean;
+  incomplete: boolean;
   captureStarted: boolean;
   durationMs: number;
   eventCount: number;
@@ -606,10 +608,19 @@ export async function stopBehaviorRecording(): Promise<BehaviorProfileV2> {
   return invoke<BehaviorProfileV2>("stop_behavior_recording");
 }
 
+export async function discardBehaviorRecording(): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("Behavior recording requires the Windows desktop app");
+  }
+  await invoke("discard_behavior_recording");
+}
+
 export async function getBehaviorRecordingStatus(): Promise<BehaviorRecordingStatus> {
   if (!isTauriRuntime()) {
     return {
       active: false,
+      pending: false,
+      incomplete: false,
       captureStarted: false,
       durationMs: 0,
       eventCount: 0,

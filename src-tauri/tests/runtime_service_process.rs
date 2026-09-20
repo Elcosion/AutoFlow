@@ -219,6 +219,179 @@ fn play(client: &SafetyClient) -> Result<(), autoflow_lib::AppError> {
 fn status(client: &SafetyClient) -> Value {
     client.call(SafetyCommand::PlaybackStatus).expect("status")
 }
+
+#[test]
+fn process_dispatch_rejects_stale_identity_but_keeps_emergency_commands_live() {
+    use autoflow_lib::service_transport::{read_document, write_document};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::process::CommandExt;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+    struct Fixture {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        stdout: std::process::ChildStdout,
+        lease: OwnedHandle,
+        secret: String,
+        session: String,
+        sequence: u64,
+    }
+    impl Fixture {
+        fn spawn() -> Self {
+            let session = format!(
+                "{:032x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let secret = session.repeat(2);
+            let lease_name = format!("Local\\AutoFlow.ControlLease.{secret}");
+            let stop_name = format!("Local\\AutoFlow.StopSignal.{secret}");
+            let lease = unsafe {
+                CreateEventW(
+                    None,
+                    false,
+                    true,
+                    &windows::core::HSTRING::from(&lease_name),
+                )
+            }
+            .expect("private lease event");
+            let lease = unsafe { OwnedHandle::from_raw_handle(lease.0) };
+            let stop = unsafe {
+                CreateEventW(
+                    None,
+                    false,
+                    false,
+                    &windows::core::HSTRING::from(&stop_name),
+                )
+            }
+            .expect("private stop event");
+            let _stop = unsafe { OwnedHandle::from_raw_handle(stop.0) };
+            let mut child =
+                std::process::Command::new(env!("CARGO_BIN_EXE_runtime_protocol_probe"))
+                    .arg("--runtime-safety-mock")
+                    .creation_flags(0x08000000)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("own input-free child");
+            let mut stdin = child.stdin.take().expect("request pipe");
+            let mut stdout = child.stdout.take().expect("response pipe");
+            write_document(
+                &mut stdin,
+                &serde_json::json!({
+                    "version": 2,
+                    "secret": secret,
+                    "session": session,
+                    "parent_pid": std::process::id(),
+                    "lease_name": lease_name,
+                    "stop_name": stop_name,
+                    "config": AppConfig::default(),
+                    "image_root": std::env::temp_dir(),
+                }),
+            )
+            .expect("bootstrap request");
+            let ready: Value = read_document(&mut stdout).expect("bootstrap response");
+            assert_eq!(ready["result"]["Ok"], "ready");
+            Self {
+                child,
+                stdin,
+                stdout,
+                lease,
+                secret,
+                session,
+                sequence: 0,
+            }
+        }
+
+        fn call(&mut self, command: SafetyCommand, generation: u64, revision: u64) -> Value {
+            unsafe { SetEvent(HANDLE(self.lease.as_raw_handle())) }.expect("pulse private lease");
+            self.sequence += 1;
+            write_document(
+                &mut self.stdin,
+                &serde_json::json!({
+                    "version": 2,
+                    "secret": self.secret,
+                    "session": self.session,
+                    "sequence": self.sequence,
+                    "generation": generation,
+                    "admission_revision": revision,
+                    "command": command,
+                }),
+            )
+            .expect("service request");
+            read_document(&mut self.stdout).expect("service response")
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let mut fixture = Fixture::spawn();
+    let rule: MacroRule = serde_json::from_value(serde_json::json!({
+        "id": "process-identity-test",
+        "name": "input-free",
+        "program": {"kind": "macro", "steps": []}
+    }))
+    .expect("mock rule");
+    let started = fixture.call(
+        SafetyCommand::Play {
+            rule: Box::new(rule.clone()),
+        },
+        0,
+        0,
+    );
+    assert!(started["result"].get("Ok").is_some());
+    assert_eq!(started["admission_revision"], 1);
+
+    let stale_revision = fixture.call(SafetyCommand::PlaybackStatus, 0, 0);
+    assert_eq!(
+        stale_revision["result"]["Err"]["code"],
+        "safety_service_stale_request"
+    );
+    let active = fixture.call(SafetyCommand::PlaybackStatus, 0, 1);
+    assert_eq!(active["result"]["Ok"]["running"], true);
+
+    let stopped = fixture.call(SafetyCommand::Stop, u64::MAX, u64::MAX);
+    assert!(stopped["result"].get("Ok").is_some());
+    assert_eq!(stopped["generation"], 1);
+    assert_eq!(stopped["admission_revision"], 2);
+    let stale_generation = fixture.call(SafetyCommand::PlaybackStatus, 0, 1);
+    assert_eq!(
+        stale_generation["result"]["Err"]["code"],
+        "safety_service_stale_request"
+    );
+    let stale_play = fixture.call(
+        SafetyCommand::Play {
+            rule: Box::new(rule.clone()),
+        },
+        0,
+        1,
+    );
+    assert_eq!(
+        stale_play["result"]["Err"]["code"],
+        "safety_service_stale_request"
+    );
+    let idle = fixture.call(SafetyCommand::PlaybackStatus, 1, 2);
+    assert_eq!(idle["result"]["Ok"]["running"], false);
+
+    let restarted = fixture.call(
+        SafetyCommand::Play {
+            rule: Box::new(rule),
+        },
+        1,
+        2,
+    );
+    assert_eq!(restarted["result"]["Ok"], Value::Null);
+    let shutdown = fixture.call(SafetyCommand::Shutdown, 0, 0);
+    assert_eq!(shutdown["result"]["Ok"], true);
+}
+
 #[test]
 fn rejected_start_cannot_destroy_active_service_run() {
     let client = client();
@@ -238,8 +411,14 @@ fn independent_stop_signal_revokes_without_a_stop_rpc() {
     play(&client).expect("admission");
     client.stop_signal().expect("priority event");
     let deadline = Instant::now() + Duration::from_secs(2);
-    while status(&client)["running"] == true {
+    loop {
         assert!(Instant::now() < deadline, "priority stop not observed");
+        match client.call::<Value>(SafetyCommand::PlaybackStatus) {
+            Ok(status) if status["running"] == false => break,
+            Ok(_) => {}
+            Err(error) if error.code == "safety_service_stale_request" => {}
+            Err(error) => panic!("unexpected status rejection: {error:?}"),
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(client

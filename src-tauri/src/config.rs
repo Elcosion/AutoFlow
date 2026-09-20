@@ -16,6 +16,41 @@ use std::collections::HashSet;
 
 pub const SCHEMA_VERSION: u32 = 6;
 
+pub(crate) fn normalized_virtual_key(key: &str) -> Option<u32> {
+    let normalized = key.trim().to_ascii_uppercase();
+    let named = [
+        ("CTRL", 0x11),
+        ("CONTROL", 0x11),
+        ("ALT", 0x12),
+        ("SHIFT", 0x10),
+        ("WIN", 0x5B),
+        ("ESC", 0x1B),
+        ("ENTER", 0x0D),
+        ("SPACE", 0x20),
+        ("TAB", 0x09),
+        ("BACKSPACE", 0x08),
+        ("CAPSLOCK", 0x14),
+        ("LEFT", 0x25),
+        ("RIGHT", 0x27),
+        ("UP", 0x26),
+        ("DOWN", 0x28),
+    ];
+    if let Some((_, value)) = named.iter().find(|(name, _)| *name == normalized) {
+        return Some(*value);
+    }
+    if normalized.len() == 1 {
+        let byte = normalized.as_bytes()[0];
+        if byte.is_ascii_uppercase() || byte.is_ascii_digit() {
+            return Some(u32::from(byte));
+        }
+    }
+    normalized
+        .strip_prefix('F')
+        .and_then(|number| number.parse::<u32>().ok())
+        .filter(|number| (1..=24).contains(number))
+        .map(|number| 0x70 + number - 1)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -426,6 +461,12 @@ impl AppConfig {
                 "紧急停止键不能为空，请设置为 F12 或其他按键",
             ));
         }
+        let emergency_vk = normalized_virtual_key(&self.emergency_stop).ok_or_else(|| {
+            AppError::invalid(
+                "emergency_stop_unsupported",
+                "紧急停止键无法识别；请使用 F12 或其他受支持的单键",
+            )
+        })?;
 
         if !self.biomimetic_intensity.is_finite()
             || !(0.0..=1.0).contains(&self.biomimetic_intensity)
@@ -639,6 +680,17 @@ impl AppConfig {
                     "启用宏前至少需要设置一个触发键",
                 ));
             }
+            if rule
+                .trigger_keys
+                .iter()
+                .filter_map(|key| normalized_virtual_key(key))
+                .any(|vk| vk == emergency_vk)
+            {
+                return Err(AppError::invalid(
+                    "macro_emergency_key_conflict",
+                    "宏快捷键不能包含紧急停止键；请更换快捷键组合",
+                ));
+            }
             let trigger_keys = rule
                 .trigger_keys
                 .iter()
@@ -791,6 +843,29 @@ mod tests {
         SourceRetention,
     };
 
+    fn macro_fixture(id: &str, trigger_keys: Vec<&str>, mode: MacroMode) -> MacroRule {
+        MacroRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            import_error: None,
+            enabled: true,
+            trigger_keys: trigger_keys.into_iter().map(str::to_string).collect(),
+            mode,
+            repeat_count: 3,
+            speed: 1.0,
+            record_mouse_move: true,
+            record_mouse_clicks: true,
+            target: None,
+            behavior_policy: None,
+            program: AutomationProgram::Macro {
+                steps: vec![MacroStep::Delay {
+                    duration_ms: 10,
+                    duration_max_ms: None,
+                }],
+            },
+        }
+    }
+
     #[test]
     fn default_config_is_valid() {
         assert!(AppConfig::default().validate().is_ok());
@@ -887,6 +962,55 @@ mod tests {
             .validate()
             .expect_err("duplicate macro trigger should fail");
         assert_eq!(error.code, "macro_conflict");
+    }
+
+    #[test]
+    fn global_hold_and_ordinary_shortcuts_validate() {
+        let mut config = AppConfig::default();
+        config.macros.push(macro_fixture(
+            "ordinary-shortcut",
+            vec!["Ctrl", "F9"],
+            MacroMode::Once,
+        ));
+        config
+            .validate()
+            .expect("ordinary shortcut should validate");
+
+        config.macros[0].mode = MacroMode::Hold;
+        config
+            .validate()
+            .expect("enabled Hold with a global shortcut should validate");
+    }
+
+    #[test]
+    fn macro_shortcuts_cannot_contain_default_or_custom_emergency_key() {
+        for (keys, mode) in [
+            (vec!["F12"], MacroMode::Hold),
+            (vec!["Ctrl", "F12"], MacroMode::Once),
+        ] {
+            let mut config = AppConfig::default();
+            config
+                .macros
+                .push(macro_fixture("emergency-conflict", keys, mode));
+            assert_eq!(
+                config.validate().expect_err("F12 conflict").code,
+                "macro_emergency_key_conflict"
+            );
+        }
+
+        let mut config = AppConfig {
+            emergency_stop: "F11".to_string(),
+            ..AppConfig::default()
+        };
+        config.macros.push(macro_fixture(
+            "custom-emergency-conflict",
+            vec!["Shift", "F11"],
+            MacroMode::Hold,
+        ));
+        assert_eq!(
+            config.validate().expect_err("custom conflict").code,
+            "macro_emergency_key_conflict"
+        );
     }
 
     #[test]
