@@ -604,6 +604,9 @@ struct MacroTriggerTask {
     rule: MacroRule,
     start_timing: TriggerStartTiming,
     hold_epoch: Option<u64>,
+    trigger_vk: Option<u32>,
+    hold_owner_vk: Option<u32>,
+    hold_modifier_vks: Vec<u32>,
     generation: u64,
     controller_generation: u64,
     admission_revision: u64,
@@ -630,7 +633,7 @@ struct HoldLifecycleIdentity {
     epoch: u64,
     macro_id: String,
     rule_snapshot: TriggerMacroSnapshot,
-    trigger_vks: Vec<u32>,
+    owner_vk: u32,
     phase: HoldLifecyclePhase,
     cancelled: bool,
 }
@@ -639,7 +642,7 @@ struct HoldLifecycleIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TriggerStartTiming {
     ReleaseGated,
-    HoldImmediate,
+    HoldModifierRelease,
 }
 
 #[cfg(windows)]
@@ -741,6 +744,7 @@ enum TriggerReleaseCancellation {
     AdmissionRevision,
     ConfigRevision,
     HoldLifecycle,
+    HoldOwnerReleased,
 }
 
 #[cfg(windows)]
@@ -786,6 +790,15 @@ struct TriggerReleaseGate {
 struct TriggerReleaseSample {
     elapsed: Duration,
     any_trigger_key_down: bool,
+    status: TriggerReleaseGateStatus,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct HoldModifierReleaseSample {
+    elapsed: Duration,
+    owner_down: bool,
+    any_modifier_down: bool,
     status: TriggerReleaseGateStatus,
 }
 
@@ -862,6 +875,50 @@ fn drive_trigger_release_gate(
 }
 
 #[cfg(windows)]
+fn drive_hold_modifier_release_gate(
+    has_modifiers: bool,
+    gate: TriggerReleaseGate,
+    mut sample: impl FnMut() -> HoldModifierReleaseSample,
+    pause: impl FnMut(Duration),
+) -> TriggerReleaseGateOutcome {
+    if !has_modifiers {
+        let observation = sample();
+        return match observation.status {
+            TriggerReleaseGateStatus::Shutdown => TriggerReleaseGateOutcome::Shutdown,
+            TriggerReleaseGateStatus::Cancelled(reason) => {
+                TriggerReleaseGateOutcome::Cancelled(reason)
+            }
+            TriggerReleaseGateStatus::Current if observation.owner_down => {
+                TriggerReleaseGateOutcome::Ready
+            }
+            TriggerReleaseGateStatus::Current => {
+                TriggerReleaseGateOutcome::Cancelled(TriggerReleaseCancellation::HoldOwnerReleased)
+            }
+        };
+    }
+    drive_trigger_release_gate(
+        gate,
+        || {
+            let observation = sample();
+            TriggerReleaseSample {
+                elapsed: observation.elapsed,
+                any_trigger_key_down: observation.any_modifier_down,
+                status: if matches!(observation.status, TriggerReleaseGateStatus::Current)
+                    && !observation.owner_down
+                {
+                    TriggerReleaseGateStatus::Cancelled(
+                        TriggerReleaseCancellation::HoldOwnerReleased,
+                    )
+                } else {
+                    observation.status
+                },
+            }
+        },
+        pause,
+    )
+}
+
+#[cfg(windows)]
 struct TriggerPendingReset<'a>(&'a AtomicBool);
 
 #[cfg(windows)]
@@ -906,7 +963,45 @@ fn trigger_release_cancellation_name(reason: TriggerReleaseCancellation) -> &'st
         TriggerReleaseCancellation::AdmissionRevision => "admission_revision",
         TriggerReleaseCancellation::ConfigRevision => "config_revision",
         TriggerReleaseCancellation::HoldLifecycle => "hold_lifecycle",
+        TriggerReleaseCancellation::HoldOwnerReleased => "hold_owner_released",
     }
+}
+
+#[cfg(windows)]
+fn hold_diagnostic_fields(
+    macro_id: Option<&str>,
+    decision: &str,
+    epoch: Option<u64>,
+    run_token: Option<RunToken>,
+    trigger_vk: Option<u32>,
+    owner_vk: Option<u32>,
+    released_vk: Option<u32>,
+) -> Vec<(String, String)> {
+    let mut fields = vec![
+        ("mode".to_string(), "hold".to_string()),
+        ("source".to_string(), "low_level_keyboard".to_string()),
+        ("decision".to_string(), decision.to_string()),
+    ];
+    if let Some(macro_id) = macro_id {
+        fields.push(("macro_id".to_string(), macro_id.to_string()));
+    }
+    if let Some(epoch) = epoch {
+        fields.push(("hold_epoch".to_string(), epoch.to_string()));
+    }
+    if let Some(token) = run_token.filter(|token| token.id != 0) {
+        fields.push(("run_id".to_string(), token.id.to_string()));
+        fields.push(("run_generation".to_string(), token.generation.to_string()));
+    }
+    if let Some(vk) = trigger_vk {
+        fields.push(("canonical_vk".to_string(), format!("{vk:#04x}")));
+    }
+    if let Some(vk) = owner_vk {
+        fields.push(("owner_vk".to_string(), format!("{vk:#04x}")));
+    }
+    if let Some(vk) = released_vk {
+        fields.push(("released_vk".to_string(), format!("{vk:#04x}")));
+    }
+    fields
 }
 #[cfg(windows)]
 struct RemapTask {
@@ -3014,10 +3109,7 @@ impl HookShared {
     }
 
     #[cfg(windows)]
-    fn publish_hold_lifecycle(&self, rule: &MacroRule) -> Option<u64> {
-        let mut trigger_vks = macro_trigger_vks(&rule.trigger_keys)?;
-        trigger_vks.sort_unstable();
-        trigger_vks.dedup();
+    fn publish_hold_lifecycle(&self, rule: &MacroRule, owner_vk: u32) -> Option<u64> {
         let epoch = self.allocate_hold_epoch()?;
         let Ok(mut current) = self.hold_lifecycle.try_lock() else {
             return None;
@@ -3027,19 +3119,16 @@ impl HookShared {
         }
 
         let mut words = [0_u64; 4];
-        for vk in &trigger_vks {
-            let index = usize::try_from(*vk / 64).ok()?;
-            let bit = *vk % 64;
-            if index >= words.len() {
-                return None;
-            }
-            words[index] |= 1_u64 << bit;
+        let index = usize::try_from(owner_vk / 64).ok()?;
+        if index >= words.len() {
+            return None;
         }
+        words[index] |= 1_u64 << (owner_vk % 64);
         *current = Some(HoldLifecycleIdentity {
             epoch,
             macro_id: rule.id.clone(),
             rule_snapshot: trigger_macro_snapshot(rule),
-            trigger_vks,
+            owner_vk,
             phase: HoldLifecyclePhase::Pending,
             cancelled: false,
         });
@@ -3272,6 +3361,7 @@ impl HookShared {
                 let Some(epoch) = self.cancel_matching_hold_epoch_atomic(vk) else {
                     return false;
                 };
+                matched_epoch = Some(epoch);
                 bound_token = self
                     .load_hold_atomic_snapshot(vk)
                     .filter(|snapshot| snapshot.epoch == epoch && snapshot.trigger_matches)
@@ -3299,6 +3389,21 @@ impl HookShared {
         if !matched {
             return false;
         }
+        // Cancellation watermark publication and any exact-token revocation
+        // have already completed. Diagnostic allocation/queue loss therefore
+        // cannot delay or undo Hold input-permission revocation.
+        self.record_safety_async(
+            "macro_hold_release_cancelled",
+            hold_diagnostic_fields(
+                None,
+                "release_cancellation_published",
+                matched_epoch,
+                bound_token,
+                None,
+                Some(vk),
+                Some(vk),
+            ),
+        );
         true
     }
 
@@ -3338,6 +3443,16 @@ impl HookShared {
             }
         }
         None
+    }
+
+    #[cfg(windows)]
+    fn owns_current_hold_owner_keydown(&self, vk: u32) -> bool {
+        let Some(snapshot) = self.load_hold_atomic_snapshot(vk) else {
+            return false;
+        };
+        snapshot.trigger_matches
+            && self.hold_cancelled_epoch.load(Ordering::Acquire) < snapshot.epoch
+            && self.hold_lifecycle_epoch.load(Ordering::Acquire) == snapshot.epoch
     }
 
     #[cfg(windows)]
@@ -3382,36 +3497,54 @@ impl HookShared {
                     epoch: task.hold_epoch,
                     transferred_to_playback: false,
                 };
+                if matches!(task.start_timing, TriggerStartTiming::HoldModifierRelease) {
+                    shared.record_safety_async(
+                        "macro_hold_modifier_wait",
+                        hold_diagnostic_fields(
+                            Some(&task.rule.id),
+                            if task.hold_modifier_vks.is_empty() {
+                                "owner_only_ready_check"
+                            } else {
+                                "waiting_for_modifier_release"
+                            },
+                            task.hold_epoch,
+                            None,
+                            task.trigger_vk,
+                            task.hold_owner_vk,
+                            None,
+                        ),
+                    );
+                }
                 let outcome = match task.start_timing {
                     TriggerStartTiming::ReleaseGated => wait_for_trigger_release(&shared, &task),
-                    TriggerStartTiming::HoldImmediate => {
-                        match trigger_release_gate_status(&shared, &task) {
-                            TriggerReleaseGateStatus::Current => TriggerReleaseGateOutcome::Ready,
-                            TriggerReleaseGateStatus::Shutdown => {
-                                TriggerReleaseGateOutcome::Shutdown
-                            }
-                            TriggerReleaseGateStatus::Cancelled(reason) => {
-                                TriggerReleaseGateOutcome::Cancelled(reason)
-                            }
-                        }
+                    TriggerStartTiming::HoldModifierRelease => {
+                        wait_for_hold_modifier_release(&shared, &task)
                     }
                 };
                 if !matches!(outcome, TriggerReleaseGateOutcome::Ready) {
                     let (event, reason) = match outcome {
-                        TriggerReleaseGateOutcome::Timeout => {
-                            ("macro_trigger_release_timeout", "physical_release_timeout")
-                        }
+                        TriggerReleaseGateOutcome::Timeout => (
+                            if matches!(task.start_timing, TriggerStartTiming::HoldModifierRelease)
+                            {
+                                "macro_hold_modifier_release_timeout"
+                            } else {
+                                "macro_trigger_release_timeout"
+                            },
+                            "physical_release_timeout",
+                        ),
                         TriggerReleaseGateOutcome::Shutdown => (
-                            if matches!(task.start_timing, TriggerStartTiming::HoldImmediate) {
-                                "macro_trigger_immediate_shutdown"
+                            if matches!(task.start_timing, TriggerStartTiming::HoldModifierRelease)
+                            {
+                                "macro_hold_modifier_release_shutdown"
                             } else {
                                 "macro_trigger_release_shutdown"
                             },
                             "shutdown",
                         ),
                         TriggerReleaseGateOutcome::Cancelled(reason) => (
-                            if matches!(task.start_timing, TriggerStartTiming::HoldImmediate) {
-                                "macro_trigger_immediate_cancelled"
+                            if matches!(task.start_timing, TriggerStartTiming::HoldModifierRelease)
+                            {
+                                "macro_hold_modifier_release_cancelled"
                             } else {
                                 "macro_trigger_release_cancelled"
                             },
@@ -3428,13 +3561,29 @@ impl HookShared {
                                 "start_timing",
                                 match task.start_timing {
                                     TriggerStartTiming::ReleaseGated => "release_gated",
-                                    TriggerStartTiming::HoldImmediate => "hold_immediate",
+                                    TriggerStartTiming::HoldModifierRelease => {
+                                        "hold_modifier_release"
+                                    }
                                 }
                                 .to_string(),
                             ),
                         ],
                     );
                     return;
+                }
+                if matches!(task.start_timing, TriggerStartTiming::HoldModifierRelease) {
+                    shared.record_safety_async(
+                        "macro_hold_modifier_ready",
+                        hold_diagnostic_fields(
+                            Some(&task.rule.id),
+                            "modifier_release_stable",
+                            task.hold_epoch,
+                            None,
+                            task.trigger_vk,
+                            task.hold_owner_vk,
+                            None,
+                        ),
+                    );
                 }
                 if let Err(error) = shared.start_hotkey_playback_at_revision(
                     task.rule.clone(),
@@ -3443,6 +3592,20 @@ impl HookShared {
                     task.config_revision,
                     task.hold_epoch,
                 ) {
+                    if let Some(epoch) = task.hold_epoch {
+                        shared.record_safety_async(
+                            "macro_hold_start_failed",
+                            hold_diagnostic_fields(
+                                Some(&task.rule.id),
+                                &error.code,
+                                Some(epoch),
+                                None,
+                                task.trigger_vk,
+                                task.hold_owner_vk,
+                                None,
+                            ),
+                        );
+                    }
                     if should_show_start_error(&error.code) {
                         shared.set_playback_start_error(error.message.clone());
                         shared
@@ -3451,6 +3614,25 @@ impl HookShared {
                     }
                     shared.record_safety("macro_trigger_failed", &[("error", error.message)]);
                 } else {
+                    if let Some(epoch) = task.hold_epoch {
+                        let run_token = task
+                            .hold_owner_vk
+                            .and_then(|vk| shared.load_hold_atomic_snapshot(vk))
+                            .filter(|snapshot| snapshot.epoch == epoch)
+                            .and_then(|snapshot| snapshot.bound_token);
+                        shared.record_safety_async(
+                            "macro_hold_started",
+                            hold_diagnostic_fields(
+                                Some(&task.rule.id),
+                                "started",
+                                Some(epoch),
+                                run_token,
+                                task.trigger_vk,
+                                task.hold_owner_vk,
+                                None,
+                            ),
+                        );
+                    }
                     hold_reset.transfer_to_playback();
                 }
             },
@@ -3473,10 +3655,22 @@ impl HookShared {
         rule: &MacroRule,
         generation: u64,
         config_revision: u64,
+        trigger_vk: Option<u32>,
     ) -> bool {
         let admission_revision = self.controller.background_generation();
         let controller_generation = self.controller.generation();
         let emergency_vk = self.emergency_vk.load(Ordering::Acquire);
+        let start_timing = trigger_start_timing(rule);
+        let hold_parts = matches!(start_timing, TriggerStartTiming::HoldModifierRelease)
+            .then(|| crate::config::hold_trigger_parts(&rule.trigger_keys))
+            .flatten();
+        if matches!(start_timing, TriggerStartTiming::HoldModifierRelease) && hold_parts.is_none() {
+            self.record_safety_async(
+                "macro_hold_trigger_invalid",
+                vec![("macro_id".into(), rule.id.clone())],
+            );
+            return false;
+        }
         // At most one admitted startup, including the task currently handled.
         // This is not a deferred playback queue: busy starts are never stored.
         if self.shutdown.load(Ordering::Acquire)
@@ -3496,9 +3690,12 @@ impl HookShared {
         {
             return false;
         }
-        let start_timing = trigger_start_timing(rule);
-        let hold_epoch = if matches!(start_timing, TriggerStartTiming::HoldImmediate) {
-            match self.publish_hold_lifecycle(rule) {
+        let hold_epoch = if matches!(start_timing, TriggerStartTiming::HoldModifierRelease) {
+            let Some(parts) = hold_parts.as_ref() else {
+                self.trigger_pending.store(false, Ordering::Release);
+                return false;
+            };
+            match self.publish_hold_lifecycle(rule, parts.owner_vk) {
                 Some(epoch) => Some(epoch),
                 None => {
                     self.trigger_pending.store(false, Ordering::Release);
@@ -3516,6 +3713,12 @@ impl HookShared {
             rule: rule.clone(),
             start_timing,
             hold_epoch,
+            trigger_vk,
+            hold_owner_vk: hold_parts.as_ref().map(|parts| parts.owner_vk),
+            hold_modifier_vks: hold_parts
+                .as_ref()
+                .map(|parts| parts.modifier_vks.clone())
+                .unwrap_or_default(),
             generation,
             controller_generation,
             admission_revision,
@@ -3535,6 +3738,20 @@ impl HookShared {
                 vec![("macro_id".into(), rule.id.clone())],
             );
             return false;
+        }
+        if let Some(epoch) = hold_epoch {
+            self.record_safety_async(
+                "macro_hold_trigger_admitted",
+                hold_diagnostic_fields(
+                    Some(&rule.id),
+                    "worker_admitted",
+                    Some(epoch),
+                    None,
+                    trigger_vk,
+                    hold_parts.as_ref().map(|parts| parts.owner_vk),
+                    None,
+                ),
+            );
         }
         true
     }
@@ -4231,6 +4448,37 @@ fn trigger_keys_are_physically_down(
 }
 
 #[cfg(windows)]
+fn hold_keys_physical_state(
+    shared: &HookShared,
+    owner_vk: u32,
+    modifier_vks: &[u32],
+) -> Result<(bool, bool), TriggerReleaseCancellation> {
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        return Err(TriggerReleaseCancellation::PhysicalLedgerUncertain);
+    }
+    let ledger = shared
+        .physical_pressed
+        .try_lock()
+        .map(|ledger| ledger.clone())
+        .map_err(|_| {
+            shared
+                .physical_ledger_uncertain
+                .store(true, Ordering::Release);
+            TriggerReleaseCancellation::PhysicalLedgerUncertain
+        })?;
+    if shared.physical_ledger_uncertain.load(Ordering::Acquire) {
+        return Err(TriggerReleaseCancellation::PhysicalLedgerUncertain);
+    }
+    let owner_down =
+        trigger_down_from_ledger_or_async(&ledger, owner_vk, trigger_vk_is_physically_down);
+    let any_modifier_down = modifier_vks
+        .iter()
+        .copied()
+        .any(|vk| trigger_down_from_ledger_or_async(&ledger, vk, trigger_vk_is_physically_down));
+    Ok((owner_down, any_modifier_down))
+}
+
+#[cfg(windows)]
 fn wait_for_trigger_release(
     shared: &HookShared,
     task: &MacroTriggerTask,
@@ -4259,6 +4507,45 @@ fn wait_for_trigger_release(
             TriggerReleaseSample {
                 elapsed: started.elapsed(),
                 any_trigger_key_down,
+                status,
+            }
+        },
+        thread::sleep,
+    )
+}
+
+#[cfg(windows)]
+fn wait_for_hold_modifier_release(
+    shared: &HookShared,
+    task: &MacroTriggerTask,
+) -> TriggerReleaseGateOutcome {
+    let Some(owner_vk) = task.hold_owner_vk else {
+        return TriggerReleaseGateOutcome::Cancelled(
+            TriggerReleaseCancellation::TriggerConfiguration,
+        );
+    };
+    let started = Instant::now();
+    drive_hold_modifier_release_gate(
+        !task.hold_modifier_vks.is_empty(),
+        TriggerReleaseGate::new(TRIGGER_RELEASE_STABLE, TRIGGER_RELEASE_TIMEOUT),
+        || {
+            let mut status = trigger_release_gate_status(shared, task);
+            let (owner_down, any_modifier_down) =
+                if matches!(status, TriggerReleaseGateStatus::Current) {
+                    match hold_keys_physical_state(shared, owner_vk, &task.hold_modifier_vks) {
+                        Ok(state) => state,
+                        Err(reason) => {
+                            status = TriggerReleaseGateStatus::Cancelled(reason);
+                            (false, false)
+                        }
+                    }
+                } else {
+                    (false, false)
+                };
+            HoldModifierReleaseSample {
+                elapsed: started.elapsed(),
+                owner_down,
+                any_modifier_down,
                 status,
             }
         },
@@ -4980,6 +5267,14 @@ unsafe extern "system" fn keyboard_hook(
         } else if is_up {
             shared.emergency_key_down.store(false, Ordering::Release);
         }
+        return LRESULT(1);
+    }
+
+    // Once a Hold chord has been admitted, its ordinary owner key belongs to
+    // that lifecycle until owner key-up or retirement. Modifier release makes
+    // the full chord stop matching, so suppress physical auto-repeat here,
+    // before configuration routing, using only the published atomic identity.
+    if is_down && shared.owns_current_hold_owner_keydown(vk) {
         return LRESULT(1);
     }
 
@@ -6099,7 +6394,22 @@ fn process_macro_key_down(
             }
             HotkeyPlaybackAction::StartAfterRelease | HotkeyPlaybackAction::StartImmediate => {}
         }
-        shared.submit_macro_trigger(rule, request_generation, config_revision);
+        if matches!(effective_hotkey_mode(rule), MacroMode::Hold) {
+            shared.record_safety_async(
+                "macro_hold_trigger_matched",
+                hold_diagnostic_fields(
+                    Some(&rule.id),
+                    "matched",
+                    None,
+                    None,
+                    Some(current_vk),
+                    crate::config::hold_trigger_parts(&rule.trigger_keys)
+                        .map(|parts| parts.owner_vk),
+                    None,
+                ),
+            );
+        }
+        shared.submit_macro_trigger(rule, request_generation, config_revision, Some(current_vk));
         return true;
     }
     false
@@ -6130,7 +6440,7 @@ fn hotkey_playback_action(mode: MacroMode, playback_running: bool) -> HotkeyPlay
 #[cfg(windows)]
 fn trigger_start_timing(rule: &MacroRule) -> TriggerStartTiming {
     if matches!(effective_hotkey_mode(rule), MacroMode::Hold) {
-        TriggerStartTiming::HoldImmediate
+        TriggerStartTiming::HoldModifierRelease
     } else {
         TriggerStartTiming::ReleaseGated
     }
@@ -6174,10 +6484,7 @@ fn cancel_hold_identity_for_key(
     matched_epoch: &mut Option<u64>,
     bound_token: &mut Option<RunToken>,
 ) -> bool {
-    let Some(identity) = current
-        .as_mut()
-        .filter(|identity| identity.trigger_vks.contains(&vk))
-    else {
+    let Some(identity) = current.as_mut().filter(|identity| identity.owner_vk == vk) else {
         return false;
     };
     *matched_epoch = Some(identity.epoch);
@@ -6540,7 +6847,7 @@ fn process_native_macro_hotkey(shared: &Arc<HookShared>, hotkey_id: i32) {
         }
         HotkeyPlaybackAction::StartAfterRelease | HotkeyPlaybackAction::StartImmediate => {}
     }
-    shared.submit_macro_trigger(rule, request_generation, config_revision);
+    shared.submit_macro_trigger(rule, request_generation, config_revision, None);
 }
 
 #[cfg(windows)]
@@ -6600,7 +6907,7 @@ fn process_native_clicker_hotkey(shared: &Arc<HookShared>) {
         HotkeyPlaybackAction::StartAfterRelease => {}
         HotkeyPlaybackAction::StartImmediate | HotkeyPlaybackAction::Ignore => return,
     }
-    shared.submit_macro_trigger(rule, request_generation, config_revision);
+    shared.submit_macro_trigger(rule, request_generation, config_revision, None);
 }
 
 #[cfg(windows)]
@@ -10216,7 +10523,7 @@ mod tests {
             .load(Ordering::Acquire);
         assert!(!service
             .shared
-            .submit_macro_trigger(&rule, generation, config_revision));
+            .submit_macro_trigger(&rule, generation, config_revision, None));
         assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -10234,14 +10541,14 @@ mod tests {
         assert!(service.shared.trigger_tasks.set(worker).is_ok());
         assert!(service
             .shared
-            .submit_macro_trigger(&rule, generation, config_revision));
+            .submit_macro_trigger(&rule, generation, config_revision, None));
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("handling");
         for _ in 0..100 {
             assert!(!service
                 .shared
-                .submit_macro_trigger(&rule, generation, config_revision));
+                .submit_macro_trigger(&rule, generation, config_revision, None));
         }
         service
             .shared
@@ -10249,7 +10556,7 @@ mod tests {
             .fetch_add(1, Ordering::AcqRel);
         assert!(!service
             .shared
-            .submit_macro_trigger(&rule, generation, config_revision));
+            .submit_macro_trigger(&rule, generation, config_revision, None));
         service.shared.trigger_tasks.get().expect("queue").close();
         release_tx.send(()).expect("release fixture");
         assert!(service.shared.controller.is_quiescent());
@@ -10340,6 +10647,143 @@ mod tests {
     }
 
     #[test]
+    fn hold_combo_matches_in_both_entry_orders_and_waits_for_all_modifiers() {
+        use std::collections::VecDeque;
+
+        let mut rule = pending_trigger_task(&test_hook_service()).rule;
+        rule.mode = MacroMode::Hold;
+        rule.trigger_keys = vec!["Ctrl".into(), "Shift".into(), "7".into()];
+        let pressed = HashSet::from([0x11, 0x10, 0x37]);
+        assert!(super::macro_rule_matches_key_down(&rule, 0x37, &pressed));
+        assert!(super::macro_rule_matches_key_down(&rule, 0x11, &pressed));
+
+        let mut samples = VecDeque::from([
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::ZERO,
+                owner_down: true,
+                any_modifier_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            // Only one modifier was released; the aggregate remains down.
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(12),
+                owner_down: true,
+                any_modifier_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(20),
+                owner_down: true,
+                any_modifier_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            // Re-press resets the 18 ms stability window.
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(30),
+                owner_down: true,
+                any_modifier_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(40),
+                owner_down: true,
+                any_modifier_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(58),
+                owner_down: true,
+                any_modifier_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(59),
+                owner_down: true,
+                any_modifier_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+        ]);
+        assert_eq!(
+            super::drive_hold_modifier_release_gate(
+                true,
+                super::TriggerReleaseGate::new(
+                    std::time::Duration::from_millis(18),
+                    std::time::Duration::from_secs(5),
+                ),
+                || samples.pop_front().expect("Hold gate sample"),
+                |_| {},
+            ),
+            super::TriggerReleaseGateOutcome::Ready
+        );
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn hold_owner_release_is_terminal_but_owner_only_hold_is_immediate() {
+        use std::collections::VecDeque;
+
+        let mut released = VecDeque::from([
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::ZERO,
+                owner_down: true,
+                any_modifier_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(3),
+                owner_down: false,
+                any_modifier_down: true,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+            // A re-press must not create a new start in this epoch.
+            super::HoldModifierReleaseSample {
+                elapsed: std::time::Duration::from_millis(6),
+                owner_down: true,
+                any_modifier_down: false,
+                status: super::TriggerReleaseGateStatus::Current,
+            },
+        ]);
+        assert_eq!(
+            super::drive_hold_modifier_release_gate(
+                true,
+                super::TriggerReleaseGate::new(
+                    std::time::Duration::from_millis(18),
+                    std::time::Duration::from_secs(5),
+                ),
+                || released.pop_front().expect("Hold release sample"),
+                |_| {},
+            ),
+            super::TriggerReleaseGateOutcome::Cancelled(
+                super::TriggerReleaseCancellation::HoldOwnerReleased
+            )
+        );
+        assert_eq!(released.len(), 1);
+
+        let mut samples = 0;
+        assert_eq!(
+            super::drive_hold_modifier_release_gate(
+                false,
+                super::TriggerReleaseGate::new(
+                    std::time::Duration::from_millis(18),
+                    std::time::Duration::from_secs(5),
+                ),
+                || {
+                    samples += 1;
+                    super::HoldModifierReleaseSample {
+                        elapsed: std::time::Duration::ZERO,
+                        owner_down: true,
+                        any_modifier_down: false,
+                        status: super::TriggerReleaseGateStatus::Current,
+                    }
+                },
+                |_| {},
+            ),
+            super::TriggerReleaseGateOutcome::Ready
+        );
+        assert_eq!(samples, 1);
+    }
+
+    #[test]
     fn final_admission_repress_resets_stability_and_never_returns_ready() {
         use std::collections::VecDeque;
 
@@ -10405,6 +10849,9 @@ mod tests {
             },
             start_timing: super::TriggerStartTiming::ReleaseGated,
             hold_epoch: None,
+            trigger_vk: Some(0x78),
+            hold_owner_vk: None,
+            hold_modifier_vks: Vec::new(),
             generation: service.shared.emergency_generation.load(Ordering::Acquire),
             controller_generation: service.shared.controller.generation(),
             admission_revision: service.shared.controller.background_generation(),
@@ -10444,17 +10891,26 @@ mod tests {
     fn configured_trigger_task(service: &HookService) -> super::MacroTriggerTask {
         let rule = service.shared.config.lock().expect("config").macros[0].clone();
         let start_timing = super::trigger_start_timing(&rule);
-        let hold_epoch =
-            matches!(start_timing, super::TriggerStartTiming::HoldImmediate).then(|| {
+        let hold_parts = crate::config::hold_trigger_parts(&rule.trigger_keys);
+        let hold_epoch = matches!(start_timing, super::TriggerStartTiming::HoldModifierRelease)
+            .then(|| {
                 service
                     .shared
-                    .publish_hold_lifecycle(&rule)
+                    .publish_hold_lifecycle(
+                        &rule,
+                        hold_parts.as_ref().expect("valid Hold trigger").owner_vk,
+                    )
                     .expect("publish test Hold lifecycle")
             });
         super::MacroTriggerTask {
             rule,
             start_timing,
             hold_epoch,
+            trigger_vk: Some(0x78),
+            hold_owner_vk: hold_parts.as_ref().map(|parts| parts.owner_vk),
+            hold_modifier_vks: hold_parts
+                .map(|parts| parts.modifier_vks)
+                .unwrap_or_default(),
             generation: service.shared.emergency_generation.load(Ordering::Acquire),
             controller_generation: service.shared.controller.generation(),
             admission_revision: service.shared.controller.background_generation(),
@@ -10463,6 +10919,16 @@ mod tests {
                 .trigger_config_revision
                 .load(Ordering::Acquire),
         }
+    }
+
+    fn publish_test_hold_lifecycle(service: &HookService, rule: &MacroRule) -> u64 {
+        let owner_vk = crate::config::hold_trigger_parts(&rule.trigger_keys)
+            .expect("valid test Hold trigger")
+            .owner_vk;
+        service
+            .shared
+            .publish_hold_lifecycle(rule, owner_vk)
+            .expect("publish test Hold lifecycle")
     }
 
     fn assert_trigger_config_change_cancels(mut change: impl FnMut(&mut AppConfig)) {
@@ -10824,6 +11290,24 @@ mod tests {
                 super::TriggerReleaseCancellation::ControllerGeneration
             ))
         );
+
+        let mut hold_config = trigger_config_fixture();
+        hold_config.macros[0].mode = MacroMode::Hold;
+        let hold_service = HookService::isolated(
+            hold_config,
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let hold_task = configured_trigger_task(&hold_service);
+        hold_service.shared.controller.request_stop();
+        assert_eq!(
+            super::trigger_release_gate_status(&hold_service.shared, &hold_task),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ControllerGeneration
+            )
+        );
+        hold_service
+            .shared
+            .retire_hold_lifecycle(hold_task.hold_epoch.expect("Hold epoch"));
     }
 
     #[test]
@@ -10915,7 +11399,66 @@ mod tests {
     }
 
     #[test]
-    fn hold_starts_immediately_while_existing_toggle_and_release_gate_semantics_remain() {
+    fn pending_hold_lifecycle_clears_on_terminal_gate_exit_and_can_retrigger() {
+        let terminal_statuses = [
+            super::TriggerReleaseGateStatus::Current,
+            super::TriggerReleaseGateStatus::Shutdown,
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::TaskGeneration,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ControllerGeneration,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::AdmissionRevision,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::ConfigRevision,
+            ),
+            super::TriggerReleaseGateStatus::Cancelled(
+                super::TriggerReleaseCancellation::PhysicalLedgerUncertain,
+            ),
+        ];
+        for status in terminal_statuses {
+            let mut config = trigger_config_fixture();
+            config.macros[0].mode = MacroMode::Hold;
+            let service = HookService::isolated(
+                config,
+                crate::automation::VisionService::new(std::env::temp_dir()),
+            );
+            let task = configured_trigger_task(&service);
+            service
+                .shared
+                .trigger_pending
+                .store(true, Ordering::Release);
+            {
+                let _pending_reset = super::TriggerPendingReset(&service.shared.trigger_pending);
+                let _hold_reset = super::PendingHoldLifecycleReset {
+                    shared: &service.shared,
+                    epoch: task.hold_epoch,
+                    transferred_to_playback: false,
+                };
+                let mut gate = super::TriggerReleaseGate::new(
+                    std::time::Duration::from_millis(18),
+                    std::time::Duration::from_millis(10),
+                );
+                assert!(gate
+                    .observe(std::time::Duration::from_millis(10), true, status)
+                    .is_some());
+            }
+            assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
+            assert_eq!(
+                service.shared.hold_lifecycle_epoch.load(Ordering::Acquire),
+                0
+            );
+            let rule = service.shared.config.lock().expect("config").macros[0].clone();
+            let epoch = publish_test_hold_lifecycle(&service, &rule);
+            service.shared.retire_hold_lifecycle(epoch);
+        }
+    }
+
+    #[test]
+    fn hold_submits_immediately_while_existing_toggle_and_release_gate_semantics_remain() {
         use super::HotkeyPlaybackAction::{
             Ignore, StartAfterRelease, StartImmediate, StopImmediate,
         };
@@ -10956,9 +11499,46 @@ mod tests {
         task.rule.mode = MacroMode::Hold;
         assert_eq!(
             super::trigger_start_timing(&task.rule),
-            super::TriggerStartTiming::HoldImmediate
+            super::TriggerStartTiming::HoldModifierRelease
         );
         assert_eq!(service.shared.injected_input.counts(), (0, 0));
+    }
+
+    #[test]
+    fn hold_diagnostics_are_correlatable_and_do_not_include_typed_content() {
+        let fields = super::hold_diagnostic_fields(
+            Some("hold-diagnostic-fixture"),
+            "input_permission_revoked",
+            Some(17),
+            Some(crate::runtime_control::RunToken {
+                id: 23,
+                generation: 29,
+            }),
+            Some(0x41),
+            Some(0x41),
+            Some(0x41),
+        )
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(fields.get("mode").map(String::as_str), Some("hold"));
+        assert_eq!(
+            fields.get("source").map(String::as_str),
+            Some("low_level_keyboard")
+        );
+        assert_eq!(
+            fields.get("decision").map(String::as_str),
+            Some("input_permission_revoked")
+        );
+        assert_eq!(fields.get("hold_epoch").map(String::as_str), Some("17"));
+        assert_eq!(fields.get("run_id").map(String::as_str), Some("23"));
+        assert_eq!(fields.get("run_generation").map(String::as_str), Some("29"));
+        assert_eq!(fields.get("canonical_vk").map(String::as_str), Some("0x41"));
+        assert_eq!(fields.get("owner_vk").map(String::as_str), Some("0x41"));
+        assert_eq!(fields.get("released_vk").map(String::as_str), Some("0x41"));
+        assert!(!fields.contains_key("key"));
+        assert!(!fields.contains_key("text"));
+        assert!(!fields.contains_key("content"));
     }
 
     #[test]
@@ -10975,7 +11555,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_keydown_submits_immediately_repeat_is_ignored_and_keyup_cancels_pending() {
+    fn hold_keydown_submits_immediately_but_only_owner_keyup_cancels_pending() {
         let mut config = trigger_config_fixture();
         config.macros[0].mode = MacroMode::Hold;
         let service = HookService::isolated(
@@ -11012,7 +11592,10 @@ mod tests {
         let task = rx
             .recv_timeout(std::time::Duration::from_millis(500))
             .expect("Hold keydown must submit without waiting for keyup");
-        assert_eq!(task.start_timing, super::TriggerStartTiming::HoldImmediate);
+        assert_eq!(
+            task.start_timing,
+            super::TriggerStartTiming::HoldModifierRelease
+        );
         assert_eq!(
             super::trigger_release_gate_status(&service.shared, &task),
             super::TriggerReleaseGateStatus::Current
@@ -11031,7 +11614,12 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
 
-        assert!(service.shared.revoke_current_hold_for_key_up(0x11));
+        assert!(!service.shared.revoke_current_hold_for_key_up(0x11));
+        assert_eq!(
+            super::trigger_release_gate_status(&service.shared, &task),
+            super::TriggerReleaseGateStatus::Current
+        );
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
         assert_eq!(
             super::trigger_release_gate_status(&service.shared, &task),
             super::TriggerReleaseGateStatus::Cancelled(
@@ -11049,45 +11637,135 @@ mod tests {
     }
 
     #[test]
-    fn any_hold_component_keyup_stops_only_the_matching_hotkey_hold() {
-        for released_vk in [0x11, 0x78] {
-            let mut config = trigger_config_fixture();
-            config.macros[0].mode = MacroMode::Hold;
-            let service = HookService::isolated(
-                config.clone(),
-                crate::automation::VisionService::new(std::env::temp_dir()),
-            );
-            let epoch = service
-                .shared
-                .publish_hold_lifecycle(&config.macros[0])
-                .expect("publish Hold identity");
-            let mut lease = service
-                .shared
-                .controller
-                .begin_start(None)
-                .expect("admit active Hold");
-            let token = lease.token();
-            service
-                .shared
-                .bind_hold_lifecycle_run(&config.macros[0], Some(epoch), token)
-                .expect("bind Hold token");
-            assert!(service.shared.controller.activate(token));
-            lease.commit();
-            service
-                .shared
-                .activate_hold_lifecycle(&config.macros[0], Some(epoch), token, 1)
-                .expect("activate Hold identity");
-            let playback_guard = service.shared.playback.lock().expect("playback lock");
-            assert!(service.shared.revoke_current_hold_for_key_up(released_vk));
-            assert!(
-                !service.shared.controller.input_allowed(token),
-                "releasing VK {released_vk:#x} must revoke the matching Hold"
-            );
-            drop(playback_guard);
-            service.shared.retire_hold_lifecycle(epoch);
-            let _ = service.shared.controller.begin_cleaning(token);
-            let _ = service.shared.controller.finish(token, true);
+    fn hold_owner_keydown_suppression_survives_modifier_release_and_active_transition() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
+
+        assert!(service.shared.owns_current_hold_owner_keydown(0x78));
+        assert!(!service.shared.owns_current_hold_owner_keydown(0x11));
+        assert!(!service.shared.owns_current_hold_owner_keydown(0x77));
+        assert!(!service.shared.revoke_current_hold_for_key_up(0x11));
+        assert!(
+            service.shared.owns_current_hold_owner_keydown(0x78),
+            "owner autorepeat remains consumed after Ctrl release"
+        );
+
+        let mut lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("admit Hold");
+        let token = lease.token();
+        service
+            .shared
+            .bind_hold_lifecycle_run(&config.macros[0], Some(epoch), token)
+            .expect("bind Hold");
+        assert!(service.shared.controller.activate(token));
+        lease.commit();
+        service
+            .shared
+            .activate_hold_lifecycle(&config.macros[0], Some(epoch), token, 1)
+            .expect("activate Hold");
+        assert!(service.shared.owns_current_hold_owner_keydown(0x78));
+
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
+        assert!(!service.shared.owns_current_hold_owner_keydown(0x78));
+        assert!(!service.shared.controller.input_allowed(token));
+        service.shared.retire_hold_lifecycle(epoch);
+        let _ = service.shared.controller.begin_cleaning(token);
+        let _ = service.shared.controller.finish(token, true);
+    }
+
+    #[test]
+    fn hold_owner_suppression_ends_on_cancel_timeout_and_stale_repress() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let cancelled_epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
+        assert!(service.shared.owns_current_hold_owner_keydown(0x78));
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
+        assert!(
+            !service.shared.owns_current_hold_owner_keydown(0x78),
+            "a re-press cannot be consumed as ownership of the cancelled epoch"
+        );
+        service.shared.retire_hold_lifecycle(cancelled_epoch);
+        assert!(!service.shared.owns_current_hold_owner_keydown(0x78));
+
+        let timeout_epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
+        assert!(service.shared.owns_current_hold_owner_keydown(0x78));
+        {
+            let _timeout_cleanup = super::PendingHoldLifecycleReset {
+                shared: &service.shared,
+                epoch: Some(timeout_epoch),
+                transferred_to_playback: false,
+            };
         }
+        assert!(!service.shared.owns_current_hold_owner_keydown(0x78));
+
+        let fresh_epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
+        assert!(fresh_epoch > timeout_epoch);
+        assert!(service.shared.owns_current_hold_owner_keydown(0x78));
+        service.shared.retire_hold_lifecycle(fresh_epoch);
+        assert!(!service.shared.owns_current_hold_owner_keydown(0x78));
+    }
+
+    #[test]
+    fn active_hold_ignores_modifier_keyup_and_stops_on_owner_keyup() {
+        let mut config = trigger_config_fixture();
+        config.macros[0].mode = MacroMode::Hold;
+        let service = HookService::isolated(
+            config.clone(),
+            crate::automation::VisionService::new(std::env::temp_dir()),
+        );
+        let epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
+        let mut lease = service
+            .shared
+            .controller
+            .begin_start(None)
+            .expect("admit active Hold");
+        let token = lease.token();
+        service
+            .shared
+            .bind_hold_lifecycle_run(&config.macros[0], Some(epoch), token)
+            .expect("bind Hold token");
+        assert!(service.shared.controller.activate(token));
+        lease.commit();
+        service
+            .shared
+            .activate_hold_lifecycle(&config.macros[0], Some(epoch), token, 1)
+            .expect("activate Hold identity");
+        let playback_guard = service.shared.playback.lock().expect("playback lock");
+        assert!(!service.shared.revoke_current_hold_for_key_up(0x11));
+        assert!(service.shared.controller.input_allowed(token));
+        drop(playback_guard);
+        service.shared.playback.lock().expect("playback").running = true;
+        let revision = service
+            .shared
+            .trigger_config_revision
+            .load(Ordering::Acquire);
+        assert!(super::process_macro_key_down(
+            &service.shared,
+            &config,
+            revision,
+            0x11,
+            false,
+            &HashSet::from([0x11, 0x78]),
+        ));
+        assert!(service.shared.controller.input_allowed(token));
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
+        assert!(!service.shared.controller.input_allowed(token));
+        service.shared.playback.lock().expect("playback").running = false;
+        service.shared.retire_hold_lifecycle(epoch);
+        let _ = service.shared.controller.begin_cleaning(token);
+        let _ = service.shared.controller.finish(token, true);
 
         for unrelated_mode in [MacroMode::Once, MacroMode::Repeat, MacroMode::Toggle] {
             let mut config = trigger_config_fixture();
@@ -11121,7 +11799,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_config_change_cancels_stale_immediate_task() {
+    fn hold_config_change_cancels_stale_modifier_release_task() {
         let mut config = trigger_config_fixture();
         config.macros[0].mode = MacroMode::Hold;
         let service = HookService::isolated(
@@ -11129,7 +11807,10 @@ mod tests {
             crate::automation::VisionService::new(std::env::temp_dir()),
         );
         let task = configured_trigger_task(&service);
-        assert_eq!(task.start_timing, super::TriggerStartTiming::HoldImmediate);
+        assert_eq!(
+            task.start_timing,
+            super::TriggerStartTiming::HoldModifierRelease
+        );
         {
             let mut current = service.shared.config.lock().expect("config");
             current.macros[0].enabled = false;
@@ -11159,10 +11840,7 @@ mod tests {
                 crate::automation::VisionService::new(std::env::temp_dir()),
             );
             let rule = config.macros[0].clone();
-            let epoch = service
-                .shared
-                .publish_hold_lifecycle(&rule)
-                .expect("publish Hold identity");
+            let epoch = publish_test_hold_lifecycle(&service, &rule);
             let mut lease = service
                 .shared
                 .controller
@@ -11203,7 +11881,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_hold_identity_ignores_other_rules_and_cancels_shared_components() {
+    fn pending_hold_identity_ignores_other_rules_and_modifier_releases() {
         let mut config = trigger_config_fixture();
         config.macros[0].mode = MacroMode::Hold;
         let rule_a = config.macros[0].clone();
@@ -11216,22 +11894,20 @@ mod tests {
             config,
             crate::automation::VisionService::new(std::env::temp_dir()),
         );
-        let epoch = service
-            .shared
-            .publish_hold_lifecycle(&rule_a)
-            .expect("publish Hold A");
+        let epoch = publish_test_hold_lifecycle(&service, &rule_a);
 
         assert!(!service.shared.revoke_current_hold_for_key_up(0x77));
         service
             .shared
             .validate_hold_lifecycle(&rule_a, Some(epoch))
             .expect("Hold B unique key must not cancel Hold A");
-        assert!(service.shared.revoke_current_hold_for_key_up(0x11));
+        assert!(!service.shared.revoke_current_hold_for_key_up(0x11));
+        assert!(service.shared.revoke_current_hold_for_key_up(0x78));
         assert_eq!(
             service
                 .shared
                 .validate_hold_lifecycle(&rule_a, Some(epoch))
-                .expect_err("shared Ctrl release cancels current Hold A")
+                .expect_err("owner F9 release cancels current Hold A")
                 .code,
             "macro_hold_released"
         );
@@ -11246,10 +11922,7 @@ mod tests {
             config.clone(),
             crate::automation::VisionService::new(std::env::temp_dir()),
         );
-        let epoch = service
-            .shared
-            .publish_hold_lifecycle(&config.macros[0])
-            .expect("publish Hold");
+        let epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
         let lifecycle_guard = service
             .shared
             .hold_lifecycle
@@ -11313,10 +11986,7 @@ mod tests {
             config.clone(),
             crate::automation::VisionService::new(std::env::temp_dir()),
         );
-        let epoch = service
-            .shared
-            .publish_hold_lifecycle(&config.macros[0])
-            .expect("publish Hold");
+        let epoch = publish_test_hold_lifecycle(&service, &config.macros[0]);
         let mut lease = service
             .shared
             .controller
@@ -11442,15 +12112,9 @@ mod tests {
             config,
             crate::automation::VisionService::new(std::env::temp_dir()),
         );
-        let old_epoch = service
-            .shared
-            .publish_hold_lifecycle(&rule)
-            .expect("publish old Hold");
+        let old_epoch = publish_test_hold_lifecycle(&service, &rule);
         service.shared.retire_hold_lifecycle(old_epoch);
-        let new_epoch = service
-            .shared
-            .publish_hold_lifecycle(&rule)
-            .expect("publish new Hold");
+        let new_epoch = publish_test_hold_lifecycle(&service, &rule);
         service.shared.retire_hold_lifecycle(old_epoch);
         assert_eq!(
             service.shared.hold_lifecycle_epoch.load(Ordering::Acquire),
@@ -11466,7 +12130,13 @@ mod tests {
             .shared
             .next_hold_epoch
             .store(u64::MAX, Ordering::Release);
-        assert!(service.shared.publish_hold_lifecycle(&rule).is_none());
+        let owner_vk = crate::config::hold_trigger_parts(&rule.trigger_keys)
+            .expect("valid Hold trigger")
+            .owner_vk;
+        assert!(service
+            .shared
+            .publish_hold_lifecycle(&rule, owner_vk)
+            .is_none());
         assert!(service.shared.hold_epoch_exhausted.load(Ordering::Acquire));
         assert_eq!(
             service.shared.hold_lifecycle_epoch.load(Ordering::Acquire),
@@ -11483,10 +12153,7 @@ mod tests {
             config,
             crate::automation::VisionService::new(std::env::temp_dir()),
         );
-        let epoch = service
-            .shared
-            .publish_hold_lifecycle(&rule)
-            .expect("publish stale Hold");
+        let epoch = publish_test_hold_lifecycle(&service, &rule);
         let mut old_lease = service
             .shared
             .controller
@@ -11940,7 +12607,8 @@ mod tests {
             assert!(!service.shared.submit_macro_trigger(
                 &task.rule,
                 task.generation,
-                task.config_revision
+                task.config_revision,
+                Some(0x7B),
             ));
             assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
         }
@@ -11949,7 +12617,8 @@ mod tests {
         assert!(!service.shared.submit_macro_trigger(
             &task.rule,
             task.generation,
-            task.config_revision
+            task.config_revision,
+            Some(0x7A),
         ));
         assert!(!service.shared.trigger_pending.load(Ordering::Acquire));
         assert_eq!(service.shared.injected_input.counts(), (0, 0));
@@ -12299,6 +12968,20 @@ mod tests {
         assert_eq!(canonical_virtual_key(0xA5), 0x12);
         assert_eq!(canonical_virtual_key(0xA1), 0x10);
         assert_eq!(canonical_virtual_key(0x5C), 0x5B);
+
+        for (raw, canonical) in [
+            (0xA0, 0x10),
+            (0xA1, 0x10),
+            (0xA2, 0x11),
+            (0xA3, 0x11),
+            (0xA4, 0x12),
+            (0xA5, 0x12),
+            (0x5B, 0x5B),
+            (0x5C, 0x5B),
+        ] {
+            let ledger = HashSet::from([raw]);
+            assert!(super::physical_ledger_contains_trigger(&ledger, canonical));
+        }
     }
 
     #[test]

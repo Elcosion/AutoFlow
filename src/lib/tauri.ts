@@ -32,6 +32,7 @@ import {
   type MacroStep,
   type MacroTarget,
 } from "../types/config";
+import { repairLegacyHoldTrigger } from "./holdTrigger";
 
 export type RuntimeStatus = {
   appName: string;
@@ -151,7 +152,7 @@ function normalizeMacro(value: MacroRule): MacroRule {
       : inputProgram;
 
   const { steps: _legacySteps, ...withoutLegacySteps } = legacy;
-  return {
+  return repairLegacyHoldTrigger({
     ...withoutLegacySteps,
     program,
     recordMouseMove: value.recordMouseMove !== false,
@@ -160,7 +161,7 @@ function normalizeMacro(value: MacroRule): MacroRule {
       value.behaviorPolicy === undefined
         ? undefined
         : normalizeBehaviorPolicy(value.behaviorPolicy),
-  };
+  });
 }
 
 export function normalizeBehaviorPolicy(

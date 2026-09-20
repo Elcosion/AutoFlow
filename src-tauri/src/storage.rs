@@ -37,7 +37,7 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig, AppError> {
 
     match serde_json::from_str::<AppConfig>(&content) {
         Ok(config) => {
-            let (mut config, migrated) = config.migrate()?;
+            let (mut config, mut migrated) = config.migrate()?;
             let inline_macros = !config.macros.is_empty();
             let inline_profiles = !config.behavior_profiles.is_empty();
             let inline_inputs = !config.biomimetic_inputs.is_empty();
@@ -80,6 +80,7 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig, AppError> {
                 load_behavior_profiles_v2(app, &config.behavior_profile_v2_files)?
             };
             config.macros = macros;
+            migrated |= config.repair_legacy_hold_triggers();
             let normalized_macro_names = normalize_macro_display_names(&mut config.macros);
             config.macro_files = macro_files;
             config.behavior_profiles = profiles;
@@ -405,6 +406,7 @@ fn decode_macro_file(
                 errors.push("宏名称不能为空".to_string());
                 rule.name = fallback_name.to_string();
             }
+            let hold_trigger_repaired = rule.repair_legacy_hold_trigger();
             if let Some(error) = rule.import_error.take() {
                 errors.push(error);
             }
@@ -412,7 +414,9 @@ fn decode_macro_file(
                 errors.push(error);
             }
             if !errors.is_empty() {
-                rule.name = fallback_name.to_string();
+                if !hold_trigger_repaired {
+                    rule.name = fallback_name.to_string();
+                }
                 rule.enabled = false;
                 rule.import_error = Some(errors.join("；"));
             }
@@ -1640,6 +1644,37 @@ mod tests {
         assert!(matches!(
             rule.program,
             AutomationProgram::Rhai { source, .. } if source == "this is not json"
+        ));
+    }
+
+    #[test]
+    fn invalid_legacy_hold_file_is_disabled_without_dropping_payload() {
+        let content = serde_json::json!({
+            "id": "legacy-hold",
+            "name": "Legacy Hold",
+            "enabled": true,
+            "triggerKeys": ["Ctrl"],
+            "mode": "hold",
+            "repeatCount": 1,
+            "speed": 1.0,
+            "program": {
+                "kind": "macro",
+                "steps": [{ "type": "delay", "durationMs": 37 }]
+            }
+        })
+        .to_string();
+        let rule = decode_macro_file(&content, "fallback", "Fallback Name", false);
+
+        assert!(!rule.enabled);
+        assert_eq!(rule.name, "Legacy Hold");
+        assert!(rule
+            .import_error
+            .as_deref()
+            .is_some_and(|error| { error.contains(crate::config::HOLD_TRIGGER_REPAIR_REASON) }));
+        assert!(matches!(
+            rule.program,
+            AutomationProgram::Macro { steps }
+                if matches!(steps.as_slice(), [crate::MacroStep::Delay { duration_ms: 37, .. }])
         ));
     }
 
