@@ -1,8 +1,7 @@
-# Codex: Sol root orchestrator + Luna routine agents + Astra review
+# Codex: Sol orchestrator + Luna routine agents + Astra reviewer
 
-# Root / orchestrator
+# Root / orchestrator. Keep this model and effort fixed for the entire thread.
 model = "gpt-5.6-sol"
-model_provider = "openai"
 model_reasoning_effort = "high"
 
 # Safe interactive defaults. Change if your workflow needs otherwise.
@@ -15,6 +14,6 @@ enabled = true
 # Number of child agent threads Codex may keep open concurrently.
 max_concurrent_threads_per_session = 4
 
-# Unnamed agents use the Luna high execution tier.
+# Unnamed agents use the balanced Luna High execution tier.
 default_subagent_model = "gpt-5.6-luna"
 default_subagent_reasoning_effort = "high"
