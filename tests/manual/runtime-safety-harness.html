@@ -3,24 +3,68 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    />
     <title>AutoFlow Manual Acceptance Harness</title>
     <style>
       :root {
         color-scheme: dark;
-        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
         background: #10141c;
         color: #e8edf7;
       }
-      * { box-sizing: border-box; }
-      html, body { width: 100%; height: 100%; }
-      body { margin: 0; min-width: 1100px; min-height: 900px; overflow: hidden; }
-      header { height: 100px; padding: 18px 24px; background: #182131; border-bottom: 1px solid #34425a; }
-      h1 { margin: 0 0 6px; font-size: 24px; }
-      header p { margin: 0; color: #b8c4d8; }
-      main { position: relative; height: calc(100vh - 100px); min-height: 800px; padding: 16px; overflow: hidden; }
-      section { border: 1px solid #34425a; border-radius: 10px; background: #161d29; padding: 16px; }
-      .warning { border-color: #b8791b; background: #332713; color: #ffe2a7; }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        min-width: 1100px;
+        min-height: 900px;
+        overflow: hidden;
+      }
+      header {
+        height: 100px;
+        padding: 18px 24px;
+        background: #182131;
+        border-bottom: 1px solid #34425a;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 24px;
+      }
+      header p {
+        margin: 0;
+        color: #b8c4d8;
+      }
+      main {
+        position: relative;
+        height: calc(100vh - 100px);
+        min-height: 800px;
+        padding: 16px;
+        overflow: hidden;
+      }
+      section {
+        border: 1px solid #34425a;
+        border-radius: 10px;
+        background: #161d29;
+        padding: 16px;
+      }
+      .warning {
+        border-color: #b8791b;
+        background: #332713;
+        color: #ffe2a7;
+      }
       #safe-zone-panel {
         position: absolute;
         top: 20%;
@@ -35,14 +79,40 @@
         border: 3px solid #4c8dff;
         background: #111e31;
       }
-      .zone-heading { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
-      .zone-heading h2 { margin: 0; font-size: 18px; }
-      .zone-heading span { color: #b8c4d8; font-size: 12px; }
-      .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-      .status { padding: 10px; border-radius: 8px; background: #222d3e; }
-      .status strong { display: block; margin-bottom: 5px; }
-      .held { color: #ffb86b; }
-      .clear { color: #75e6a4; }
+      .zone-heading {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: baseline;
+      }
+      .zone-heading h2 {
+        margin: 0;
+        font-size: 18px;
+      }
+      .zone-heading span {
+        color: #b8c4d8;
+        font-size: 12px;
+      }
+      .status-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .status {
+        padding: 10px;
+        border-radius: 8px;
+        background: #222d3e;
+      }
+      .status strong {
+        display: block;
+        margin-bottom: 5px;
+      }
+      .held {
+        color: #ffb86b;
+      }
+      .clear {
+        color: #75e6a4;
+      }
       #interaction-zone {
         min-height: 0;
         width: 100%;
@@ -53,9 +123,18 @@
         place-items: center;
         user-select: none;
         touch-action: none;
-        background: repeating-linear-gradient(45deg, #17253b, #17253b 16px, #1a2a43 16px, #1a2a43 32px);
+        background: repeating-linear-gradient(
+          45deg,
+          #17253b,
+          #17253b 16px,
+          #1a2a43 16px,
+          #1a2a43 32px
+        );
       }
-      #interaction-zone.active { border-color: #ffad42; background: #382817; }
+      #interaction-zone.active {
+        border-color: #ffad42;
+        background: #382817;
+      }
       #vision-target {
         width: 180px;
         height: 96px;
@@ -68,7 +147,9 @@
         letter-spacing: 1px;
         box-shadow: inset 0 0 0 5px #102a43;
       }
-      #vision-target[hidden] { display: none; }
+      #vision-target[hidden] {
+        display: none;
+      }
       #operator-panel {
         position: absolute;
         left: 16px;
@@ -83,26 +164,100 @@
         overflow: hidden;
         padding: 12px;
       }
-      #operator-controls, #log-panel { min-width: 0; min-height: 0; overflow: auto; }
-      #operator-controls { padding: 0; border: 0; background: transparent; }
-      #log-panel { display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: 0; border: 0; background: transparent; }
-      label { display: block; margin-top: 14px; font-weight: 650; }
-      input { width: 100%; margin-top: 6px; padding: 12px; border: 2px solid #536580; border-radius: 7px; background: #0c1119; color: white; font-size: 17px; }
-      button { margin: 12px 8px 0 0; padding: 10px 14px; border: 0; border-radius: 7px; background: #365f9d; color: white; cursor: pointer; }
-      button:focus-visible, input:focus-visible, #interaction-zone:focus-visible { outline: 3px solid #ffd166; outline-offset: 2px; }
-      .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-      .toolbar button { background: #477a55; }
-      #result-status { color: #b8c4d8; font-size: 12px; }
-      #clipboard-fallback { width: 100%; min-height: 90px; margin-top: 10px; background: #0c1119; color: white; }
-      pre { min-height: 0; height: 100%; overflow: auto; margin: 8px 0 0; padding: 12px; background: #080b11; border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
-      code { color: #9cc1ff; }
-      .small-note { color: #b8c4d8; font-size: 12px; }
+      #operator-controls,
+      #log-panel {
+        min-width: 0;
+        min-height: 0;
+        overflow: auto;
+      }
+      #operator-controls {
+        padding: 0;
+        border: 0;
+        background: transparent;
+      }
+      #log-panel {
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        padding: 0;
+        border: 0;
+        background: transparent;
+      }
+      label {
+        display: block;
+        margin-top: 14px;
+        font-weight: 650;
+      }
+      input {
+        width: 100%;
+        margin-top: 6px;
+        padding: 12px;
+        border: 2px solid #536580;
+        border-radius: 7px;
+        background: #0c1119;
+        color: white;
+        font-size: 17px;
+      }
+      button {
+        margin: 12px 8px 0 0;
+        padding: 10px 14px;
+        border: 0;
+        border-radius: 7px;
+        background: #365f9d;
+        color: white;
+        cursor: pointer;
+      }
+      button:focus-visible,
+      input:focus-visible,
+      #interaction-zone:focus-visible {
+        outline: 3px solid #ffd166;
+        outline-offset: 2px;
+      }
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+      }
+      .toolbar button {
+        background: #477a55;
+      }
+      #result-status {
+        color: #b8c4d8;
+        font-size: 12px;
+      }
+      #clipboard-fallback {
+        width: 100%;
+        min-height: 90px;
+        margin-top: 10px;
+        background: #0c1119;
+        color: white;
+      }
+      pre {
+        min-height: 0;
+        height: 100%;
+        overflow: auto;
+        margin: 8px 0 0;
+        padding: 12px;
+        background: #080b11;
+        border-radius: 7px;
+        white-space: pre-wrap;
+        font-size: 12px;
+      }
+      code {
+        color: #9cc1ff;
+      }
+      .small-note {
+        color: #b8c4d8;
+        font-size: 12px;
+      }
     </style>
   </head>
   <body>
     <header>
       <h1>AutoFlow Manual Acceptance Harness</h1>
-      <p>离线、无网络、无自动动作。页面只记录本页收到的键盘、指针、焦点与可见性事件。</p>
+      <p>
+        离线、无网络、无自动动作。页面只记录本页收到的键盘、指针、焦点与可见性事件。
+      </p>
     </header>
     <main>
       <section id="safe-zone-panel" aria-label="安全指针区域面板">
@@ -110,71 +265,137 @@
           <h2>安全指针区域（仅用于观察）</h2>
           <span>宏坐标只允许中心窄带 45%–55%；本区域没有业务控件。</span>
         </div>
-        <div id="interaction-zone" tabindex="0" aria-label="安全指针区域：仅用于观察输入">
+        <div
+          id="interaction-zone"
+          tabindex="0"
+          aria-label="安全指针区域：仅用于观察输入"
+        >
           <div id="vision-target">VISION TARGET</div>
         </div>
       </section>
       <section id="operator-panel" aria-label="操作员控制与事件结果">
         <div id="operator-controls">
           <div class="warning">
-            <strong>紧急规则：</strong>真实输入阶段必须由操作员全程在场；异常时立即按物理 F12。若释放状态不明确，停止验收，不要继续下一级。
+            <strong>紧急规则：</strong
+            >真实输入阶段必须由操作员全程在场；异常时立即按物理
+            F12。若释放状态不明确，停止验收，不要继续下一级。
           </div>
           <div class="status-grid">
-            <div class="status"><strong>按下的键</strong><span id="held-keys" class="clear">无</span></div>
-            <div class="status"><strong>按下的鼠标键</strong><span id="held-buttons" class="clear">无</span></div>
-            <div class="status"><strong>窗口焦点</strong><span id="focus-state">检测中</span></div>
-            <div class="status"><strong>页面可见性</strong><span id="visibility-state">检测中</span></div>
+            <div class="status">
+              <strong>按下的键</strong
+              ><span id="held-keys" class="clear">无</span>
+            </div>
+            <div class="status">
+              <strong>按下的鼠标键</strong
+              ><span id="held-buttons" class="clear">无</span>
+            </div>
+            <div class="status">
+              <strong>窗口焦点</strong><span id="focus-state">检测中</span>
+            </div>
+            <div class="status">
+              <strong>页面可见性</strong
+              ><span id="visibility-state">检测中</span>
+            </div>
+            <div class="status">
+              <strong>观察状态</strong
+              ><span id="observation-state">检测中</span>
+            </div>
           </div>
-          <p class="small-note">窗口必须保持 100% 浏览器缩放、无页面滚动；操作员先运行无点击短移动并目视确认端点确在上方绿色安全区域内。window_rect 只提供窗口外框，不能证明 DOM 区域归属。</p>
-          <label for="text-target">文本与单键验收框（点击 Play 后利用 3 秒倒计时返回并手动聚焦）</label>
-          <input id="text-target" autocomplete="off" spellcheck="false" placeholder="预期：AUTOFLOW_MANUAL_SMOKE 或单个 a" />
+          <p class="small-note">
+            窗口必须保持 100%
+            浏览器缩放、无页面滚动；操作员先运行无点击短移动并目视确认端点确在上方绿色安全区域内。window_rect
+            只提供窗口外框，不能证明 DOM 区域归属。
+          </p>
+          <label for="text-target"
+            >文本与单键验收框（点击 Play 后利用 3
+            秒倒计时返回并手动聚焦）</label
+          >
+          <input
+            id="text-target"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="预期：AUTOFLOW_MANUAL_SMOKE 或单个 a"
+          />
           <div>
-            <button id="clear" type="button">清空日志与输入框</button>
-            <button id="toggle-vision" type="button">隐藏 / 显示视觉目标</button>
+            <button id="clear" type="button">开始新会话并清空</button>
+            <button id="toggle-vision" type="button">
+              隐藏 / 显示视觉目标
+            </button>
           </div>
           <div class="toolbar" aria-label="操作员结果工具">
             <button id="copy-results" type="button">复制结果</button>
             <button id="export-results" type="button">导出结果</button>
-            <span id="result-status" role="status" aria-live="polite">结果工具仅在操作员点击时执行。</span>
+            <span id="result-status" role="status" aria-live="polite"
+              >结果工具仅在操作员点击时执行。</span
+            >
           </div>
-          <textarea id="clipboard-fallback" hidden aria-label="复制失败时请手动复制的结果"></textarea>
+          <textarea
+            id="clipboard-fallback"
+            hidden
+            aria-label="复制失败时请手动复制的结果"
+          ></textarea>
         </div>
         <div id="log-panel">
           <strong>键盘 / 鼠标事件日志（最新在最上）</strong>
-          <p>截图视觉成功时，仅截取上方 <code>VISION TARGET</code> 图块并按手册导入。</p>
+          <p>
+            截图视觉成功时，仅截取上方
+            <code>VISION TARGET</code> 图块并按手册导入。
+          </p>
           <pre id="event-log" aria-live="polite"></pre>
         </div>
       </section>
     </main>
+    <script src="./runtime-safety-harness-state.cjs"></script>
     <script>
       (() => {
         "use strict";
-        const heldKeys = new Set();
-        const heldButtons = new Set();
+        const state = AutoFlowHarnessState.createHarnessState();
         const logNode = document.querySelector("#event-log");
         const zone = document.querySelector("#interaction-zone");
         const input = document.querySelector("#text-target");
         const resultStatus = document.querySelector("#result-status");
         const fallback = document.querySelector("#clipboard-fallback");
+        const textEvidence = [];
         let sequence = 0;
 
         const renderHeld = () => {
+          const snapshot = state.snapshot();
           const keyNode = document.querySelector("#held-keys");
           const buttonNode = document.querySelector("#held-buttons");
-          keyNode.textContent = heldKeys.size ? [...heldKeys].join(", ") : "无";
-          buttonNode.textContent = heldButtons.size ? [...heldButtons].join(", ") : "无";
-          keyNode.className = heldKeys.size ? "held" : "clear";
-          buttonNode.className = heldButtons.size ? "held" : "clear";
-          zone.classList.toggle("active", heldButtons.size > 0);
+          const observationNode = document.querySelector("#observation-state");
+          keyNode.textContent = snapshot.heldKeys.length
+            ? snapshot.heldKeys
+                .map(
+                  (entry) =>
+                    `${entry.identity} [key=${JSON.stringify(entry.key)}]`,
+                )
+                .join(", ")
+            : "无已跟踪键（不等于物理释放证明）";
+          buttonNode.textContent = snapshot.heldButtons.length
+            ? snapshot.heldButtons.join(", ")
+            : "无已跟踪键";
+          keyNode.className = snapshot.heldKeys.length ? "held" : "clear";
+          buttonNode.className = snapshot.heldButtons.length ? "held" : "clear";
+          observationNode.textContent =
+            snapshot.observationState === "known"
+              ? `已知（会话 ${snapshot.session}）`
+              : `不确定（会话 ${snapshot.session}：${snapshot.uncertaintyReasons.join(", ")}）`;
+          observationNode.className =
+            snapshot.observationState === "known" ? "clear" : "held";
+          zone.classList.toggle("active", snapshot.heldButtons.length > 0);
         };
-        const log = (message) => {
+        const log = (message, evidence = null) => {
           sequence += 1;
           const stamp = new Date().toISOString();
-          logNode.textContent = `${String(sequence).padStart(3, "0")} ${stamp} ${message}\n${logNode.textContent}`;
+          const detail =
+            evidence === null ? "" : ` ${JSON.stringify(evidence)}`;
+          logNode.textContent = `${String(sequence).padStart(3, "0")} ${stamp} ${message}${detail}\n${logNode.textContent}`;
         };
         const renderWindowState = () => {
-          document.querySelector("#focus-state").textContent = document.hasFocus() ? "有焦点" : "无焦点";
-          document.querySelector("#visibility-state").textContent = document.visibilityState;
+          document.querySelector("#focus-state").textContent =
+            document.hasFocus() ? "有焦点" : "无焦点";
+          document.querySelector("#visibility-state").textContent =
+            document.visibilityState;
         };
         const buildResults = () => {
           const now = new Date().toISOString();
@@ -184,80 +405,135 @@
             `title=${document.title}`,
             `focus=${document.hasFocus()}`,
             `visibility=${document.visibilityState}`,
-            `heldKeys=${JSON.stringify([...heldKeys])}`,
-            `heldButtons=${JSON.stringify([...heldButtons])}`,
-            `inputValue=${JSON.stringify(input.value)}`,
+            `keyPointerObservation=${JSON.stringify(state.snapshot())}`,
+            `previousSessionSnapshot=${JSON.stringify(state.previousSessionSnapshot())}`,
+            `textEvidence=${JSON.stringify({ value: input.value, events: textEvidence })}`,
             "eventLog:",
-            logNode.textContent || "(empty)"
+            logNode.textContent || "(empty)",
           ].join("\n");
         };
 
-        window.addEventListener("keydown", (event) => {
-          heldKeys.add(event.key);
-          log(`keydown key=${event.key} repeat=${event.repeat}`);
+        window.addEventListener(
+          "keydown",
+          (event) => {
+            log("keyboard", state.keyEvent("keydown", event));
+            renderHeld();
+          },
+          true,
+        );
+        window.addEventListener(
+          "keyup",
+          (event) => {
+            log("keyboard", state.keyEvent("keyup", event));
+            renderHeld();
+          },
+          true,
+        );
+        window.addEventListener(
+          "pointerdown",
+          (event) => {
+            log("pointer", state.pointerEvent("pointerdown", event));
+            renderHeld();
+          },
+          true,
+        );
+        window.addEventListener(
+          "pointerup",
+          (event) => {
+            log("pointer", state.pointerEvent("pointerup", event));
+            renderHeld();
+          },
+          true,
+        );
+        window.addEventListener(
+          "pointercancel",
+          (event) => {
+            log("pointer", state.pointerEvent("pointercancel", event));
+            renderHeld();
+          },
+          true,
+        );
+        window.addEventListener("blur", () => {
+          state.windowEvent("blur", document.visibilityState);
+          log("window blur; observation is now uncertain", state.snapshot());
           renderHeld();
-        }, true);
-        window.addEventListener("keyup", (event) => {
-          heldKeys.delete(event.key);
-          log(`keyup key=${event.key}`);
+          renderWindowState();
+        });
+        window.addEventListener("focus", () => {
+          state.windowEvent("focus", document.visibilityState);
+          log(
+            "window focus; uncertainty is intentionally retained",
+            state.snapshot(),
+          );
+          renderWindowState();
+        });
+        document.addEventListener("visibilitychange", () => {
+          state.windowEvent("visibilitychange", document.visibilityState);
+          log(`visibility ${document.visibilityState}`, state.snapshot());
           renderHeld();
-        }, true);
-        window.addEventListener("pointerdown", (event) => {
-          heldButtons.add(event.button);
-          log(`pointerdown button=${event.button} x=${event.clientX} y=${event.clientY}`);
-          renderHeld();
-        }, true);
-        window.addEventListener("pointerup", (event) => {
-          heldButtons.delete(event.button);
-          log(`pointerup button=${event.button} x=${event.clientX} y=${event.clientY}`);
-          renderHeld();
-        }, true);
-        window.addEventListener("pointercancel", (event) => {
-          heldButtons.delete(event.button);
-          log(`pointercancel button=${event.button}`);
-          renderHeld();
-        }, true);
-        window.addEventListener("blur", () => { log("window blur"); renderWindowState(); });
-        window.addEventListener("focus", () => { log("window focus"); renderWindowState(); });
-        document.addEventListener("visibilitychange", () => { log(`visibility ${document.visibilityState}`); renderWindowState(); });
-        input.addEventListener("input", () => log(`input length=${input.value.length}`));
+          renderWindowState();
+        });
+        input.addEventListener("input", (event) => {
+          const evidence = {
+            at: new Date().toISOString(),
+            inputType: event.inputType || "unknown",
+            length: input.value.length,
+          };
+          textEvidence.push(evidence);
+          if (textEvidence.length > 200) textEvidence.shift();
+          log("text input evidence (separate from key state)", evidence);
+        });
         document.querySelector("#clear").addEventListener("click", () => {
+          const sessionTransition = state.startNewSession("operator_clear");
           input.value = "";
+          textEvidence.length = 0;
           logNode.textContent = "";
           sequence = 0;
           renderHeld();
-          log("harness log and text cleared by operator; held state was not fabricated");
+          log(
+            "new observation session started; previous state snapshotted; physical release is not claimed",
+            sessionTransition,
+          );
         });
-        document.querySelector("#toggle-vision").addEventListener("click", () => {
-          const target = document.querySelector("#vision-target");
-          target.hidden = !target.hidden;
-          log(`vision target ${target.hidden ? "hidden" : "visible"}`);
-        });
-        document.querySelector("#copy-results").addEventListener("click", async () => {
-          const result = buildResults();
-          fallback.hidden = true;
-          try {
-            await navigator.clipboard.writeText(result);
-            resultStatus.textContent = "结果已复制到剪贴板。";
-          } catch (error) {
-            fallback.hidden = false;
-            fallback.value = result;
-            fallback.focus();
-            fallback.select();
-            resultStatus.textContent = "浏览器拒绝剪贴板；结果已选中，请手动复制。";
-          }
-        });
-        document.querySelector("#export-results").addEventListener("click", () => {
-          const result = buildResults();
-          const blob = new Blob([result], { type: "text/plain;charset=utf-8" });
-          const url = URL.createObjectURL(blob);
-          const anchor = document.createElement("a");
-          anchor.href = url;
-          anchor.download = `autoflow-manual-harness-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
-          anchor.click();
-          URL.revokeObjectURL(url);
-          resultStatus.textContent = "结果已交给浏览器下载。";
-        });
+        document
+          .querySelector("#toggle-vision")
+          .addEventListener("click", () => {
+            const target = document.querySelector("#vision-target");
+            target.hidden = !target.hidden;
+            log(`vision target ${target.hidden ? "hidden" : "visible"}`);
+          });
+        document
+          .querySelector("#copy-results")
+          .addEventListener("click", async () => {
+            const result = buildResults();
+            fallback.hidden = true;
+            try {
+              await navigator.clipboard.writeText(result);
+              resultStatus.textContent = "结果已复制到剪贴板。";
+            } catch (error) {
+              fallback.hidden = false;
+              fallback.value = result;
+              fallback.focus();
+              fallback.select();
+              resultStatus.textContent =
+                "浏览器拒绝剪贴板；结果已选中，请手动复制。";
+            }
+          });
+        document
+          .querySelector("#export-results")
+          .addEventListener("click", () => {
+            const result = buildResults();
+            const blob = new Blob([result], {
+              type: "text/plain;charset=utf-8",
+            });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement("a");
+            anchor.href = url;
+            anchor.download = `autoflow-manual-harness-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+            anchor.click();
+            URL.revokeObjectURL(url);
+            resultStatus.textContent = "结果已交给浏览器下载。";
+          });
 
         renderHeld();
         renderWindowState();

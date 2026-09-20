@@ -16,6 +16,15 @@ use std::collections::HashSet;
 
 pub const SCHEMA_VERSION: u32 = 6;
 
+pub(crate) const HOLD_TRIGGER_REPAIR_REASON: &str =
+    "按住循环快捷键需要且只能包含一个普通键，Ctrl/Shift/Alt/Win 只能作为修饰键";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HoldTriggerParts {
+    pub owner_vk: u32,
+    pub modifier_vks: Vec<u32>,
+}
+
 pub(crate) fn normalized_virtual_key(key: &str) -> Option<u32> {
     let normalized = key.trim().to_ascii_uppercase();
     let named = [
@@ -49,6 +58,66 @@ pub(crate) fn normalized_virtual_key(key: &str) -> Option<u32> {
         .and_then(|number| number.parse::<u32>().ok())
         .filter(|number| (1..=24).contains(number))
         .map(|number| 0x70 + number - 1)
+}
+
+pub(crate) fn is_modifier_virtual_key(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B)
+}
+
+pub(crate) fn hold_trigger_parts(trigger_keys: &[String]) -> Option<HoldTriggerParts> {
+    let mut owner_vk = None;
+    let mut modifier_vks = Vec::new();
+    for key in trigger_keys {
+        let vk = normalized_virtual_key(key)?;
+        if is_modifier_virtual_key(vk) {
+            if !modifier_vks.contains(&vk) {
+                modifier_vks.push(vk);
+            }
+        } else if owner_vk.replace(vk).is_some() {
+            return None;
+        }
+    }
+    Some(HoldTriggerParts {
+        owner_vk: owner_vk?,
+        modifier_vks,
+    })
+}
+
+fn merge_import_error(import_error: &mut Option<String>, reason: &str) -> bool {
+    if import_error
+        .as_deref()
+        .is_some_and(|current| current.split('；').any(|part| part.trim() == reason))
+    {
+        return false;
+    }
+    *import_error = Some(
+        match import_error.take().filter(|value| !value.trim().is_empty()) {
+            Some(current) => format!("{current}；{reason}"),
+            None => reason.to_string(),
+        },
+    );
+    true
+}
+
+fn remove_import_error(import_error: &mut Option<String>, reason: &str) -> bool {
+    let Some(current) = import_error.as_deref() else {
+        return false;
+    };
+    let retained = current
+        .split('；')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != reason)
+        .collect::<Vec<_>>();
+    if retained.len()
+        == current
+            .split('；')
+            .filter(|part| !part.trim().is_empty())
+            .count()
+    {
+        return false;
+    }
+    *import_error = (!retained.is_empty()).then(|| retained.join("；"));
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +348,21 @@ impl MacroRule {
             AutomationProgram::Rhai { .. } => None,
         }
     }
+
+    pub(crate) fn repair_legacy_hold_trigger(&mut self) -> bool {
+        if !matches!(self.mode, MacroMode::Hold) {
+            return remove_import_error(&mut self.import_error, HOLD_TRIGGER_REPAIR_REASON);
+        }
+        if hold_trigger_parts(&self.trigger_keys).is_some() {
+            return remove_import_error(&mut self.import_error, HOLD_TRIGGER_REPAIR_REASON);
+        }
+        if !self.enabled {
+            return false;
+        }
+        self.enabled = false;
+        let _ = merge_import_error(&mut self.import_error, HOLD_TRIGGER_REPAIR_REASON);
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +529,14 @@ impl AppConfig {
                 .map(|profile| profile.id.clone());
         }
         Ok((self, migrated))
+    }
+
+    pub(crate) fn repair_legacy_hold_triggers(&mut self) -> bool {
+        let mut changed = false;
+        for rule in &mut self.macros {
+            changed |= rule.repair_legacy_hold_trigger();
+        }
+        changed
     }
 
     pub fn validate(&self) -> Result<(), AppError> {
@@ -678,6 +770,15 @@ impl AppConfig {
                 return Err(AppError::invalid(
                     "macro_missing_trigger",
                     "启用宏前至少需要设置一个触发键",
+                ));
+            }
+            if rule.enabled
+                && matches!(rule.mode, MacroMode::Hold)
+                && hold_trigger_parts(&rule.trigger_keys).is_none()
+            {
+                return Err(AppError::invalid(
+                    "macro_hold_trigger_invalid",
+                    HOLD_TRIGGER_REPAIR_REASON,
                 ));
             }
             if rule
@@ -980,6 +1081,99 @@ mod tests {
         config
             .validate()
             .expect("enabled Hold with a global shortcut should validate");
+    }
+
+    #[test]
+    fn enabled_hold_requires_exactly_one_recognized_owner_key() {
+        assert_eq!(
+            hold_trigger_parts(&["Ctrl".to_string(), "F01".to_string()])
+                .expect("Rust aliases F01 to F1")
+                .owner_vk,
+            normalized_virtual_key("F1").expect("F1")
+        );
+        for keys in [
+            vec!["Ctrl"],
+            vec!["Ctrl", "A", "B"],
+            vec!["Ctrl", "Unknown"],
+        ] {
+            let mut config = AppConfig::default();
+            config
+                .macros
+                .push(macro_fixture("invalid-hold", keys, MacroMode::Hold));
+            assert_eq!(
+                config
+                    .validate()
+                    .expect_err("invalid enabled Hold trigger")
+                    .code,
+                "macro_hold_trigger_invalid"
+            );
+        }
+
+        let mut disabled = macro_fixture(
+            "disabled-invalid-hold",
+            vec!["Ctrl", "A", "B"],
+            MacroMode::Hold,
+        );
+        disabled.enabled = false;
+        let mut config = AppConfig::default();
+        config.macros.push(disabled);
+        config
+            .validate()
+            .expect("disabled invalid Hold remains editable");
+    }
+
+    #[test]
+    fn legacy_hold_repair_preserves_payload_merges_errors_and_recovers() {
+        let mut rule = macro_fixture("legacy-hold", vec!["Ctrl"], MacroMode::Hold);
+        rule.import_error = Some("原有错误".to_string());
+        let original_program = serde_json::to_value(&rule.program).expect("program");
+
+        assert!(rule.repair_legacy_hold_trigger());
+        assert!(!rule.enabled);
+        assert_eq!(
+            serde_json::to_value(&rule.program).expect("program"),
+            original_program
+        );
+        let expected_error = format!("原有错误；{HOLD_TRIGGER_REPAIR_REASON}");
+        assert_eq!(rule.import_error.as_deref(), Some(expected_error.as_str()));
+
+        rule.trigger_keys = vec!["Ctrl".to_string(), "F9".to_string()];
+        assert!(rule.repair_legacy_hold_trigger());
+        assert_eq!(rule.import_error.as_deref(), Some("原有错误"));
+        rule.import_error = Some(HOLD_TRIGGER_REPAIR_REASON.to_string());
+        assert!(rule.repair_legacy_hold_trigger());
+        assert!(rule.import_error.is_none());
+        rule.enabled = true;
+        let mut config = AppConfig::default();
+        config.macros.push(rule);
+        config.validate().expect("repaired Hold can be enabled");
+    }
+
+    #[test]
+    fn loaded_inline_legacy_hold_is_repaired_before_config_validation() {
+        let mut config = AppConfig::default();
+        let mut rule = macro_fixture("inline-legacy-hold", vec!["Shift"], MacroMode::Hold);
+        let original_program = serde_json::to_value(&rule.program).expect("program");
+        rule.import_error = Some("保留详情".to_string());
+        config.macros.push(rule);
+
+        let (mut repaired, _) = config.migrate().expect("migrate inline Hold");
+        let changed = repaired.repair_legacy_hold_triggers();
+        assert!(changed);
+        assert!(!repaired.macros[0].enabled);
+        assert_eq!(
+            serde_json::to_value(&repaired.macros[0].program).expect("program"),
+            original_program
+        );
+        let error = repaired.macros[0]
+            .import_error
+            .as_deref()
+            .expect("repair error");
+        assert!(error.contains("保留详情"));
+        assert!(error.contains(HOLD_TRIGGER_REPAIR_REASON));
+        repaired
+            .validate()
+            .expect("disabled repaired inline Hold validates");
     }
 
     #[test]
