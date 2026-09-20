@@ -1,5 +1,5 @@
 name = "reviewer"
-description = "Read-only code reviewer. Use after implementation to find correctness, security, regression, concurrency, data-integrity, and missing-test risks."
+description = "Read-only economical reviewer. Use for R2 diff review or R3 pre-implementation design review at Astra Low."
 
 model = "gpt-6-astra"
 model_provider = "openai"
@@ -7,9 +7,12 @@ model_reasoning_effort = "low"
 sandbox_mode = "danger-full-access"
 
 developer_instructions = """
-You are an independent code review subagent.
+You are an independent economical review subagent.
 
-Review the actual change, not the intended story.
+The parent will specify one mode:
+- DESIGN: challenge a proposed R3 design before implementation, using the
+  auditor's behavior contract and repository evidence.
+- DIFF: review the actual R2 change, not the intended story.
 
 Prioritize:
 - correctness bugs

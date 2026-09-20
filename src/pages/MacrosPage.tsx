@@ -36,6 +36,10 @@ import {
 } from "../lib/tauri";
 import { nextCapturedKeys } from "../lib/triggerCapture";
 import {
+  holdTriggerDraftError,
+  recoverHoldTriggerRepair,
+} from "../lib/holdTrigger";
+import {
   classifyMacroSource,
   MacroSourceError,
   macroToSource,
@@ -302,7 +306,7 @@ const modeLabels: Record<MacroMode, string> = {
 const modeDescriptions: Record<MacroMode, string> = {
   once: "触发一次，只执行一轮步骤。",
   repeat: "触发一次，连续执行指定的循环次数。",
-  hold: "按住触发组合时持续循环，松开后停止。",
+  hold: "快捷键需且只能包含一个普通保持键；按住普通键并释放全部修饰键后开始，松开普通键停止。",
   toggle: "按一次开始循环，再按一次相同组合停止。",
 };
 
@@ -677,7 +681,7 @@ export function MacrosPage() {
       if (legacySteps !== undefined) {
         next.program = { kind: "macro", steps: legacySteps };
       }
-      return next;
+      return recoverHoldTriggerRepair(next);
     });
   };
 
@@ -694,6 +698,8 @@ export function MacrosPage() {
   };
 
   const validateDraft = (candidate: MacroRule) => {
+    const holdTriggerError = holdTriggerDraftError(candidate);
+    if (holdTriggerError) return holdTriggerError;
     if (candidate.importError) return candidate.importError;
     if (
       candidate.behaviorPolicy?.profileId &&
@@ -946,16 +952,16 @@ export function MacrosPage() {
       setError("这个宏还没有步骤，录制或添加步骤后才能启用");
       return;
     }
+    const toggled = { ...candidate, enabled: !candidate.enabled };
+    const validationError = validateDraft(toggled);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     const next = config.macros.map((item) =>
-      item.id === macro.id
-        ? { ...candidate, enabled: !candidate.enabled }
-        : item,
+      item.id === macro.id ? toggled : item,
     );
-    setDraft((current) =>
-      current?.id === macro.id
-        ? { ...current, enabled: !candidate.enabled }
-        : current,
-    );
+    setDraft((current) => (current?.id === macro.id ? toggled : current));
     void save(next, candidate.enabled ? "宏已停用" : "宏已启用");
   };
 
@@ -1272,7 +1278,9 @@ export function MacrosPage() {
           <input
             checked={config.showPlaybackOverlay}
             disabled={saving}
-            onChange={(event) => void updatePlaybackOverlay(event.target.checked)}
+            onChange={(event) =>
+              void updatePlaybackOverlay(event.target.checked)
+            }
             type="checkbox"
           />
           <span>运行时显示进度悬浮窗</span>
