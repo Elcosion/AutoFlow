@@ -50,6 +50,8 @@
     let uncertaintyReasons = [];
     let previousSessionSnapshot = null;
     let ambiguousKeySequence = 0;
+    let completedClickCount = 0;
+    let lastClick = null;
 
     const snapshot = () => ({
       session,
@@ -57,6 +59,8 @@
       uncertaintyReasons: [...uncertaintyReasons],
       heldKeys: cloneHeldKeys(heldKeys),
       heldButtons: [...heldButtons].sort((left, right) => left - right),
+      completedClickCount,
+      lastClick: lastClick === null ? null : { ...lastClick },
     });
 
     const markUncertain = (reason) => {
@@ -150,12 +154,35 @@
       };
     };
 
+    const clickEvent = (event) => {
+      const source = event ?? {};
+      completedClickCount += 1;
+      lastClick = {
+        button:
+          Number.isInteger(source.button) &&
+          source.button >= 0 &&
+          source.button <= 4
+            ? source.button
+            : null,
+        clientX: Number.isFinite(source.clientX) ? source.clientX : null,
+        clientY: Number.isFinite(source.clientY) ? source.clientY : null,
+        timeStamp:
+          Number.isFinite(source.timeStamp) && source.timeStamp >= 0
+            ? source.timeStamp
+            : null,
+        isTrusted: source.isTrusted === true,
+      };
+      return { type: "click", lastClick: { ...lastClick }, state: snapshot() };
+    };
+
     const startNewSession = (reason) => {
       previousSessionSnapshot = { reason, ...snapshot() };
       session += 1;
       heldKeys.clear();
       heldButtons.clear();
       ambiguousKeySequence = 0;
+      completedClickCount = 0;
+      lastClick = null;
       known = false;
       uncertaintyReasons = ["new_session_without_physical_snapshot"];
       return {
@@ -167,6 +194,7 @@
     return {
       keyEvent,
       pointerEvent,
+      clickEvent,
       markUncertain,
       windowEvent,
       startNewSession,

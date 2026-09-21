@@ -7,6 +7,7 @@ const { createHarnessState } =
     createHarnessState: () => {
       keyEvent: (type: string, event: Record<string, unknown>) => any;
       pointerEvent: (type: string, event: Record<string, unknown>) => any;
+      clickEvent: (event: Record<string, unknown>) => any;
       windowEvent: (type: string, visibilityState: string) => any;
       startNewSession: (reason: string) => any;
       snapshot: () => any;
@@ -119,6 +120,52 @@ describe("manual acceptance harness keyboard state", () => {
     expect(unmatchedState.snapshot().observationState).toBe("uncertain");
   });
 
+  it("projects real click evidence without replacing pointerup state", () => {
+    const state = createHarnessState();
+    state.pointerEvent("pointerdown", {
+      button: 0,
+      clientX: 10,
+      clientY: 20,
+    });
+    const click = state.clickEvent({
+      button: 0,
+      clientX: 10.5,
+      clientY: 20.25,
+      timeStamp: 42,
+      isTrusted: true,
+    });
+
+    expect(click.lastClick).toEqual({
+      button: 0,
+      clientX: 10.5,
+      clientY: 20.25,
+      timeStamp: 42,
+      isTrusted: true,
+    });
+    expect(state.snapshot().completedClickCount).toBe(1);
+    expect(state.snapshot().heldButtons).toEqual([0]);
+    expect(state.pointerEvent("pointerup", { button: 0 }).transition).toBe(
+      "released",
+    );
+    expect(state.snapshot().heldButtons).toEqual([]);
+
+    state.clickEvent({
+      button: 5,
+      clientX: Number.NaN,
+      clientY: Number.POSITIVE_INFINITY,
+      timeStamp: -1,
+      isTrusted: 1,
+    });
+    expect(state.snapshot().completedClickCount).toBe(2);
+    expect(state.snapshot().lastClick).toEqual({
+      button: null,
+      clientX: null,
+      clientY: null,
+      timeStamp: null,
+      isTrusted: false,
+    });
+  });
+
   it("marks blur and hidden visibility uncertain and focus cannot restore certainty", () => {
     const state = createHarnessState();
     state.windowEvent("blur", "visible");
@@ -137,11 +184,22 @@ describe("manual acceptance harness keyboard state", () => {
   it("starts a new uncertain session with the prior state snapshot", () => {
     const state = createHarnessState();
     state.keyEvent("keydown", key("a", "KeyA"));
+    state.clickEvent({
+      button: 0,
+      clientX: 1,
+      clientY: 2,
+      timeStamp: 3,
+      isTrusted: true,
+    });
     const reset = state.startNewSession("operator_clear");
 
     expect(reset.previous.heldKeys).toHaveLength(1);
+    expect(reset.previous.completedClickCount).toBe(1);
+    expect(reset.previous.lastClick.button).toBe(0);
     expect(reset.current.session).toBe(2);
     expect(reset.current.heldKeys).toEqual([]);
+    expect(reset.current.completedClickCount).toBe(0);
+    expect(reset.current.lastClick).toBeNull();
     expect(reset.current.observationState).toBe("uncertain");
     expect(reset.current.uncertaintyReasons).toContain(
       "new_session_without_physical_snapshot",
