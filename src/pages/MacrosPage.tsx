@@ -11,6 +11,7 @@ import { RhaiEditor } from "../components/RhaiEditor";
 import { useAppConfig, toErrorMessage } from "../lib/config";
 import { useAutoSave } from "../lib/useAutoSave";
 import { shouldHydrateSourceDraft } from "../lib/sourceDraft";
+import { formatRhaiSource } from "../lib/rhaiFormatter";
 import {
   RHAI_API_REFERENCE_SNIPPETS,
   type RhaiReferenceSnippet,
@@ -773,23 +774,22 @@ export function MacrosPage() {
   };
 
   const formatSource = () => {
-    if (!selected || classifyMacroSource(sourceText) === "advanced") {
-      setSourceError("高级脚本暂不自动格式化，请保留源码原样编辑。");
-      setSourceErrorLine(null);
-      setSourceErrorColumn(null);
+    const result = formatRhaiSource(sourceText);
+    if (!result.ok) {
+      setSourceError(result.error.message);
+      setSourceErrorLine(result.error.line);
+      setSourceErrorColumn(result.error.column);
       return undefined;
     }
-    try {
-      const candidate = parseMacroSource(sourceText, selected);
-      setSourceError(null);
-      setSourceErrorLine(null);
-      setSourceErrorColumn(null);
-      showNotice("源码已格式化");
-      return macroToSource(candidate);
-    } catch (reason) {
-      showSourceError(reason);
+    setSourceError(null);
+    setSourceErrorLine(null);
+    setSourceErrorColumn(null);
+    if (!result.changed) {
+      showNotice("源码已是规范格式");
       return undefined;
     }
+    showNotice("源码已格式化");
+    return result.source;
   };
 
   const applySourceAndSwitch = async (openVisualConfiguration = false) => {
