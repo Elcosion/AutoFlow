@@ -34,13 +34,6 @@ import {
 } from "../types/config";
 import { repairLegacyHoldTrigger } from "./holdTrigger";
 
-export type RuntimeStatus = {
-  appName: string;
-  version: string;
-  coreState: string;
-  source: "tauri" | "browser-preview";
-};
-
 export type MacroRecordingStatus = {
   active: boolean;
   captureStarted: boolean;
@@ -111,12 +104,6 @@ export type BehaviorApi = {
   profileName: string;
   functions: BehaviorApiFunction[];
   source: string;
-};
-
-type TauriStatus = {
-  app_name: string;
-  version: string;
-  core_state: string;
 };
 
 export function isTauriRuntime(): boolean {
@@ -568,11 +555,6 @@ export async function recoverInputSafety(): Promise<void> {
   await invoke("recover_input_safety");
 }
 
-export async function isMacroPlaying(): Promise<boolean> {
-  if (!isTauriRuntime()) return false;
-  return invoke<boolean>("is_macro_playing");
-}
-
 export async function getMacroPlaybackStatus(): Promise<MacroPlaybackStatus> {
   if (!isTauriRuntime()) {
     return {
@@ -740,30 +722,4 @@ export async function deleteAsset(
     throw new Error("图像资源管理需要在 Windows 桌面端运行");
   }
   await invoke("delete_asset", { assetId, confirmed });
-}
-
-export async function runVisionDiagnostic(durationMs = 0): Promise<string> {
-  if (!isTauriRuntime()) {
-    throw new Error("视觉诊断需要在 Windows 桌面端运行");
-  }
-  return invoke<string>("run_vision_diagnostic", { durationMs });
-}
-
-export async function getRuntimeStatus(): Promise<RuntimeStatus> {
-  if (!isTauriRuntime()) {
-    return {
-      appName: "AutoFlow",
-      version: "0.1.0",
-      coreState: "浏览器预览",
-      source: "browser-preview",
-    };
-  }
-
-  const status = await invoke<TauriStatus>("get_app_status");
-  return {
-    appName: status.app_name,
-    version: status.version,
-    coreState: status.core_state,
-    source: "tauri",
-  };
 }
