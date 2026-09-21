@@ -1,8 +1,7 @@
 use crate::automation::VisionService;
 use crate::behavior::v2::{BehaviorPolicy, BehaviorRuntimeV2};
 use crate::behavior::{
-    BehaviorProfile, BehaviorRecorder, BehaviorRecordingResult, BehaviorRecordingStatus,
-    BiomimeticInput, BiomimeticRuntime, DelayKind,
+    BehaviorRecorder, BehaviorRecordingResult, BehaviorRecordingStatus, DelayKind,
 };
 #[cfg(windows)]
 use crate::input_safety::{
@@ -4279,62 +4278,6 @@ impl HookShared {
             use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
             GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0
         });
-    }
-
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    fn behavior_runtime(&self) -> Result<Option<Arc<Mutex<BiomimeticRuntime>>>, String> {
-        let config = self.config.lock().map_err(|_| "配置状态异常".to_string())?;
-        if !config.biomimetic_enabled {
-            return Ok(None);
-        }
-        if !config.selected_biomimetic_input_ids.is_empty() {
-            let inputs = config
-                .selected_biomimetic_input_ids
-                .iter()
-                .filter_map(|input_id| {
-                    config
-                        .biomimetic_inputs
-                        .iter()
-                        .find(|input| input.id == *input_id)
-                        .cloned()
-                })
-                .collect::<Vec<BiomimeticInput>>();
-            if inputs.len() != config.selected_biomimetic_input_ids.len() {
-                return Err("当前选中的仿生输入文件不存在".to_string());
-            }
-            return BiomimeticRuntime::from_inputs(&inputs, config.biomimetic_intensity)
-                .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
-                .map_err(|error| error.message);
-        }
-        let selected_ids = if config.selected_behavior_profile_ids.is_empty() {
-            config
-                .active_behavior_profile_id
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            config.selected_behavior_profile_ids.clone()
-        };
-        if selected_ids.is_empty() {
-            return Ok(None);
-        }
-        let profiles = selected_ids
-            .iter()
-            .filter_map(|profile_id| {
-                config
-                    .behavior_profiles
-                    .iter()
-                    .find(|profile| profile.id == *profile_id)
-                    .cloned()
-            })
-            .collect::<Vec<BehaviorProfile>>();
-        if profiles.len() != selected_ids.len() {
-            return Err("当前选中的仿生行为档案不存在".to_string());
-        }
-        BiomimeticRuntime::from_profiles(&profiles, config.biomimetic_intensity)
-            .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
-            .map_err(|error| error.message)
     }
 
     #[cfg(windows)]
