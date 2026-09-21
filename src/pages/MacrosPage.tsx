@@ -439,7 +439,7 @@ export function MacrosPage() {
             current: status.currentStep,
             total: status.totalSteps,
           });
-          if (!status.running) {
+          if (status.phaseObservation === "confirmed" && !status.running) {
             setPlaying(false);
             if (status.lastError) setError(status.lastError);
           }

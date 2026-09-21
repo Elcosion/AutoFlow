@@ -110,6 +110,31 @@ fn runtime_phase_provenance_name(provenance: RuntimePhaseProvenance) -> &'static
     }
 }
 
+#[cfg(windows)]
+fn unavailable_playback_status(
+    phase_provenance: &'static str,
+    last_error: &'static str,
+) -> MacroPlaybackStatus {
+    MacroPlaybackStatus {
+        running: false,
+        current_step: 0,
+        total_steps: 0,
+        last_error: Some(last_error.to_string()),
+        playback_id: 0,
+        macro_id: None,
+        macro_name: None,
+        program_kind: "unknown".to_string(),
+        action_kind: None,
+        action_summary: None,
+        elapsed_ms: 0,
+        phase: "unknown".to_string(),
+        phase_observation: "unavailable".to_string(),
+        phase_provenance: phase_provenance.to_string(),
+        cleanup_status: "unknown".to_string(),
+        overlay_visible: false,
+    }
+}
+
 impl HookService {
     #[cfg(windows)]
     pub(crate) fn bind_frontend_process(pid: u32) {
@@ -2512,105 +2537,114 @@ impl HookShared {
 
     #[cfg(windows)]
     fn playback_status(&self) -> MacroPlaybackStatus {
-        let overlay_enabled = self
-            .config
-            .lock()
-            .map(|config| config.show_playback_overlay)
-            .unwrap_or(false);
+        let config = match self.config.try_lock() {
+            Ok(config) => config,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return unavailable_playback_status(
+                    "config_busy",
+                    "配置状态正在更新，播放状态暂不可确认",
+                );
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return unavailable_playback_status(
+                    "config_poisoned",
+                    "配置状态读取失败，请重启 AutoFlow",
+                );
+            }
+        };
+        let mut playback = match self.playback.try_lock() {
+            Ok(playback) => playback,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return unavailable_playback_status(
+                    "playback_busy",
+                    "播放状态正在更新，暂不可确认",
+                );
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return unavailable_playback_status(
+                    "playback_poisoned",
+                    "播放状态读取失败，请重启 AutoFlow",
+                );
+            }
+        };
+        let overlay_enabled = config.show_playback_overlay;
         let recording = self.is_recording();
+        // All fallible observation locks are now held or have failed without
+        // waiting. Do not retain a confirmed controller view across a wait.
         let controller_phase = self.controller.observe_phase();
         let now = Instant::now();
-        self.playback
-            .lock()
-            .map(|mut playback| {
-                if !playback.running
-                    && !playback.terminal_persistent
-                    && playback
-                        .terminal_until
-                        .is_some_and(|deadline| deadline <= now)
-                {
-                    playback.macro_id = None;
-                    playback.macro_name = None;
-                    playback.program_kind = None;
-                    playback.action_summary = None;
-                    playback.current_step_kind = None;
-                    playback.total_steps = 0;
-                    playback.last_error = None;
-                    playback.phase = "idle".to_string();
-                    playback.cleanup_status = "not_started".to_string();
-                    playback.started_at = None;
-                    playback.terminal_until = None;
-                    playback.terminal_persistent = false;
-                }
-                let terminal_active = playback.running
-                    || playback.terminal_persistent
-                    || playback.terminal_until.is_some();
-                let (phase, phase_observation, phase_provenance) = match controller_phase {
-                    RuntimePhaseObservation::Unavailable => (
-                        "unknown".to_string(),
-                        "unavailable".to_string(),
-                        "controller_busy".to_string(),
-                    ),
-                    RuntimePhaseObservation::Confirmed { phase, provenance } => (
-                        if phase == RuntimePhase::FaultLocked || playback.phase.is_empty() {
-                            runtime_phase_name(phase).to_string()
-                        } else {
-                            playback.phase.clone()
-                        },
-                        "confirmed".to_string(),
-                        runtime_phase_provenance_name(provenance).to_string(),
-                    ),
-                };
-                MacroPlaybackStatus {
-                    running: playback.running,
-                    current_step: playback.current_step,
-                    total_steps: playback.total_steps,
-                    last_error: playback.last_error.clone(),
-                    playback_id: playback.instance_id,
-                    macro_id: playback.macro_id.clone(),
-                    macro_name: playback.macro_name.clone(),
-                    program_kind: playback
-                        .program_kind
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    action_kind: playback.current_step_kind.clone(),
-                    action_summary: playback.action_summary.clone(),
-                    elapsed_ms: playback
-                        .started_at
-                        .map(|started| now.saturating_duration_since(started).as_millis() as u64)
-                        .unwrap_or(0),
+        if !playback.running
+            && !playback.terminal_persistent
+            && playback
+                .terminal_until
+                .is_some_and(|deadline| deadline <= now)
+        {
+            playback.macro_id = None;
+            playback.macro_name = None;
+            playback.program_kind = None;
+            playback.action_summary = None;
+            playback.current_step_kind = None;
+            playback.total_steps = 0;
+            playback.last_error = None;
+            playback.phase = "idle".to_string();
+            playback.cleanup_status = "not_started".to_string();
+            playback.started_at = None;
+            playback.terminal_until = None;
+            playback.terminal_persistent = false;
+        }
+        let terminal_active =
+            playback.running || playback.terminal_persistent || playback.terminal_until.is_some();
+        let (phase, phase_observation, phase_provenance) = match controller_phase {
+            RuntimePhaseObservation::Unavailable => (
+                "unknown".to_string(),
+                "unavailable".to_string(),
+                "controller_busy".to_string(),
+            ),
+            RuntimePhaseObservation::Confirmed { phase, provenance } => (
+                if matches!(
                     phase,
-                    phase_observation,
-                    phase_provenance,
-                    cleanup_status: if playback.cleanup_status.is_empty() {
-                        "not_started".to_string()
-                    } else {
-                        playback.cleanup_status.clone()
-                    },
-                    overlay_visible: overlay_enabled
-                        && !recording
-                        && terminal_active
-                        && playback.macro_name.is_some(),
-                }
-            })
-            .unwrap_or_else(|_| MacroPlaybackStatus {
-                running: false,
-                current_step: 0,
-                total_steps: 0,
-                last_error: Some("播放状态读取失败，请重启 AutoFlow".to_string()),
-                playback_id: 0,
-                macro_id: None,
-                macro_name: None,
-                program_kind: "unknown".to_string(),
-                action_kind: None,
-                action_summary: None,
-                elapsed_ms: 0,
-                phase: "unknown".to_string(),
-                phase_observation: "unavailable".to_string(),
-                phase_provenance: "playback_state_unavailable".to_string(),
-                cleanup_status: "unknown".to_string(),
-                overlay_visible: false,
-            })
+                    RuntimePhase::FaultLocked | RuntimePhase::ShuttingDown
+                ) || playback.phase.is_empty()
+                {
+                    runtime_phase_name(phase).to_string()
+                } else {
+                    playback.phase.clone()
+                },
+                "confirmed".to_string(),
+                runtime_phase_provenance_name(provenance).to_string(),
+            ),
+        };
+        MacroPlaybackStatus {
+            running: playback.running,
+            current_step: playback.current_step,
+            total_steps: playback.total_steps,
+            last_error: playback.last_error.clone(),
+            playback_id: playback.instance_id,
+            macro_id: playback.macro_id.clone(),
+            macro_name: playback.macro_name.clone(),
+            program_kind: playback
+                .program_kind
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            action_kind: playback.current_step_kind.clone(),
+            action_summary: playback.action_summary.clone(),
+            elapsed_ms: playback
+                .started_at
+                .map(|started| now.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or(0),
+            phase,
+            phase_observation,
+            phase_provenance,
+            cleanup_status: if playback.cleanup_status.is_empty() {
+                "not_started".to_string()
+            } else {
+                playback.cleanup_status.clone()
+            },
+            overlay_visible: overlay_enabled
+                && !recording
+                && terminal_active
+                && playback.macro_name.is_some(),
+        }
     }
 
     #[cfg(windows)]
@@ -13234,11 +13268,77 @@ mod tests {
         assert_eq!(status.phase_provenance, "controller_busy");
 
         let faulted = test_hook_service();
+        {
+            let mut playback = faulted.shared.playback.lock().expect("playback state");
+            playback.running = true;
+            playback.phase = "running".to_string();
+        }
         faulted.shared.controller.lock_fault();
         let status = faulted.shared.playback_status();
         assert_eq!(status.phase, "fault_locked");
         assert_eq!(status.phase_observation, "confirmed");
         assert_eq!(status.phase_provenance, "fault_latch");
+
+        let generation = faulted.shared.controller.generation();
+        let revision = faulted.shared.controller.background_generation();
+        assert!(faulted
+            .shared
+            .controller
+            .recover_after_cleanup_at(generation, revision));
+        let status = faulted.shared.playback_status();
+        assert_eq!(status.phase, "running");
+        assert_eq!(status.phase_observation, "confirmed");
+        assert_eq!(status.phase_provenance, "controller_state");
+
+        faulted.shared.controller.request_shutdown();
+        let status = faulted.shared.playback_status();
+        assert_eq!(status.phase, "shutting_down");
+        assert_eq!(status.phase_observation, "confirmed");
+        assert_eq!(status.phase_provenance, "shutdown_latch");
+    }
+
+    #[test]
+    fn playback_status_returns_without_waiting_for_config_lock() {
+        let service = test_hook_service();
+        let config = service.shared.config.lock().expect("config state");
+        let shared = Arc::clone(&service.shared);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(shared.playback_status())
+                .expect("send config-contended status");
+        });
+
+        let status = receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("status observation must not wait for config");
+        assert_eq!(status.phase, "unknown");
+        assert_eq!(status.phase_observation, "unavailable");
+        assert_eq!(status.phase_provenance, "config_busy");
+        drop(config);
+        worker.join().expect("status worker");
+    }
+
+    #[test]
+    fn playback_status_returns_without_waiting_for_playback_lock() {
+        let service = test_hook_service();
+        let playback = service.shared.playback.lock().expect("playback state");
+        let shared = Arc::clone(&service.shared);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(shared.playback_status())
+                .expect("send playback-contended status");
+        });
+
+        let status = receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("status observation must not wait for playback");
+        assert_eq!(status.phase, "unknown");
+        assert_eq!(status.phase_observation, "unavailable");
+        assert_eq!(status.phase_provenance, "playback_busy");
+        drop(playback);
+        worker.join().expect("status worker");
     }
 
     #[test]

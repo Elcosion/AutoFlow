@@ -82,6 +82,10 @@ export type MacroPlaybackStatus = {
     | "shutdown_latch"
     | "controller_busy"
     | "playback_state_unavailable"
+    | "config_busy"
+    | "config_poisoned"
+    | "playback_busy"
+    | "playback_poisoned"
     | "transport_error"
     | "unsupported_platform";
   cleanupStatus: "not_started" | "pending" | "safe" | "failed" | "unknown";

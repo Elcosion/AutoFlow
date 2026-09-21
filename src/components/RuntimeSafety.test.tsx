@@ -32,6 +32,13 @@ async function mount() {
     },
   };
 }
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 it("recovery failure keeps lock visible; successful explicit recovery never plays", async () => {
   status.mockResolvedValue({
     phase: "fault_locked",
@@ -99,4 +106,115 @@ it("transitions confirmed fault to query-unknown to normal without stale lock UI
   expect(view.host.querySelector("aside")).toBeNull();
   expect(recover).not.toHaveBeenCalled();
   await view.close();
+});
+
+it("ignores a stale fault poll across successful recovery until a fresh query", async () => {
+  const stalePoll = deferred<{
+    phase: "fault_locked";
+    phaseObservation: "confirmed";
+    cleanupStatus: "safe";
+    lastError: string;
+  }>();
+  status
+    .mockResolvedValueOnce({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+      lastError: "initial fault",
+    })
+    .mockReturnValueOnce(stalePoll.promise)
+    .mockResolvedValueOnce({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+      lastError: "fresh fault",
+    });
+  recover.mockResolvedValue(undefined);
+  const view = await mount();
+
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  expect(status).toHaveBeenCalledTimes(2);
+  await act(async () => view.host.querySelector("button")?.click());
+  expect(view.host.querySelector("aside")).toBeNull();
+
+  await act(async () => {
+    stalePoll.resolve({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+      lastError: "stale fault",
+    });
+    await stalePoll.promise;
+  });
+  expect(view.host.querySelector("aside")).toBeNull();
+
+  await act(async () => vi.advanceTimersByTimeAsync(0));
+  expect(status).toHaveBeenCalledTimes(3);
+  expect(view.host.textContent).toContain("fresh fault");
+  expect(view.host.textContent).not.toContain("stale fault");
+  expect(view.host.querySelector("button")?.disabled).toBe(false);
+  await view.close();
+});
+
+it("does not start a queued poll through an in-flight recovery", async () => {
+  const recovery = deferred<undefined>();
+  status
+    .mockResolvedValueOnce({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+    })
+    .mockResolvedValueOnce({
+      phase: "idle",
+      phaseObservation: "confirmed",
+      cleanupStatus: "not_started",
+    });
+  recover.mockReturnValue(recovery.promise);
+  const view = await mount();
+
+  await act(async () => view.host.querySelector("button")?.click());
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  expect(status).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    recovery.resolve(undefined);
+    await recovery.promise;
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(0));
+  expect(status).toHaveBeenCalledTimes(2);
+  expect(view.host.querySelector("aside")).toBeNull();
+  await view.close();
+});
+
+it("does not publish recovery or polling results after unmount", async () => {
+  const stalePoll = deferred<{
+    phase: "fault_locked";
+    phaseObservation: "confirmed";
+    cleanupStatus: "safe";
+  }>();
+  const recovery = deferred<undefined>();
+  status
+    .mockResolvedValueOnce({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+    })
+    .mockReturnValueOnce(stalePoll.promise);
+  recover.mockReturnValue(recovery.promise);
+  const view = await mount();
+
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  await act(async () => view.host.querySelector("button")?.click());
+  await view.close();
+  await act(async () => {
+    recovery.resolve(undefined);
+    stalePoll.resolve({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+    });
+    await Promise.all([recovery.promise, stalePoll.promise]);
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(status).toHaveBeenCalledTimes(2);
 });
