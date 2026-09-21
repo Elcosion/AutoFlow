@@ -10,7 +10,10 @@ use crate::input_safety::{
 #[cfg(windows)]
 use crate::rhai_runtime::{validate_rhai_source, AutomationInput, CANCELLED};
 #[cfg(windows)]
-use crate::runtime_control::{RunToken, RuntimeController, RuntimePhase, StartError};
+use crate::runtime_control::{
+    RunToken, RuntimeController, RuntimePhase, RuntimePhaseObservation, RuntimePhaseProvenance,
+    StartError,
+};
 use crate::{
     AppConfig, AppError, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep,
     MacroTarget, MouseButton,
@@ -79,6 +82,8 @@ pub struct MacroPlaybackStatus {
     pub action_summary: Option<String>,
     pub elapsed_ms: u64,
     pub phase: String,
+    pub phase_observation: String,
+    pub phase_provenance: String,
     pub cleanup_status: String,
     pub overlay_visible: bool,
 }
@@ -93,6 +98,15 @@ fn runtime_phase_name(phase: RuntimePhase) -> &'static str {
         RuntimePhase::Cleaning => "cleaning",
         RuntimePhase::FaultLocked => "fault_locked",
         RuntimePhase::ShuttingDown => "shutting_down",
+    }
+}
+
+#[cfg(windows)]
+fn runtime_phase_provenance_name(provenance: RuntimePhaseProvenance) -> &'static str {
+    match provenance {
+        RuntimePhaseProvenance::State => "controller_state",
+        RuntimePhaseProvenance::FaultLatch => "fault_latch",
+        RuntimePhaseProvenance::ShutdownLatch => "shutdown_latch",
     }
 }
 
@@ -582,8 +596,10 @@ impl HookService {
             action_kind: None,
             action_summary: None,
             elapsed_ms: 0,
-            phase: "idle".to_string(),
-            cleanup_status: "not_started".to_string(),
+            phase: "unknown".to_string(),
+            phase_observation: "unavailable".to_string(),
+            phase_provenance: "unsupported_platform".to_string(),
+            cleanup_status: "unknown".to_string(),
             overlay_visible: false,
         }
     }
@@ -2502,7 +2518,7 @@ impl HookShared {
             .map(|config| config.show_playback_overlay)
             .unwrap_or(false);
         let recording = self.is_recording();
-        let controller_phase = self.controller.phase();
+        let controller_phase = self.controller.observe_phase();
         let now = Instant::now();
         self.playback
             .lock()
@@ -2529,6 +2545,22 @@ impl HookShared {
                 let terminal_active = playback.running
                     || playback.terminal_persistent
                     || playback.terminal_until.is_some();
+                let (phase, phase_observation, phase_provenance) = match controller_phase {
+                    RuntimePhaseObservation::Unavailable => (
+                        "unknown".to_string(),
+                        "unavailable".to_string(),
+                        "controller_busy".to_string(),
+                    ),
+                    RuntimePhaseObservation::Confirmed { phase, provenance } => (
+                        if phase == RuntimePhase::FaultLocked || playback.phase.is_empty() {
+                            runtime_phase_name(phase).to_string()
+                        } else {
+                            playback.phase.clone()
+                        },
+                        "confirmed".to_string(),
+                        runtime_phase_provenance_name(provenance).to_string(),
+                    ),
+                };
                 MacroPlaybackStatus {
                     running: playback.running,
                     current_step: playback.current_step,
@@ -2547,13 +2579,9 @@ impl HookShared {
                         .started_at
                         .map(|started| now.saturating_duration_since(started).as_millis() as u64)
                         .unwrap_or(0),
-                    phase: if controller_phase == RuntimePhase::FaultLocked
-                        || playback.phase.is_empty()
-                    {
-                        runtime_phase_name(controller_phase).to_string()
-                    } else {
-                        playback.phase.clone()
-                    },
+                    phase,
+                    phase_observation,
+                    phase_provenance,
                     cleanup_status: if playback.cleanup_status.is_empty() {
                         "not_started".to_string()
                     } else {
@@ -2577,8 +2605,10 @@ impl HookShared {
                 action_kind: None,
                 action_summary: None,
                 elapsed_ms: 0,
-                phase: "failed".to_string(),
-                cleanup_status: "failed".to_string(),
+                phase: "unknown".to_string(),
+                phase_observation: "unavailable".to_string(),
+                phase_provenance: "playback_state_unavailable".to_string(),
+                cleanup_status: "unknown".to_string(),
                 overlay_visible: false,
             })
     }
@@ -7999,6 +8029,7 @@ mod tests {
         resolve_cursor_start, shifted_printable_character, should_show_playback_error,
         split_command_line, HookService, HookShared, PlaybackState, RecorderState,
     };
+    use crate::runtime_control::RuntimePhase;
     use crate::MouseButton;
     use crate::{AppConfig, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep};
     use std::collections::HashSet;
@@ -13186,6 +13217,28 @@ mod tests {
         assert!(status.running);
         assert_eq!(status.phase, "cleaning");
         assert_eq!(status.cleanup_status, "pending");
+    }
+
+    #[test]
+    fn playback_status_distinguishes_confirmed_fault_from_controller_contention() {
+        let contended = test_hook_service();
+        let status = contended.shared.controller.while_state_locked(|| {
+            assert_eq!(
+                contended.shared.controller.phase(),
+                RuntimePhase::FaultLocked
+            );
+            contended.shared.playback_status()
+        });
+        assert_eq!(status.phase, "unknown");
+        assert_eq!(status.phase_observation, "unavailable");
+        assert_eq!(status.phase_provenance, "controller_busy");
+
+        let faulted = test_hook_service();
+        faulted.shared.controller.lock_fault();
+        let status = faulted.shared.playback_status();
+        assert_eq!(status.phase, "fault_locked");
+        assert_eq!(status.phase_observation, "confirmed");
+        assert_eq!(status.phase_provenance, "fault_latch");
     }
 
     #[test]

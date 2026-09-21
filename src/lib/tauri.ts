@@ -73,7 +73,17 @@ export type MacroPlaybackStatus = {
     | "failed"
     | "cleanup_failed"
     | "fault_locked"
-    | "shutting_down";
+    | "shutting_down"
+    | "unknown";
+  phaseObservation: "confirmed" | "unavailable";
+  phaseProvenance:
+    | "controller_state"
+    | "fault_latch"
+    | "shutdown_latch"
+    | "controller_busy"
+    | "playback_state_unavailable"
+    | "transport_error"
+    | "unsupported_platform";
   cleanupStatus: "not_started" | "pending" | "safe" | "failed" | "unknown";
   overlayVisible: boolean;
 };
@@ -565,8 +575,10 @@ export async function getMacroPlaybackStatus(): Promise<MacroPlaybackStatus> {
       playbackId: 0,
       programKind: "unknown",
       elapsedMs: 0,
-      phase: "idle",
-      cleanupStatus: "not_started",
+      phase: "unknown",
+      phaseObservation: "unavailable",
+      phaseProvenance: "unsupported_platform",
+      cleanupStatus: "unknown",
       overlayVisible: false,
     };
   }

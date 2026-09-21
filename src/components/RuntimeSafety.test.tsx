@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RuntimeSafety } from "./RuntimeSafety";
 const { status, recover } = vi.hoisted(() => ({
   status: vi.fn(),
@@ -11,7 +11,11 @@ vi.mock("../lib/tauri", () => ({
   getMacroPlaybackStatus: status,
   recoverInputSafety: recover,
 }));
-afterEach(() => vi.clearAllMocks());
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.clearAllMocks();
+});
 async function mount() {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   const host = document.createElement("div");
@@ -29,7 +33,11 @@ async function mount() {
   };
 }
 it("recovery failure keeps lock visible; successful explicit recovery never plays", async () => {
-  status.mockResolvedValue({ phase: "fault_locked", cleanupStatus: "safe" });
+  status.mockResolvedValue({
+    phase: "fault_locked",
+    phaseObservation: "confirmed",
+    cleanupStatus: "safe",
+  });
   recover
     .mockRejectedValueOnce({ message: "检测通道未就绪" })
     .mockResolvedValue(undefined);
@@ -43,14 +51,52 @@ it("recovery failure keeps lock visible; successful explicit recovery never play
   expect(view.host.querySelector("aside")).toBeNull();
   await view.close();
 });
-it("unknown cleanup disables recovery and busy polling does not report a fault", async () => {
-  status.mockResolvedValue({ phase: "fault_locked", cleanupStatus: "unknown" });
+it("unconfirmed phase or cleanup cannot enable recovery", async () => {
+  status.mockResolvedValue({
+    phase: "fault_locked",
+    phaseObservation: "confirmed",
+    cleanupStatus: "unknown",
+  });
   const view = await mount();
   expect(view.host.querySelector("button")?.disabled).toBe(true);
   expect(recover).not.toHaveBeenCalled();
   await view.close();
-  status.mockRejectedValue({ code: "safety_service_busy" });
-  const busy = await mount();
-  expect(busy.host.querySelector("aside")).toBeNull();
-  await busy.close();
+
+  status.mockResolvedValue({
+    phase: "fault_locked",
+    phaseObservation: "unavailable",
+    cleanupStatus: "safe",
+  });
+  const unknown = await mount();
+  expect(unknown.host.textContent).not.toContain("输入安全已锁定");
+  expect(unknown.host.querySelector("button")).toBeNull();
+  await unknown.close();
+});
+
+it("transitions confirmed fault to query-unknown to normal without stale lock UI", async () => {
+  status
+    .mockResolvedValueOnce({
+      phase: "fault_locked",
+      phaseObservation: "confirmed",
+      cleanupStatus: "safe",
+    })
+    .mockRejectedValueOnce({ code: "safety_service_busy" })
+    .mockResolvedValue({
+      phase: "idle",
+      phaseObservation: "confirmed",
+      cleanupStatus: "not_started",
+    });
+  const view = await mount();
+  expect(view.host.textContent).toContain("输入安全已锁定");
+
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  expect(view.host.textContent).toContain("输入安全状态暂不可确认");
+  expect(view.host.textContent).not.toContain("输入安全已锁定");
+  expect(view.host.querySelector("button")).toBeNull();
+  expect(recover).not.toHaveBeenCalled();
+
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  expect(view.host.querySelector("aside")).toBeNull();
+  expect(recover).not.toHaveBeenCalled();
+  await view.close();
 });
