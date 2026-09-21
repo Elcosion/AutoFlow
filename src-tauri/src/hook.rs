@@ -7737,173 +7737,6 @@ fn play_automation_program(
     }
 }
 
-// Test-only reference for recorded-step semantics; production interpretation
-// now lives exclusively in the isolated worker.
-#[cfg(all(windows, test))]
-#[allow(dead_code, clippy::too_many_arguments)]
-fn play_macro_steps(
-    shared: &HookShared,
-    steps: &[MacroStep],
-    speed: f32,
-    stop: &Arc<AtomicBool>,
-    held_keys: &mut HashSet<u32>,
-    held_buttons: &mut HashSet<MouseButton>,
-    behavior: Option<Arc<Mutex<BehaviorRuntimeV2>>>,
-    input_state: Arc<InjectedInputState>,
-    emergency_generation: u64,
-    instance_id: u64,
-    run_token: RunToken,
-) -> Result<bool, String> {
-    let speed = speed.max(0.05);
-    let input = WindowsAutomationInput::new(
-        behavior,
-        Arc::clone(stop),
-        input_state,
-        Arc::clone(&shared.controller),
-        run_token,
-    );
-    let mut index = 0usize;
-    while index < steps.len() {
-        if shared.stop_requested(stop, emergency_generation) {
-            return Ok(false);
-        }
-
-        if input.behavior.is_some() {
-            if let Some((button, x, y)) = combinable_click_at(steps, index, held_buttons) {
-                shared.set_playback_action(
-                    instance_id,
-                    index + 1,
-                    "combined_click",
-                    Some(format!("鼠标{}点击", mouse_button_name(button))),
-                );
-                input.bio_click_with_cancel(mouse_button_name(button), x, y, None, stop)?;
-                // Keep progress aligned with the original three recorded
-                // steps even though V2 executes them as one action.
-                shared.set_playback_action(
-                    instance_id,
-                    index + 3,
-                    "combined_click",
-                    Some(format!("鼠标{}点击", mouse_button_name(button))),
-                );
-                index += 3;
-                continue;
-            }
-        }
-
-        let step = &steps[index];
-        shared.set_playback_action(
-            instance_id,
-            index + 1,
-            macro_step_kind(step),
-            Some(macro_step_summary(step)),
-        );
-        match step {
-            MacroStep::Delay {
-                duration_ms,
-                duration_max_ms,
-            } => {
-                let result = match duration_max_ms {
-                    Some(maximum) => input.wait_random_ms(*duration_ms, *maximum, speed, stop),
-                    None => input.wait_ms(*duration_ms, speed, stop),
-                };
-                if result.is_err() {
-                    return Ok(false);
-                }
-            }
-            MacroStep::Key { key, action } => {
-                let Some(vk) = key_to_vk(key) else {
-                    return Err(format!("第 {} 步的按键“{}”暂不支持", index + 1, key));
-                };
-                if matches!(action, KeyAction::Down) {
-                    input.key_down(key)?;
-                } else {
-                    input.key_up(key)?;
-                }
-                if matches!(action, KeyAction::Down) {
-                    held_keys.insert(vk);
-                } else {
-                    held_keys.remove(&vk);
-                }
-            }
-            MacroStep::MouseButton {
-                button,
-                action,
-                x,
-                y,
-            } => {
-                let already_at_target = index > 0
-                    && matches!(
-                        &steps[index - 1],
-                        MacroStep::MouseMove {
-                            x: previous_x,
-                            y: previous_y
-                        } if *previous_x == *x && *previous_y == *y
-                    );
-                let action_x = if already_at_target { 0 } else { *x };
-                let action_y = if already_at_target { 0 } else { *y };
-                if matches!(action, KeyAction::Down) {
-                    input.mouse_down(mouse_button_name(*button), action_x, action_y)?;
-                } else {
-                    input.mouse_up(mouse_button_name(*button), action_x, action_y)?;
-                }
-                if matches!(action, KeyAction::Down) {
-                    held_buttons.insert(*button);
-                } else {
-                    held_buttons.remove(button);
-                }
-            }
-            MacroStep::MouseMove { x, y } => {
-                let followed_by_click = steps.get(index + 1).is_some_and(|next| {
-                    matches!(
-                        next,
-                        MacroStep::MouseButton {
-                            action: KeyAction::Down,
-                            ..
-                        }
-                    )
-                });
-                if input.behavior.is_some() {
-                    input.bio_move_to_with_cancel(*x, *y, None, followed_by_click, stop)?;
-                } else {
-                    input.move_to_with_cancel(*x, *y, Some(stop))?;
-                }
-            }
-            MacroStep::Wheel { delta_x, delta_y } => input.scroll(*delta_x, *delta_y)?,
-            MacroStep::Text { text } => input.type_text_with_cancel(text, Some(stop))?,
-        }
-        index += 1;
-    }
-    Ok(true)
-}
-
-#[cfg(all(windows, test))]
-fn combined_click_at(steps: &[MacroStep], index: usize) -> Option<(MouseButton, i32, i32)> {
-    let (Some(MacroStep::MouseMove { x, y }), Some(down), Some(up)) =
-        (steps.get(index), steps.get(index + 1), steps.get(index + 2))
-    else {
-        return None;
-    };
-    let (
-        MacroStep::MouseButton {
-            button: down_button,
-            action: KeyAction::Down,
-            x: down_x,
-            y: down_y,
-        },
-        MacroStep::MouseButton {
-            button: up_button,
-            action: KeyAction::Up,
-            x: up_x,
-            y: up_y,
-        },
-    ) = (down, up)
-    else {
-        return None;
-    };
-    (*x == *down_x && *y == *down_y && *x == *up_x && *y == *up_y && down_button == up_button)
-        .then_some((*down_button, *x, *y))
-}
-
 #[cfg(windows)]
 fn macro_step_kind(step: &MacroStep) -> &'static str {
     match step {
@@ -7944,15 +7777,6 @@ fn macro_step_summary(step: &MacroStep) -> String {
         MacroStep::Wheel { delta_x, delta_y } => format!("滚轮 ({delta_x}, {delta_y})"),
         MacroStep::Text { .. } => "输入文本".to_string(),
     }
-}
-
-#[cfg(all(windows, test))]
-fn combinable_click_at(
-    steps: &[MacroStep],
-    index: usize,
-    held_buttons: &HashSet<MouseButton>,
-) -> Option<(MouseButton, i32, i32)> {
-    combined_click_at(steps, index).filter(|(button, _, _)| !held_buttons.contains(button))
 }
 
 #[cfg(windows)]
@@ -8166,13 +7990,12 @@ fn split_command_line(command_line: &str) -> Vec<String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        canonical_virtual_key, clear_released_macro_trigger_state, combinable_click_at,
-        combined_click_at, discard_recording_shortcut_steps, is_keyboard_modifier,
-        is_recording_shortcut_key, is_shift_key, is_text_modifier, latched_signature_contains_vk,
-        native_hotkey_spec, push_record_step_at, randomized_delay_ms,
-        release_after_best_effort_move, resolve_cursor_start, shifted_printable_character,
-        should_show_playback_error, split_command_line, HookService, HookShared, PlaybackState,
-        RecorderState,
+        canonical_virtual_key, clear_released_macro_trigger_state,
+        discard_recording_shortcut_steps, is_keyboard_modifier, is_recording_shortcut_key,
+        is_shift_key, is_text_modifier, latched_signature_contains_vk, native_hotkey_spec,
+        push_record_step_at, randomized_delay_ms, release_after_best_effort_move,
+        resolve_cursor_start, shifted_printable_character, should_show_playback_error,
+        split_command_line, HookService, HookShared, PlaybackState, RecorderState,
     };
     use crate::MouseButton;
     use crate::{AppConfig, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep};
@@ -13671,62 +13494,5 @@ mod tests {
             .steps
             .iter()
             .all(|step| !matches!(step, MacroStep::MouseMove { .. })));
-    }
-
-    #[test]
-    fn combined_click_requires_an_adjacent_matching_triplet() {
-        let valid = vec![
-            MacroStep::MouseMove { x: 10, y: 20 },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Down,
-                x: 10,
-                y: 20,
-            },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Up,
-                x: 10,
-                y: 20,
-            },
-        ];
-        assert_eq!(
-            combined_click_at(&valid, 0),
-            Some((MouseButton::Left, 10, 20))
-        );
-
-        let mut delayed = valid.clone();
-        delayed.insert(
-            1,
-            MacroStep::Delay {
-                duration_ms: 10,
-                duration_max_ms: None,
-            },
-        );
-        assert_eq!(combined_click_at(&delayed, 0), None);
-
-        let mut drag = valid;
-        drag[2] = MacroStep::MouseMove { x: 30, y: 40 };
-        assert_eq!(combined_click_at(&drag, 0), None);
-
-        let mut held = HashSet::new();
-        held.insert(MouseButton::Left);
-        assert_eq!(combinable_click_at(&drag, 0, &held), None);
-        let valid = vec![
-            MacroStep::MouseMove { x: 10, y: 20 },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Down,
-                x: 10,
-                y: 20,
-            },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Up,
-                x: 10,
-                y: 20,
-            },
-        ];
-        assert_eq!(combinable_click_at(&valid, 0, &held), None);
     }
 }
