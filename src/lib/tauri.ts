@@ -4,6 +4,7 @@ export type RuntimeNotification = {
   id: number;
   title: string;
   message: string;
+  mode?: "background" | "foreground";
 };
 
 export async function takeRuntimeNotification(): Promise<RuntimeNotification | null> {

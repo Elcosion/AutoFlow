@@ -5,6 +5,7 @@ use crate::automation::{
     VisionPollBudget, VisionPollOptions, VisionSearchResult, WindowRectValue, MAX_WAIT_MS,
     MIN_POLL_MS,
 };
+use crate::runtime_protocol::{ScriptStopMessage, ScriptStopMode};
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,12 +23,7 @@ const SCRIPT_STOP_REQUESTED: &str = "__autoflow_stop_with_message__";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptOutcome {
     Completed,
-    StoppedWithMessage { title: String, message: String },
-}
-
-struct ScriptStopMessage {
-    title: String,
-    message: String,
+    StoppedWithMessage(ScriptStopMessage),
 }
 
 pub trait AutomationInput: Send + Sync {
@@ -227,7 +223,12 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn(
         "stop_with_message",
         move |message: String| -> Result<(), Box<EvalAltResult>> {
-            request_script_stop(&current, "AutoFlow".to_string(), message)
+            request_script_stop(
+                &current,
+                "AutoFlow".to_string(),
+                message,
+                ScriptStopMode::Background,
+            )
         },
     );
 
@@ -235,7 +236,16 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn(
         "stop_with_message",
         move |title: String, message: String| -> Result<(), Box<EvalAltResult>> {
-            request_script_stop(&current, title, message)
+            request_script_stop(&current, title, message, ScriptStopMode::Background)
+        },
+    );
+
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "stop_with_message",
+        move |message: String, options: Map| -> Result<(), Box<EvalAltResult>> {
+            let mode = parse_stop_message_options(&options).map_err(runtime_error)?;
+            request_script_stop(&current, "AutoFlow".to_string(), message, mode)
         },
     );
 
@@ -952,6 +962,7 @@ fn request_script_stop(
     state: &Arc<Mutex<ExecutionContext>>,
     title: String,
     message: String,
+    mode: ScriptStopMode,
 ) -> Result<(), Box<EvalAltResult>> {
     let title = title.trim();
     let message = message.trim();
@@ -976,8 +987,26 @@ fn request_script_stop(
             title.to_string()
         },
         message: message.to_string(),
+        mode,
     });
     Err(runtime_error(SCRIPT_STOP_REQUESTED))
+}
+
+fn parse_stop_message_options(options: &Map) -> Result<ScriptStopMode, String> {
+    if let Some(key) = options.keys().find(|key| key.as_str() != "mode") {
+        return Err(format!("stop_with_message 的选项包含未知字段：{key}"));
+    }
+    let Some(value) = options.get("mode") else {
+        return Ok(ScriptStopMode::Background);
+    };
+    let Some(mode) = value.clone().try_cast::<String>() else {
+        return Err("stop_with_message 的 mode 必须是字符串 background 或 foreground".to_string());
+    };
+    match mode.as_str() {
+        "background" => Ok(ScriptStopMode::Background),
+        "foreground" => Ok(ScriptStopMode::Foreground),
+        _ => Err("stop_with_message 的 mode 必须是 background 或 foreground".to_string()),
+    }
 }
 
 fn parse_behavior_options(options: &Map) -> Result<(Option<f32>, bool), String> {
@@ -1121,10 +1150,7 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<Script
         if let Some(error) = cleanup_error {
             return Err(format!("脚本停止后输入清理失败，当前状态不安全: {error}"));
         }
-        return Ok(ScriptOutcome::StoppedWithMessage {
-            title: stop_message.title,
-            message: stop_message.message,
-        });
+        return Ok(ScriptOutcome::StoppedWithMessage(stop_message));
     }
     if let Some(error) = cleanup_error {
         return Err(format!(
@@ -1473,11 +1499,114 @@ mod tests {
         .expect("custom stop should not be reported as a runtime failure");
         assert_eq!(
             outcome,
-            ScriptOutcome::StoppedWithMessage {
+            ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
                 title: "完成".to_string(),
                 message: "任务已经结束".to_string(),
-            }
+                mode: ScriptStopMode::Background,
+            })
         );
+    }
+
+    #[test]
+    fn legacy_one_argument_stop_uses_default_title_and_blocks_later_input() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ExecutionContext::new(
+            Arc::new(CountingInput {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        assert_eq!(
+            run_rhai_script(r#"stop_with_message("任务已经结束"); press("B");"#, context,)
+                .expect("legacy one-argument stop"),
+            ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
+                title: "AutoFlow".into(),
+                message: "任务已经结束".into(),
+                mode: ScriptStopMode::Background,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stop_with_message_supports_background_and_foreground_options() {
+        for (source, expected_mode) in [
+            (
+                r#"stop_with_message("完成", #{});"#,
+                ScriptStopMode::Background,
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: "background" });"#,
+                ScriptStopMode::Background,
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: "foreground" });"#,
+                ScriptStopMode::Foreground,
+            ),
+        ] {
+            let context = ExecutionContext::new(
+                Arc::new(TestInput),
+                Arc::new(AtomicBool::new(false)),
+                1.0,
+                None,
+            );
+            assert_eq!(
+                run_rhai_script(source, context).expect("valid stop options"),
+                ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
+                    title: "AutoFlow".into(),
+                    message: "完成".into(),
+                    mode: expected_mode,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn stop_with_message_two_strings_remain_title_and_message() {
+        let context = ExecutionContext::new(
+            Arc::new(TestInput),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        assert_eq!(
+            run_rhai_script(r#"stop_with_message("完成", "foreground");"#, context)
+                .expect("two-string overload"),
+            ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
+                title: "完成".into(),
+                message: "foreground".into(),
+                mode: ScriptStopMode::Background,
+            })
+        );
+    }
+
+    #[test]
+    fn stop_with_message_rejects_invalid_options_explicitly() {
+        for (source, expected) in [
+            (
+                r#"stop_with_message("完成", #{ surprise: true });"#,
+                "未知字段",
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: 1 });"#,
+                "mode 必须是字符串",
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: "urgent" });"#,
+                "mode 必须是 background 或 foreground",
+            ),
+        ] {
+            let context = ExecutionContext::new(
+                Arc::new(TestInput),
+                Arc::new(AtomicBool::new(false)),
+                1.0,
+                None,
+            );
+            let error = run_rhai_script(source, context).expect_err("invalid stop options");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]

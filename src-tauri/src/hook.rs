@@ -4216,10 +4216,14 @@ impl HookShared {
                         .notifications
                         .publish(&format!("{} · 运行失败", execution_rule.name), &error);
                 } else if cleanup_safe && controller_finalized {
-                    if let Some((title, message)) = script_stop_message {
+                    if let Some(message) = script_stop_message {
                         // Presentation happens only after the run has relinquished
                         // its input permit and completed cleanup and finalization.
-                        shared.notifications.publish(&title, &message);
+                        shared.notifications.publish_with_mode(
+                            &message.title,
+                            &message.message,
+                            message.mode,
+                        );
                     }
                 }
             })
@@ -6966,7 +6970,7 @@ fn key_to_character(vk: u32, scan_code: u32, pressed: &HashSet<u32>) -> Option<S
 enum AutomationProgramResult {
     Continue,
     Stopped,
-    StoppedWithMessage { title: String, message: String },
+    StoppedWithMessage(crate::runtime_protocol::ScriptStopMessage),
 }
 
 #[cfg(windows)]
@@ -6978,7 +6982,7 @@ fn play_macro_thread(
     instance_id: u64,
     input_state: Arc<InjectedInputState>,
     run_token: RunToken,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<crate::runtime_protocol::ScriptStopMessage>, String> {
     let behavior = match shared.behavior_runtime_v2(macro_rule) {
         Ok(behavior) => behavior,
         Err(error) => {
@@ -7044,8 +7048,8 @@ fn play_macro_thread(
         match iteration_result {
             Ok(AutomationProgramResult::Continue) => {}
             Ok(AutomationProgramResult::Stopped) => break Ok(()),
-            Ok(AutomationProgramResult::StoppedWithMessage { title, message }) => {
-                script_stop_message = Some((title, message));
+            Ok(AutomationProgramResult::StoppedWithMessage(message)) => {
+                script_stop_message = Some(message);
                 break Ok(());
             }
             Err(error) => break Err(error),
@@ -7728,9 +7732,7 @@ fn play_automation_program(
         &revoke,
     );
     match result {
-        Ok(Some((title, message))) => {
-            Ok(AutomationProgramResult::StoppedWithMessage { title, message })
-        }
+        Ok(Some(message)) => Ok(AutomationProgramResult::StoppedWithMessage(message)),
         Ok(None) => Ok(AutomationProgramResult::Continue),
         Err(error) if error == CANCELLED => Ok(AutomationProgramResult::Stopped),
         Err(error) => Err(error),

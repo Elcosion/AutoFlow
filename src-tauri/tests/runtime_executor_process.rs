@@ -1,6 +1,8 @@
 //! Interpreter runs in a real subprocess; parent input is exclusively fake.
 use autoflow_lib::runtime_executor::{run_parent, ExecutorBootstrap};
-use autoflow_lib::runtime_protocol::{RunIdentity, PROTOCOL_VERSION};
+use autoflow_lib::runtime_protocol::{
+    RunIdentity, ScriptStopMessage, ScriptStopMode, PROTOCOL_VERSION,
+};
 use autoflow_lib::{AutomationInput, AutomationProgram, KeyAction, MacroStep, MouseButton};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,6 +12,7 @@ struct FakeInput {
     log: Mutex<Vec<String>>,
     keys: Mutex<Vec<String>>,
     cancel_on_wait: Option<Arc<AtomicBool>>,
+    fail_cleanup: bool,
 }
 impl FakeInput {
     fn record(&self, event: String) {
@@ -76,6 +79,10 @@ impl AutomationInput for FakeInput {
         Ok(())
     }
     fn cleanup_injected_input(&self) -> Result<(), String> {
+        if self.fail_cleanup {
+            self.record("cleanup-failed".into());
+            return Err("simulated cleanup failure".into());
+        }
         self.keys.lock().expect("keys").clear();
         self.record("cleanup".into());
         Ok(())
@@ -112,7 +119,7 @@ fn run(
     cancel: &AtomicBool,
     revoked: &AtomicBool,
     progress: &dyn Fn(usize, String),
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<ScriptStopMessage>, String> {
     run_parent(
         std::path::Path::new(env!("CARGO_BIN_EXE_runtime_protocol_probe")),
         bootstrap(program, bio),
@@ -130,7 +137,7 @@ fn run_with_initial_held_buttons(
     cancel: &AtomicBool,
     revoked: &AtomicBool,
     progress: &dyn Fn(usize, String),
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<ScriptStopMessage>, String> {
     run_parent(
         std::path::Path::new(env!("CARGO_BIN_EXE_runtime_protocol_probe")),
         bootstrap_with_initial_held_buttons(program, bio, initial_held_buttons),
@@ -367,8 +374,7 @@ fn rhai_stop_message_returns_only_after_release_without_executing_next_statement
     let input = Arc::new(FakeInput::default());
     let program = AutomationProgram::Rhai {
         api_version: 1,
-        source: "key_down(\"A\"); stop_with_message(\"done\", \"complete\"); move_to(999,999);"
-            .into(),
+        source: "key_down(\"A\"); stop_with_message(\"complete\"); move_to(999,999);".into(),
     };
     let result = run(
         program,
@@ -379,12 +385,94 @@ fn rhai_stop_message_returns_only_after_release_without_executing_next_statement
         &|_, _| {},
     )
     .expect("user stop");
-    assert_eq!(result, Some(("done".into(), "complete".into())));
+    assert_eq!(
+        result,
+        Some(ScriptStopMessage {
+            title: "AutoFlow".into(),
+            message: "complete".into(),
+            mode: ScriptStopMode::Background,
+        })
+    );
     assert!(input.keys.lock().expect("keys").is_empty());
     assert_eq!(
         *input.log.lock().expect("log"),
         ["down:A", "up:A", "cleanup"]
     );
+}
+
+#[test]
+fn rhai_stop_message_foreground_mode_round_trips_through_subprocess() {
+    let input = Arc::new(FakeInput::default());
+    let result = run(
+        AutomationProgram::Rhai {
+            api_version: 1,
+            source: r#"stop_with_message("complete", #{ mode: "foreground" }); move_to(9,9);"#
+                .into(),
+        },
+        input.clone(),
+        false,
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+        &|_, _| {},
+    )
+    .expect("foreground stop");
+    assert_eq!(
+        result,
+        Some(ScriptStopMessage {
+            title: "AutoFlow".into(),
+            message: "complete".into(),
+            mode: ScriptStopMode::Foreground,
+        })
+    );
+    assert_eq!(*input.log.lock().expect("log"), ["cleanup"]);
+}
+
+#[test]
+fn rhai_stop_message_is_not_returned_when_cleanup_fails() {
+    let input = Arc::new(FakeInput {
+        fail_cleanup: true,
+        ..Default::default()
+    });
+    let error = run(
+        AutomationProgram::Rhai {
+            api_version: 1,
+            source: r#"stop_with_message("complete", #{ mode: "foreground" });"#.into(),
+        },
+        input.clone(),
+        false,
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+        &|_, _| {},
+    )
+    .expect_err("unsafe cleanup must suppress the successful stop result");
+    assert!(error.contains("清理失败"), "{error}");
+    assert_eq!(*input.log.lock().expect("log"), ["cleanup-failed"]);
+}
+
+#[test]
+fn executor_rejects_mixed_protocol_versions() {
+    let input = Arc::new(FakeInput::default());
+    let mut incompatible = bootstrap(
+        AutomationProgram::Rhai {
+            api_version: 1,
+            source: r#"stop_with_message("never");"#.into(),
+        },
+        false,
+    );
+    incompatible.version = PROTOCOL_VERSION - 1;
+    let revoked = AtomicBool::new(false);
+    let error = run_parent(
+        std::path::Path::new(env!("CARGO_BIN_EXE_runtime_protocol_probe")),
+        incompatible,
+        input.clone(),
+        &AtomicBool::new(false),
+        &|_, _| {},
+        &|| revoked.store(true, Ordering::Release),
+    )
+    .expect_err("mixed protocol versions must fail closed");
+    assert!(error.contains("失联") || error.contains("结束"), "{error}");
+    assert!(revoked.load(Ordering::Acquire));
+    assert!(input.log.lock().expect("log").is_empty());
 }
 #[test]
 fn cancel_in_a_ten_thousand_step_graph_drops_all_late_input_and_requires_parent_cleanup() {

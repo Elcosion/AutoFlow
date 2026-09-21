@@ -74,6 +74,9 @@ click(button, x, y)
 scroll(delta_x, delta_y)
 type_text(text)
 is_cancelled()
+stop_with_message(message)
+stop_with_message(title, message)
+stop_with_message(message, options)
 active_window_title() -> String
 window_exists(title_query) -> bool
 window_rect(title_query) -> Map { found, x, y, width, height }
@@ -85,6 +88,22 @@ wait_image(file_name, region_x, region_y, region_width, region_height, threshold
 find_image(file_name, region_x, region_y, region_width, region_height, threshold, options) -> Map
 wait_image(file_name, region_x, region_y, region_width, region_height, threshold, timeout_ms, poll_ms, options) -> Map
 ```
+
+`stop_with_message` 在安全释放输入后成功结束当前脚本。原有单参数和双字符串
+调用都使用后台通知；双字符串调用的第二个参数始终是消息，即使内容恰好是
+`"foreground"`。可用 Map 明确选择展示模式：
+
+```rhai
+stop_with_message("任务已完成");
+stop_with_message("完成", "任务已完成");
+stop_with_message("任务已完成", #{ mode: "background" });
+stop_with_message("请检查运行结果", #{ mode: "foreground" });
+```
+
+`options` 可为空（仍是后台），且只接受字符串字段 `mode`，值只能是
+`"background"` 或 `"foreground"`。前台模式是尽力而为的窗口展示请求；若
+系统拒绝显示、还原或聚焦，会降级为普通后台展示，通知保持待手动确认，不会
+恢复或重新启动脚本。
 
 运行时还注册了取消、仿生输入、窗口、像素和图像诊断等函数；文档示例不构成
 独立的兼容性契约。

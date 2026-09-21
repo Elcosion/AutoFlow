@@ -1,7 +1,9 @@
 //! Isolated interpreter and private-pipe input proxy. The worker has no
 //! Windows input implementation; only its parent can authorize/send input.
 use crate::rhai_runtime::{run_rhai_script, AutomationInput, ExecutionContext, ScriptOutcome};
-use crate::runtime_protocol::{read_frame, write_frame, RunIdentity, PROTOCOL_VERSION};
+use crate::runtime_protocol::{
+    read_frame, write_frame, RunIdentity, ScriptStopMessage, PROTOCOL_VERSION,
+};
 use crate::{AutomationProgram, KeyAction, MacroStep, MouseButton};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -88,7 +90,7 @@ pub enum WorkerMessage {
         sequence: u64,
         identity: RunIdentity,
         error: Option<String>,
-        stop_message: Option<(String, String)>,
+        stop_message: Option<ScriptStopMessage>,
     },
 }
 
@@ -247,7 +249,7 @@ pub fn run_parent(
     cancel: &AtomicBool,
     progress: &dyn Fn(usize, String),
     revoke: &dyn Fn(),
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<ScriptStopMessage>, String> {
     run_parent_supervised(executable, bootstrap, input, cancel, progress, &|_| {
         revoke()
     })
@@ -260,7 +262,7 @@ pub fn run_parent_supervised(
     cancel: &AtomicBool,
     progress: &dyn Fn(usize, String),
     revoke: &dyn Fn(ExecutorStopCause),
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<ScriptStopMessage>, String> {
     use std::sync::mpsc::{sync_channel, RecvTimeoutError};
     use std::time::{Duration, Instant};
     let mut command = std::process::Command::new(executable);
@@ -734,7 +736,7 @@ pub fn worker_main() {
     };
     let (error, stop_message) = match result {
         Ok(ScriptOutcome::Completed) => (None, None),
-        Ok(ScriptOutcome::StoppedWithMessage { title, message }) => (None, Some((title, message))),
+        Ok(ScriptOutcome::StoppedWithMessage(message)) => (None, Some(message)),
         Err(error) => (Some(error), None),
     };
     let _ = write_frame(

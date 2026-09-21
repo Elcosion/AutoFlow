@@ -215,7 +215,7 @@ type RhaiApiName = keyof typeof RHAI_API_COMPLETIONS;
 const RHAI_API_REFERENCE_META = {
   stop_with_message: {
     category: "脚本控制",
-    description: "立即停止当前脚本，并显示自定义标题和提示内容。",
+    description: "立即停止当前脚本，并以后台模式显示自定义标题和提示内容。",
   },
   is_cancelled: {
     category: "脚本控制",
@@ -377,6 +377,28 @@ const RHAI_API_OVERLOAD_REFERENCE_SNIPPETS: RhaiReferenceSnippet[] = [
     description: "使用默认标题停止脚本并显示提示内容。",
     code: `stop_with_message(
   "任务已完成" // message：提示内容
+);`,
+  },
+  {
+    id: "api-stop_with_message-background",
+    apiName: "stop_with_message",
+    category: "脚本控制",
+    name: "stop_with_message(message, options)",
+    description: "停止脚本并明确使用后台通知；空 Map 也默认为后台。",
+    code: `stop_with_message(
+  "任务已完成", // message：提示内容
+  #{ mode: "background" } // mode：后台通知
+);`,
+  },
+  {
+    id: "api-stop_with_message-foreground",
+    apiName: "stop_with_message",
+    category: "脚本控制",
+    name: "stop_with_message(message, options)",
+    description: "停止脚本并请求将主窗口带到前台显示通知。",
+    code: `stop_with_message(
+  "需要确认结果", // message：提示内容
+  #{ mode: "foreground" } // mode：请求前台通知
 );`,
   },
   {
