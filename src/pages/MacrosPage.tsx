@@ -757,7 +757,9 @@ export function MacrosPage() {
       if (classifyMacroSource(sourceText) === "advanced") {
         await validateRhaiSource(sourceText);
         setSourceError(null);
-        showNotice("高级 Rhai 语法检查通过");
+        showNotice(
+          "Rhai 语法及部分已知参数检查通过；变量与运行结果仍需实际执行验证",
+        );
         setSourceErrorLine(null);
         setSourceErrorColumn(null);
         return;

@@ -262,7 +262,7 @@ it("cancels pending polling work after unmount", async () => {
   expect(mocks.getCurrentWindow).not.toHaveBeenCalled();
 });
 
-it("invalidates a pending foreground step before batched acknowledgement clears state", async () => {
+it("waits for a pending foreground step before acknowledging the input barrier", async () => {
   let resolveShow!: () => void;
   let resolveAcknowledge!: (value: boolean) => void;
   mocks.isTauri.mockReturnValue(true);
@@ -286,13 +286,126 @@ it("invalidates a pending foreground step before batched acknowledgement clears 
   expect(mocks.show).toHaveBeenCalledOnce();
   await act(async () => {
     view.querySelector("button")?.click();
-    resolveAcknowledge(true);
     await Promise.resolve();
     expect(view.querySelector('[role="alertdialog"]')).not.toBeNull();
+    expect(mocks.acknowledge).not.toHaveBeenCalled();
     resolveShow();
     await Promise.resolve();
   });
   expect(mocks.unminimize).not.toHaveBeenCalled();
   expect(mocks.setFocus).not.toHaveBeenCalled();
+  expect(mocks.acknowledge).toHaveBeenCalledWith(7);
+  await act(async () => resolveAcknowledge(true));
   expect(view.querySelector('[role="alertdialog"]')).toBeNull();
+});
+
+it("promotes a deferred fault with the same id after input becomes quiescent", async () => {
+  mocks.isTauri.mockReturnValue(true);
+  mocks.take
+    .mockResolvedValueOnce({
+      id: 11,
+      title: "运行失败",
+      message: "错误",
+      mode: "background",
+    })
+    .mockResolvedValue({
+      id: 11,
+      title: "运行失败",
+      message: "错误",
+      mode: "foreground",
+    });
+  const view = await renderNotifications();
+  expect(view.querySelector('[role="alertdialog"]')).not.toBeNull();
+  expect(mocks.setFocus).not.toHaveBeenCalled();
+  await pollAgain();
+  expect(mocks.setFocus).toHaveBeenCalledOnce();
+  expect(view.querySelector('[role="alertdialog"]')).not.toBeNull();
+});
+
+it("blocks a same-id foreground upgrade until ACK resolves and never focuses after ACK", async () => {
+  let resolveAcknowledge!: (value: boolean) => void;
+  mocks.isTauri.mockReturnValue(true);
+  mocks.acknowledge.mockReturnValueOnce(
+    new Promise<boolean>((resolve) => {
+      resolveAcknowledge = resolve;
+    }),
+  );
+  mocks.take
+    .mockResolvedValueOnce({
+      id: 14,
+      title: "失败",
+      message: "保留",
+      mode: "background",
+    })
+    .mockResolvedValue({
+      id: 14,
+      title: "失败",
+      message: "保留",
+      mode: "foreground",
+    });
+  const view = await renderNotifications();
+  await act(async () => view.querySelector("button")?.click());
+  expect(mocks.acknowledge).toHaveBeenCalledWith(14);
+  await pollAgain();
+  expect(mocks.getCurrentWindow).not.toHaveBeenCalled();
+  await act(async () => resolveAcknowledge(true));
+  await pollAgain();
+  expect(view.querySelector('[role="alertdialog"]')).toBeNull();
+  expect(mocks.getCurrentWindow).not.toHaveBeenCalled();
+});
+
+it("retries presentation when ACK fails during a same-id foreground upgrade", async () => {
+  let resolveAcknowledge!: (value: boolean) => void;
+  mocks.isTauri.mockReturnValue(true);
+  mocks.acknowledge.mockReturnValueOnce(
+    new Promise<boolean>((resolve) => {
+      resolveAcknowledge = resolve;
+    }),
+  );
+  mocks.take
+    .mockResolvedValueOnce({
+      id: 15,
+      title: "失败",
+      message: "保留",
+      mode: "background",
+    })
+    .mockResolvedValue({
+      id: 15,
+      title: "失败",
+      message: "保留",
+      mode: "foreground",
+    });
+  const view = await renderNotifications();
+  await act(async () => view.querySelector("button")?.click());
+  await pollAgain();
+  expect(mocks.setFocus).not.toHaveBeenCalled();
+  await act(async () => resolveAcknowledge(false));
+  expect(mocks.setFocus).toHaveBeenCalledOnce();
+  expect(view.querySelector('[role="alertdialog"]')).not.toBeNull();
+});
+
+it("prominently replaces a queued ordinary notice with a newly prioritized fault", async () => {
+  mocks.isTauri.mockReturnValue(true);
+  mocks.take
+    .mockResolvedValueOnce({
+      id: 12,
+      title: "普通通知",
+      message: "旧消息",
+      mode: "background",
+    })
+    .mockResolvedValue({
+      id: 13,
+      title: "运行失败",
+      message: "需确认",
+      mode: "foreground",
+    });
+  const view = await renderNotifications();
+  expect(view.querySelector('[role="alertdialog"]')?.textContent).toContain(
+    "普通通知",
+  );
+  await pollAgain();
+  expect(view.querySelector('[role="alertdialog"]')?.textContent).toContain(
+    "运行失败",
+  );
+  expect(mocks.setFocus).toHaveBeenCalledOnce();
 });

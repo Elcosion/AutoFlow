@@ -1203,7 +1203,66 @@ pub fn validate_rhai_source(source: &str) -> Result<(), String> {
     }
     let mut engine = Engine::new();
     configure_engine(&mut engine, Arc::new(AtomicBool::new(false)));
-    compile_source(&engine, source).map(|_| ())
+    compile_source(&engine, source)?;
+    validate_known_move_to_arity(source, &code)
+}
+
+// This deliberately recognizes only unambiguous direct calls with one simple
+// argument. Rhai compilation does not resolve native API overloads; all other
+// calls (including nested arguments and locally defined functions) remain
+// runtime-checked rather than risking a false rejection during editing.
+fn validate_known_move_to_arity(source: &str, code: &str) -> Result<(), String> {
+    if source.contains("/*") || source.contains('`') || contains_identifier(code, "fn") {
+        return Ok(());
+    }
+    // A local function pointer or variable can shadow this native API.
+    for declaration in ["let", "const", "for"] {
+        let mut remaining = code;
+        while let Some(found) = remaining.find(declaration) {
+            let before = remaining[..found].chars().next_back();
+            let tail = &remaining[found + declaration.len()..];
+            if !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                && tail.chars().next().is_some_and(char::is_whitespace)
+                && tail.trim_start().starts_with("move_to")
+            {
+                return Ok(());
+            }
+            remaining = tail;
+        }
+    }
+    let mut offset = 0;
+    while let Some(found) = code[offset..].find("move_to") {
+        let start = offset + found;
+        let end = start + "move_to".len();
+        offset = end;
+        let before = code[..start].chars().next_back();
+        let preceding_token = code[..start].chars().rev().find(|c| !c.is_whitespace());
+        let after = code[end..].chars().next();
+        if matches!(preceding_token, Some('.' | ':'))
+            || before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            || after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = code[end..].trim_start();
+        let Some(arguments) = rest.strip_prefix('(') else {
+            continue;
+        };
+        let Some(close) = arguments.find(')') else {
+            continue;
+        };
+        let arguments = arguments[..close].trim();
+        let one_argument = arguments.trim_end_matches(',').trim();
+        if !one_argument.is_empty()
+            && arguments.chars().filter(|&c| c == ',').count() <= 1
+            && one_argument
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        {
+            return Err("move_to 需要两个坐标参数 (x, y)；末尾逗号不代表第二个参数".into());
+        }
+    }
+    Ok(())
 }
 
 fn compile_source(engine: &Engine, source: &str) -> Result<rhai::AST, String> {
@@ -1638,6 +1697,57 @@ mod tests {
     fn forbidden_capabilities_are_rejected() {
         assert!(validate_rhai_source("import \"fs\";").is_err());
         assert!(validate_rhai_source("let value = eval(\"press('A')\");").is_err());
+    }
+
+    #[test]
+    fn direct_move_to_missing_coordinate_is_rejected_before_execution() {
+        let missing = "let x = 1; move_to(x,  );";
+        assert!(validate_rhai_source(missing)
+            .expect_err("trailing comma is not a second argument")
+            .contains("两个坐标参数"));
+        assert!(validate_rhai_source("move_to(10)").is_err());
+        assert!(validate_rhai_source("move_to(10, 20)").is_ok());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ExecutionContext::new(
+            Arc::new(CountingInput {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        assert!(run_rhai_script(missing, context).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn conservative_move_to_checker_ignores_ambiguous_source() {
+        assert!(validate_rhai_source("// move_to(x, );\nmove_to(10, 20);").is_ok());
+        assert!(validate_rhai_source("let s = \"move_to(x, );\"; move_to(10, 20);").is_ok());
+        assert!(validate_rhai_source("fn move_to(x) { x } move_to(10);").is_ok());
+        assert!(validate_rhai_source("move_to((10 + 1), 20);").is_ok());
+        assert!(validate_rhai_source("let x = 10; x. move_to(20);").is_ok());
+        assert!(validate_rhai_source("let x = 1; /* move_to(x, ); */ move_to(x, 20);").is_ok());
+        let shadowed = "let move_to = Fn(\"print\"); move_to(10);";
+        assert!(
+            validate_known_move_to_arity(shadowed, &strip_strings_and_comments(shadowed)).is_ok()
+        );
+    }
+
+    #[test]
+    fn method_form_move_to_is_a_real_two_argument_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ExecutionContext::new(
+            Arc::new(CountingInput {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        run_rhai_script("let x = 10; x. move_to(20);", context)
+            .expect("Rhai accepts method syntax for this native API");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
