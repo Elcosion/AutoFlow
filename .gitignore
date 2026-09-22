@@ -3,10 +3,7 @@ dist/
 output/
 .vite/
 *.tsbuildinfo
-src-tauri/target/
 src-tauri/target-*/
-src-tauri/target-fixed/
-src-tauri/src-tauri/target-final/
 .idea/
 .vscode/
 *.log

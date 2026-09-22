@@ -1,4 +1,5 @@
 //! Bounded presentation mailbox. Producers never wait for a UI or a mutex.
+use crate::runtime_protocol::ScriptStopMode;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -11,6 +12,7 @@ pub struct RuntimeNotification {
     pub id: u64,
     pub title: String,
     pub message: String,
+    pub mode: ScriptStopMode,
 }
 
 #[derive(Default)]
@@ -24,16 +26,28 @@ pub(crate) struct RuntimeNotifications(Mutex<Mailbox>);
 
 impl RuntimeNotifications {
     pub(crate) fn publish(&self, title: &str, message: &str) -> bool {
+        self.publish_with_mode(title, message, ScriptStopMode::Background)
+    }
+
+    pub(crate) fn publish_with_mode(
+        &self,
+        title: &str,
+        message: &str,
+        mode: ScriptStopMode,
+    ) -> bool {
         let Ok(mut mailbox) = self.0.try_lock() else {
             return false;
         };
         let title: String = title.chars().take(128).collect();
         let message: String = message.chars().take(2000).collect();
-        if mailbox
+        if let Some(item) = mailbox
             .pending
-            .iter()
-            .any(|item| item.title == title && item.message == message)
+            .iter_mut()
+            .find(|item| item.title == title && item.message == message)
         {
+            if mode == ScriptStopMode::Foreground {
+                item.mode = ScriptStopMode::Foreground;
+            }
             return true;
         }
         if mailbox.pending.len() == CAPACITY {
@@ -42,9 +56,12 @@ impl RuntimeNotifications {
         }
         mailbox.next_id = mailbox.next_id.saturating_add(1);
         let id = mailbox.next_id;
-        mailbox
-            .pending
-            .push_back(RuntimeNotification { id, title, message });
+        mailbox.pending.push_back(RuntimeNotification {
+            id,
+            title,
+            message,
+            mode,
+        });
         true
     }
 
@@ -100,5 +117,35 @@ mod tests {
         assert!(queue.take().is_none());
         drop(guard);
         assert!(queue.publish("title", "message"));
+    }
+
+    #[test]
+    fn duplicate_notification_upgrades_mode_without_changing_identity() {
+        let queue = RuntimeNotifications::default();
+        assert!(queue.publish("title", "message"));
+        let background = queue.take().expect("background notification");
+        let id = background.id;
+        assert_eq!(background.mode, ScriptStopMode::Background);
+        assert!(queue.publish_with_mode("title", "message", ScriptStopMode::Foreground));
+        let upgraded = queue.take().expect("upgraded notification");
+        assert_eq!(upgraded.id, id);
+        assert_eq!(upgraded.mode, ScriptStopMode::Foreground);
+
+        assert!(queue.publish("title", "message"));
+        let not_downgraded = queue.take().expect("foreground remains pending");
+        assert_eq!(not_downgraded.id, id);
+        assert_eq!(not_downgraded.mode, ScriptStopMode::Foreground);
+    }
+
+    #[test]
+    fn acknowledge_and_publish_are_linearized_at_the_front() {
+        let queue = RuntimeNotifications::default();
+        assert!(queue.publish("first", "message"));
+        let first = queue.take().expect("first notification");
+        assert!(queue.publish("second", "message"));
+        assert!(!queue.acknowledge(first.id + 1));
+        assert_eq!(queue.take().expect("first remains").id, first.id);
+        assert!(queue.acknowledge(first.id));
+        assert_eq!(queue.take().expect("second follows").title, "second");
     }
 }

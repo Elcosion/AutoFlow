@@ -1,8 +1,7 @@
 use crate::automation::VisionService;
 use crate::behavior::v2::{BehaviorPolicy, BehaviorRuntimeV2};
 use crate::behavior::{
-    BehaviorProfile, BehaviorRecorder, BehaviorRecordingResult, BehaviorRecordingStatus,
-    BiomimeticInput, BiomimeticRuntime, DelayKind,
+    BehaviorRecorder, BehaviorRecordingResult, BehaviorRecordingStatus, DelayKind,
 };
 #[cfg(windows)]
 use crate::input_safety::{
@@ -11,7 +10,10 @@ use crate::input_safety::{
 #[cfg(windows)]
 use crate::rhai_runtime::{validate_rhai_source, AutomationInput, CANCELLED};
 #[cfg(windows)]
-use crate::runtime_control::{RunToken, RuntimeController, RuntimePhase, StartError};
+use crate::runtime_control::{
+    RunToken, RuntimeController, RuntimePhase, RuntimePhaseObservation, RuntimePhaseProvenance,
+    StartError,
+};
 use crate::{
     AppConfig, AppError, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep,
     MacroTarget, MouseButton,
@@ -80,6 +82,8 @@ pub struct MacroPlaybackStatus {
     pub action_summary: Option<String>,
     pub elapsed_ms: u64,
     pub phase: String,
+    pub phase_observation: String,
+    pub phase_provenance: String,
     pub cleanup_status: String,
     pub overlay_visible: bool,
 }
@@ -94,6 +98,40 @@ fn runtime_phase_name(phase: RuntimePhase) -> &'static str {
         RuntimePhase::Cleaning => "cleaning",
         RuntimePhase::FaultLocked => "fault_locked",
         RuntimePhase::ShuttingDown => "shutting_down",
+    }
+}
+
+#[cfg(windows)]
+fn runtime_phase_provenance_name(provenance: RuntimePhaseProvenance) -> &'static str {
+    match provenance {
+        RuntimePhaseProvenance::State => "controller_state",
+        RuntimePhaseProvenance::FaultLatch => "fault_latch",
+        RuntimePhaseProvenance::ShutdownLatch => "shutdown_latch",
+    }
+}
+
+#[cfg(windows)]
+fn unavailable_playback_status(
+    phase_provenance: &'static str,
+    last_error: &'static str,
+) -> MacroPlaybackStatus {
+    MacroPlaybackStatus {
+        running: false,
+        current_step: 0,
+        total_steps: 0,
+        last_error: Some(last_error.to_string()),
+        playback_id: 0,
+        macro_id: None,
+        macro_name: None,
+        program_kind: "unknown".to_string(),
+        action_kind: None,
+        action_summary: None,
+        elapsed_ms: 0,
+        phase: "unknown".to_string(),
+        phase_observation: "unavailable".to_string(),
+        phase_provenance: phase_provenance.to_string(),
+        cleanup_status: "unknown".to_string(),
+        overlay_visible: false,
     }
 }
 
@@ -583,8 +621,10 @@ impl HookService {
             action_kind: None,
             action_summary: None,
             elapsed_ms: 0,
-            phase: "idle".to_string(),
-            cleanup_status: "not_started".to_string(),
+            phase: "unknown".to_string(),
+            phase_observation: "unavailable".to_string(),
+            phase_provenance: "unsupported_platform".to_string(),
+            cleanup_status: "unknown".to_string(),
             overlay_visible: false,
         }
     }
@@ -2497,91 +2537,114 @@ impl HookShared {
 
     #[cfg(windows)]
     fn playback_status(&self) -> MacroPlaybackStatus {
-        let overlay_enabled = self
-            .config
-            .lock()
-            .map(|config| config.show_playback_overlay)
-            .unwrap_or(false);
+        let config = match self.config.try_lock() {
+            Ok(config) => config,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return unavailable_playback_status(
+                    "config_busy",
+                    "配置状态正在更新，播放状态暂不可确认",
+                );
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return unavailable_playback_status(
+                    "config_poisoned",
+                    "配置状态读取失败，请重启 AutoFlow",
+                );
+            }
+        };
+        let mut playback = match self.playback.try_lock() {
+            Ok(playback) => playback,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return unavailable_playback_status(
+                    "playback_busy",
+                    "播放状态正在更新，暂不可确认",
+                );
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return unavailable_playback_status(
+                    "playback_poisoned",
+                    "播放状态读取失败，请重启 AutoFlow",
+                );
+            }
+        };
+        let overlay_enabled = config.show_playback_overlay;
         let recording = self.is_recording();
-        let controller_phase = self.controller.phase();
+        // All fallible observation locks are now held or have failed without
+        // waiting. Do not retain a confirmed controller view across a wait.
+        let controller_phase = self.controller.observe_phase();
         let now = Instant::now();
-        self.playback
-            .lock()
-            .map(|mut playback| {
-                if !playback.running
-                    && !playback.terminal_persistent
-                    && playback
-                        .terminal_until
-                        .is_some_and(|deadline| deadline <= now)
+        if !playback.running
+            && !playback.terminal_persistent
+            && playback
+                .terminal_until
+                .is_some_and(|deadline| deadline <= now)
+        {
+            playback.macro_id = None;
+            playback.macro_name = None;
+            playback.program_kind = None;
+            playback.action_summary = None;
+            playback.current_step_kind = None;
+            playback.total_steps = 0;
+            playback.last_error = None;
+            playback.phase = "idle".to_string();
+            playback.cleanup_status = "not_started".to_string();
+            playback.started_at = None;
+            playback.terminal_until = None;
+            playback.terminal_persistent = false;
+        }
+        let terminal_active =
+            playback.running || playback.terminal_persistent || playback.terminal_until.is_some();
+        let (phase, phase_observation, phase_provenance) = match controller_phase {
+            RuntimePhaseObservation::Unavailable => (
+                "unknown".to_string(),
+                "unavailable".to_string(),
+                "controller_busy".to_string(),
+            ),
+            RuntimePhaseObservation::Confirmed { phase, provenance } => (
+                if matches!(
+                    phase,
+                    RuntimePhase::FaultLocked | RuntimePhase::ShuttingDown
+                ) || playback.phase.is_empty()
                 {
-                    playback.macro_id = None;
-                    playback.macro_name = None;
-                    playback.program_kind = None;
-                    playback.action_summary = None;
-                    playback.current_step_kind = None;
-                    playback.total_steps = 0;
-                    playback.last_error = None;
-                    playback.phase = "idle".to_string();
-                    playback.cleanup_status = "not_started".to_string();
-                    playback.started_at = None;
-                    playback.terminal_until = None;
-                    playback.terminal_persistent = false;
-                }
-                let terminal_active = playback.running
-                    || playback.terminal_persistent
-                    || playback.terminal_until.is_some();
-                MacroPlaybackStatus {
-                    running: playback.running,
-                    current_step: playback.current_step,
-                    total_steps: playback.total_steps,
-                    last_error: playback.last_error.clone(),
-                    playback_id: playback.instance_id,
-                    macro_id: playback.macro_id.clone(),
-                    macro_name: playback.macro_name.clone(),
-                    program_kind: playback
-                        .program_kind
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    action_kind: playback.current_step_kind.clone(),
-                    action_summary: playback.action_summary.clone(),
-                    elapsed_ms: playback
-                        .started_at
-                        .map(|started| now.saturating_duration_since(started).as_millis() as u64)
-                        .unwrap_or(0),
-                    phase: if controller_phase == RuntimePhase::FaultLocked
-                        || playback.phase.is_empty()
-                    {
-                        runtime_phase_name(controller_phase).to_string()
-                    } else {
-                        playback.phase.clone()
-                    },
-                    cleanup_status: if playback.cleanup_status.is_empty() {
-                        "not_started".to_string()
-                    } else {
-                        playback.cleanup_status.clone()
-                    },
-                    overlay_visible: overlay_enabled
-                        && !recording
-                        && terminal_active
-                        && playback.macro_name.is_some(),
-                }
-            })
-            .unwrap_or_else(|_| MacroPlaybackStatus {
-                running: false,
-                current_step: 0,
-                total_steps: 0,
-                last_error: Some("播放状态读取失败，请重启 AutoFlow".to_string()),
-                playback_id: 0,
-                macro_id: None,
-                macro_name: None,
-                program_kind: "unknown".to_string(),
-                action_kind: None,
-                action_summary: None,
-                elapsed_ms: 0,
-                phase: "failed".to_string(),
-                cleanup_status: "failed".to_string(),
-                overlay_visible: false,
-            })
+                    runtime_phase_name(phase).to_string()
+                } else {
+                    playback.phase.clone()
+                },
+                "confirmed".to_string(),
+                runtime_phase_provenance_name(provenance).to_string(),
+            ),
+        };
+        MacroPlaybackStatus {
+            running: playback.running,
+            current_step: playback.current_step,
+            total_steps: playback.total_steps,
+            last_error: playback.last_error.clone(),
+            playback_id: playback.instance_id,
+            macro_id: playback.macro_id.clone(),
+            macro_name: playback.macro_name.clone(),
+            program_kind: playback
+                .program_kind
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            action_kind: playback.current_step_kind.clone(),
+            action_summary: playback.action_summary.clone(),
+            elapsed_ms: playback
+                .started_at
+                .map(|started| now.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or(0),
+            phase,
+            phase_observation,
+            phase_provenance,
+            cleanup_status: if playback.cleanup_status.is_empty() {
+                "not_started".to_string()
+            } else {
+                playback.cleanup_status.clone()
+            },
+            overlay_visible: overlay_enabled
+                && !recording
+                && terminal_active
+                && playback.macro_name.is_some(),
+        }
     }
 
     #[cfg(windows)]
@@ -4217,10 +4280,14 @@ impl HookShared {
                         .notifications
                         .publish(&format!("{} · 运行失败", execution_rule.name), &error);
                 } else if cleanup_safe && controller_finalized {
-                    if let Some((title, message)) = script_stop_message {
+                    if let Some(message) = script_stop_message {
                         // Presentation happens only after the run has relinquished
                         // its input permit and completed cleanup and finalization.
-                        shared.notifications.publish(&title, &message);
+                        shared.notifications.publish_with_mode(
+                            &message.title,
+                            &message.message,
+                            message.mode,
+                        );
                     }
                 }
             })
@@ -4279,62 +4346,6 @@ impl HookShared {
             use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
             GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0
         });
-    }
-
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    fn behavior_runtime(&self) -> Result<Option<Arc<Mutex<BiomimeticRuntime>>>, String> {
-        let config = self.config.lock().map_err(|_| "配置状态异常".to_string())?;
-        if !config.biomimetic_enabled {
-            return Ok(None);
-        }
-        if !config.selected_biomimetic_input_ids.is_empty() {
-            let inputs = config
-                .selected_biomimetic_input_ids
-                .iter()
-                .filter_map(|input_id| {
-                    config
-                        .biomimetic_inputs
-                        .iter()
-                        .find(|input| input.id == *input_id)
-                        .cloned()
-                })
-                .collect::<Vec<BiomimeticInput>>();
-            if inputs.len() != config.selected_biomimetic_input_ids.len() {
-                return Err("当前选中的仿生输入文件不存在".to_string());
-            }
-            return BiomimeticRuntime::from_inputs(&inputs, config.biomimetic_intensity)
-                .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
-                .map_err(|error| error.message);
-        }
-        let selected_ids = if config.selected_behavior_profile_ids.is_empty() {
-            config
-                .active_behavior_profile_id
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            config.selected_behavior_profile_ids.clone()
-        };
-        if selected_ids.is_empty() {
-            return Ok(None);
-        }
-        let profiles = selected_ids
-            .iter()
-            .filter_map(|profile_id| {
-                config
-                    .behavior_profiles
-                    .iter()
-                    .find(|profile| profile.id == *profile_id)
-                    .cloned()
-            })
-            .collect::<Vec<BehaviorProfile>>();
-        if profiles.len() != selected_ids.len() {
-            return Err("当前选中的仿生行为档案不存在".to_string());
-        }
-        BiomimeticRuntime::from_profiles(&profiles, config.biomimetic_intensity)
-            .map(|runtime| Some(Arc::new(Mutex::new(runtime))))
-            .map_err(|error| error.message)
     }
 
     #[cfg(windows)]
@@ -7023,7 +7034,7 @@ fn key_to_character(vk: u32, scan_code: u32, pressed: &HashSet<u32>) -> Option<S
 enum AutomationProgramResult {
     Continue,
     Stopped,
-    StoppedWithMessage { title: String, message: String },
+    StoppedWithMessage(crate::runtime_protocol::ScriptStopMessage),
 }
 
 #[cfg(windows)]
@@ -7035,7 +7046,7 @@ fn play_macro_thread(
     instance_id: u64,
     input_state: Arc<InjectedInputState>,
     run_token: RunToken,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<crate::runtime_protocol::ScriptStopMessage>, String> {
     let behavior = match shared.behavior_runtime_v2(macro_rule) {
         Ok(behavior) => behavior,
         Err(error) => {
@@ -7101,8 +7112,8 @@ fn play_macro_thread(
         match iteration_result {
             Ok(AutomationProgramResult::Continue) => {}
             Ok(AutomationProgramResult::Stopped) => break Ok(()),
-            Ok(AutomationProgramResult::StoppedWithMessage { title, message }) => {
-                script_stop_message = Some((title, message));
+            Ok(AutomationProgramResult::StoppedWithMessage(message)) => {
+                script_stop_message = Some(message);
                 break Ok(());
             }
             Err(error) => break Err(error),
@@ -7785,180 +7796,11 @@ fn play_automation_program(
         &revoke,
     );
     match result {
-        Ok(Some((title, message))) => {
-            Ok(AutomationProgramResult::StoppedWithMessage { title, message })
-        }
+        Ok(Some(message)) => Ok(AutomationProgramResult::StoppedWithMessage(message)),
         Ok(None) => Ok(AutomationProgramResult::Continue),
         Err(error) if error == CANCELLED => Ok(AutomationProgramResult::Stopped),
         Err(error) => Err(error),
     }
-}
-
-// Test-only reference for recorded-step semantics; production interpretation
-// now lives exclusively in the isolated worker.
-#[cfg(all(windows, test))]
-#[allow(dead_code, clippy::too_many_arguments)]
-fn play_macro_steps(
-    shared: &HookShared,
-    steps: &[MacroStep],
-    speed: f32,
-    stop: &Arc<AtomicBool>,
-    held_keys: &mut HashSet<u32>,
-    held_buttons: &mut HashSet<MouseButton>,
-    behavior: Option<Arc<Mutex<BehaviorRuntimeV2>>>,
-    input_state: Arc<InjectedInputState>,
-    emergency_generation: u64,
-    instance_id: u64,
-    run_token: RunToken,
-) -> Result<bool, String> {
-    let speed = speed.max(0.05);
-    let input = WindowsAutomationInput::new(
-        behavior,
-        Arc::clone(stop),
-        input_state,
-        Arc::clone(&shared.controller),
-        run_token,
-    );
-    let mut index = 0usize;
-    while index < steps.len() {
-        if shared.stop_requested(stop, emergency_generation) {
-            return Ok(false);
-        }
-
-        if input.behavior.is_some() {
-            if let Some((button, x, y)) = combinable_click_at(steps, index, held_buttons) {
-                shared.set_playback_action(
-                    instance_id,
-                    index + 1,
-                    "combined_click",
-                    Some(format!("鼠标{}点击", mouse_button_name(button))),
-                );
-                input.bio_click_with_cancel(mouse_button_name(button), x, y, None, stop)?;
-                // Keep progress aligned with the original three recorded
-                // steps even though V2 executes them as one action.
-                shared.set_playback_action(
-                    instance_id,
-                    index + 3,
-                    "combined_click",
-                    Some(format!("鼠标{}点击", mouse_button_name(button))),
-                );
-                index += 3;
-                continue;
-            }
-        }
-
-        let step = &steps[index];
-        shared.set_playback_action(
-            instance_id,
-            index + 1,
-            macro_step_kind(step),
-            Some(macro_step_summary(step)),
-        );
-        match step {
-            MacroStep::Delay {
-                duration_ms,
-                duration_max_ms,
-            } => {
-                let result = match duration_max_ms {
-                    Some(maximum) => input.wait_random_ms(*duration_ms, *maximum, speed, stop),
-                    None => input.wait_ms(*duration_ms, speed, stop),
-                };
-                if result.is_err() {
-                    return Ok(false);
-                }
-            }
-            MacroStep::Key { key, action } => {
-                let Some(vk) = key_to_vk(key) else {
-                    return Err(format!("第 {} 步的按键“{}”暂不支持", index + 1, key));
-                };
-                if matches!(action, KeyAction::Down) {
-                    input.key_down(key)?;
-                } else {
-                    input.key_up(key)?;
-                }
-                if matches!(action, KeyAction::Down) {
-                    held_keys.insert(vk);
-                } else {
-                    held_keys.remove(&vk);
-                }
-            }
-            MacroStep::MouseButton {
-                button,
-                action,
-                x,
-                y,
-            } => {
-                let already_at_target = index > 0
-                    && matches!(
-                        &steps[index - 1],
-                        MacroStep::MouseMove {
-                            x: previous_x,
-                            y: previous_y
-                        } if *previous_x == *x && *previous_y == *y
-                    );
-                let action_x = if already_at_target { 0 } else { *x };
-                let action_y = if already_at_target { 0 } else { *y };
-                if matches!(action, KeyAction::Down) {
-                    input.mouse_down(mouse_button_name(*button), action_x, action_y)?;
-                } else {
-                    input.mouse_up(mouse_button_name(*button), action_x, action_y)?;
-                }
-                if matches!(action, KeyAction::Down) {
-                    held_buttons.insert(*button);
-                } else {
-                    held_buttons.remove(button);
-                }
-            }
-            MacroStep::MouseMove { x, y } => {
-                let followed_by_click = steps.get(index + 1).is_some_and(|next| {
-                    matches!(
-                        next,
-                        MacroStep::MouseButton {
-                            action: KeyAction::Down,
-                            ..
-                        }
-                    )
-                });
-                if input.behavior.is_some() {
-                    input.bio_move_to_with_cancel(*x, *y, None, followed_by_click, stop)?;
-                } else {
-                    input.move_to_with_cancel(*x, *y, Some(stop))?;
-                }
-            }
-            MacroStep::Wheel { delta_x, delta_y } => input.scroll(*delta_x, *delta_y)?,
-            MacroStep::Text { text } => input.type_text_with_cancel(text, Some(stop))?,
-        }
-        index += 1;
-    }
-    Ok(true)
-}
-
-#[cfg(all(windows, test))]
-fn combined_click_at(steps: &[MacroStep], index: usize) -> Option<(MouseButton, i32, i32)> {
-    let (Some(MacroStep::MouseMove { x, y }), Some(down), Some(up)) =
-        (steps.get(index), steps.get(index + 1), steps.get(index + 2))
-    else {
-        return None;
-    };
-    let (
-        MacroStep::MouseButton {
-            button: down_button,
-            action: KeyAction::Down,
-            x: down_x,
-            y: down_y,
-        },
-        MacroStep::MouseButton {
-            button: up_button,
-            action: KeyAction::Up,
-            x: up_x,
-            y: up_y,
-        },
-    ) = (down, up)
-    else {
-        return None;
-    };
-    (*x == *down_x && *y == *down_y && *x == *up_x && *y == *up_y && down_button == up_button)
-        .then_some((*down_button, *x, *y))
 }
 
 #[cfg(windows)]
@@ -8001,15 +7843,6 @@ fn macro_step_summary(step: &MacroStep) -> String {
         MacroStep::Wheel { delta_x, delta_y } => format!("滚轮 ({delta_x}, {delta_y})"),
         MacroStep::Text { .. } => "输入文本".to_string(),
     }
-}
-
-#[cfg(all(windows, test))]
-fn combinable_click_at(
-    steps: &[MacroStep],
-    index: usize,
-    held_buttons: &HashSet<MouseButton>,
-) -> Option<(MouseButton, i32, i32)> {
-    combined_click_at(steps, index).filter(|(button, _, _)| !held_buttons.contains(button))
 }
 
 #[cfg(windows)]
@@ -8223,14 +8056,14 @@ fn split_command_line(command_line: &str) -> Vec<String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        canonical_virtual_key, clear_released_macro_trigger_state, combinable_click_at,
-        combined_click_at, discard_recording_shortcut_steps, is_keyboard_modifier,
-        is_recording_shortcut_key, is_shift_key, is_text_modifier, latched_signature_contains_vk,
-        native_hotkey_spec, push_record_step_at, randomized_delay_ms,
-        release_after_best_effort_move, resolve_cursor_start, shifted_printable_character,
-        should_show_playback_error, split_command_line, HookService, HookShared, PlaybackState,
-        RecorderState,
+        canonical_virtual_key, clear_released_macro_trigger_state,
+        discard_recording_shortcut_steps, is_keyboard_modifier, is_recording_shortcut_key,
+        is_shift_key, is_text_modifier, latched_signature_contains_vk, native_hotkey_spec,
+        push_record_step_at, randomized_delay_ms, release_after_best_effort_move,
+        resolve_cursor_start, shifted_printable_character, should_show_playback_error,
+        split_command_line, HookService, HookShared, PlaybackState, RecorderState,
     };
+    use crate::runtime_control::RuntimePhase;
     use crate::MouseButton;
     use crate::{AppConfig, AutomationProgram, KeyAction, MacroMode, MacroRule, MacroStep};
     use std::collections::HashSet;
@@ -13421,6 +13254,94 @@ mod tests {
     }
 
     #[test]
+    fn playback_status_distinguishes_confirmed_fault_from_controller_contention() {
+        let contended = test_hook_service();
+        let status = contended.shared.controller.while_state_locked(|| {
+            assert_eq!(
+                contended.shared.controller.phase(),
+                RuntimePhase::FaultLocked
+            );
+            contended.shared.playback_status()
+        });
+        assert_eq!(status.phase, "unknown");
+        assert_eq!(status.phase_observation, "unavailable");
+        assert_eq!(status.phase_provenance, "controller_busy");
+
+        let faulted = test_hook_service();
+        {
+            let mut playback = faulted.shared.playback.lock().expect("playback state");
+            playback.running = true;
+            playback.phase = "running".to_string();
+        }
+        faulted.shared.controller.lock_fault();
+        let status = faulted.shared.playback_status();
+        assert_eq!(status.phase, "fault_locked");
+        assert_eq!(status.phase_observation, "confirmed");
+        assert_eq!(status.phase_provenance, "fault_latch");
+
+        let generation = faulted.shared.controller.generation();
+        let revision = faulted.shared.controller.background_generation();
+        assert!(faulted
+            .shared
+            .controller
+            .recover_after_cleanup_at(generation, revision));
+        let status = faulted.shared.playback_status();
+        assert_eq!(status.phase, "running");
+        assert_eq!(status.phase_observation, "confirmed");
+        assert_eq!(status.phase_provenance, "controller_state");
+
+        faulted.shared.controller.request_shutdown();
+        let status = faulted.shared.playback_status();
+        assert_eq!(status.phase, "shutting_down");
+        assert_eq!(status.phase_observation, "confirmed");
+        assert_eq!(status.phase_provenance, "shutdown_latch");
+    }
+
+    #[test]
+    fn playback_status_returns_without_waiting_for_config_lock() {
+        let service = test_hook_service();
+        let config = service.shared.config.lock().expect("config state");
+        let shared = Arc::clone(&service.shared);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(shared.playback_status())
+                .expect("send config-contended status");
+        });
+
+        let status = receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("status observation must not wait for config");
+        assert_eq!(status.phase, "unknown");
+        assert_eq!(status.phase_observation, "unavailable");
+        assert_eq!(status.phase_provenance, "config_busy");
+        drop(config);
+        worker.join().expect("status worker");
+    }
+
+    #[test]
+    fn playback_status_returns_without_waiting_for_playback_lock() {
+        let service = test_hook_service();
+        let playback = service.shared.playback.lock().expect("playback state");
+        let shared = Arc::clone(&service.shared);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(shared.playback_status())
+                .expect("send playback-contended status");
+        });
+
+        let status = receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("status observation must not wait for playback");
+        assert_eq!(status.phase, "unknown");
+        assert_eq!(status.phase_observation, "unavailable");
+        assert_eq!(status.phase_provenance, "playback_busy");
+        drop(playback);
+        worker.join().expect("status worker");
+    }
+
+    #[test]
     fn cleanup_failure_remains_visible_until_a_new_playback_instance() {
         let service = test_hook_service();
         service
@@ -13728,62 +13649,5 @@ mod tests {
             .steps
             .iter()
             .all(|step| !matches!(step, MacroStep::MouseMove { .. })));
-    }
-
-    #[test]
-    fn combined_click_requires_an_adjacent_matching_triplet() {
-        let valid = vec![
-            MacroStep::MouseMove { x: 10, y: 20 },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Down,
-                x: 10,
-                y: 20,
-            },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Up,
-                x: 10,
-                y: 20,
-            },
-        ];
-        assert_eq!(
-            combined_click_at(&valid, 0),
-            Some((MouseButton::Left, 10, 20))
-        );
-
-        let mut delayed = valid.clone();
-        delayed.insert(
-            1,
-            MacroStep::Delay {
-                duration_ms: 10,
-                duration_max_ms: None,
-            },
-        );
-        assert_eq!(combined_click_at(&delayed, 0), None);
-
-        let mut drag = valid;
-        drag[2] = MacroStep::MouseMove { x: 30, y: 40 };
-        assert_eq!(combined_click_at(&drag, 0), None);
-
-        let mut held = HashSet::new();
-        held.insert(MouseButton::Left);
-        assert_eq!(combinable_click_at(&drag, 0, &held), None);
-        let valid = vec![
-            MacroStep::MouseMove { x: 10, y: 20 },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Down,
-                x: 10,
-                y: 20,
-            },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Up,
-                x: 10,
-                y: 20,
-            },
-        ];
-        assert_eq!(combinable_click_at(&valid, 0, &held), None);
     }
 }

@@ -81,6 +81,7 @@ describe("Rhai editor completions", () => {
       expect.arrayContaining([
         "stop_with_message(message)",
         "stop_with_message(title, message)",
+        "stop_with_message(message, options)",
         "click(button)",
         "click(button, x, y)",
         "click(x, y)",
@@ -89,6 +90,15 @@ describe("Rhai editor completions", () => {
         "bio_type_text(text, options)",
       ]),
     );
+    const stopExamples = RHAI_API_REFERENCE_SNIPPETS.filter(
+      (snippet) => snippet.apiName === "stop_with_message",
+    ).map((snippet) => snippet.code);
+    expect(
+      stopExamples.some((code) => code.includes('mode: "background"')),
+    ).toBe(true);
+    expect(
+      stopExamples.some((code) => code.includes('mode: "foreground"')),
+    ).toBe(true);
   });
 
   it("inserts a reference snippet at the current selection", () => {

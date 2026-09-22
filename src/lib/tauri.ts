@@ -4,6 +4,7 @@ export type RuntimeNotification = {
   id: number;
   title: string;
   message: string;
+  mode?: "background" | "foreground";
 };
 
 export async function takeRuntimeNotification(): Promise<RuntimeNotification | null> {
@@ -33,13 +34,6 @@ import {
   type MacroTarget,
 } from "../types/config";
 import { repairLegacyHoldTrigger } from "./holdTrigger";
-
-export type RuntimeStatus = {
-  appName: string;
-  version: string;
-  coreState: string;
-  source: "tauri" | "browser-preview";
-};
 
 export type MacroRecordingStatus = {
   active: boolean;
@@ -79,7 +73,21 @@ export type MacroPlaybackStatus = {
     | "failed"
     | "cleanup_failed"
     | "fault_locked"
-    | "shutting_down";
+    | "shutting_down"
+    | "unknown";
+  phaseObservation: "confirmed" | "unavailable";
+  phaseProvenance:
+    | "controller_state"
+    | "fault_latch"
+    | "shutdown_latch"
+    | "controller_busy"
+    | "playback_state_unavailable"
+    | "config_busy"
+    | "config_poisoned"
+    | "playback_busy"
+    | "playback_poisoned"
+    | "transport_error"
+    | "unsupported_platform";
   cleanupStatus: "not_started" | "pending" | "safe" | "failed" | "unknown";
   overlayVisible: boolean;
 };
@@ -111,12 +119,6 @@ export type BehaviorApi = {
   profileName: string;
   functions: BehaviorApiFunction[];
   source: string;
-};
-
-type TauriStatus = {
-  app_name: string;
-  version: string;
-  core_state: string;
 };
 
 export function isTauriRuntime(): boolean {
@@ -568,11 +570,6 @@ export async function recoverInputSafety(): Promise<void> {
   await invoke("recover_input_safety");
 }
 
-export async function isMacroPlaying(): Promise<boolean> {
-  if (!isTauriRuntime()) return false;
-  return invoke<boolean>("is_macro_playing");
-}
-
 export async function getMacroPlaybackStatus(): Promise<MacroPlaybackStatus> {
   if (!isTauriRuntime()) {
     return {
@@ -582,8 +579,10 @@ export async function getMacroPlaybackStatus(): Promise<MacroPlaybackStatus> {
       playbackId: 0,
       programKind: "unknown",
       elapsedMs: 0,
-      phase: "idle",
-      cleanupStatus: "not_started",
+      phase: "unknown",
+      phaseObservation: "unavailable",
+      phaseProvenance: "unsupported_platform",
+      cleanupStatus: "unknown",
       overlayVisible: false,
     };
   }
@@ -740,30 +739,4 @@ export async function deleteAsset(
     throw new Error("图像资源管理需要在 Windows 桌面端运行");
   }
   await invoke("delete_asset", { assetId, confirmed });
-}
-
-export async function runVisionDiagnostic(durationMs = 0): Promise<string> {
-  if (!isTauriRuntime()) {
-    throw new Error("视觉诊断需要在 Windows 桌面端运行");
-  }
-  return invoke<string>("run_vision_diagnostic", { durationMs });
-}
-
-export async function getRuntimeStatus(): Promise<RuntimeStatus> {
-  if (!isTauriRuntime()) {
-    return {
-      appName: "AutoFlow",
-      version: "0.1.0",
-      coreState: "浏览器预览",
-      source: "browser-preview",
-    };
-  }
-
-  const status = await invoke<TauriStatus>("get_app_status");
-  return {
-    appName: status.app_name,
-    version: status.version,
-    coreState: status.core_state,
-    source: "tauri",
-  };
 }

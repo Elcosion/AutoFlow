@@ -229,6 +229,21 @@ submit_once(820, 430);
 
 整体速度会作用于 `wait_ms` 和 `wait_random_ms`。
 
+脚本可在释放输入后带消息正常停止：
+
+```rhai
+stop_with_message("任务已完成");
+stop_with_message("完成", "任务已完成");
+stop_with_message("任务已完成", #{ mode: "background" });
+stop_with_message("请检查运行结果", #{ mode: "foreground" });
+```
+
+原有单参数、双字符串形式均为后台通知；双字符串形式中的第二个字符串始终是
+消息。Map 可为空（默认后台），或只设置字符串 `mode` 为 `"background"` /
+`"foreground"`。前台展示是尽力而为：窗口系统拒绝显示、还原或聚焦时，会
+降级为普通后台展示，通知保持待手动确认；确认通知不会恢复或重新启动已经停止
+的脚本。
+
 ### 7.2 键盘、鼠标与文本
 
 | API                        | 说明                                   |

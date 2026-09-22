@@ -3,7 +3,23 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptStopMode {
+    #[default]
+    Background,
+    Foreground,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScriptStopMessage {
+    pub title: String,
+    pub message: String,
+    #[serde(default)]
+    pub mode: ScriptStopMode,
+}
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_PLAN_POINTS: usize = 4096;
 

@@ -114,6 +114,7 @@
         color: #75e6a4;
       }
       #interaction-zone {
+        position: relative;
         min-height: 0;
         width: 100%;
         height: 100%;
@@ -131,9 +132,41 @@
           #1a2a43 32px
         );
       }
+      #interaction-zone.clicked {
+        border-color: #c084fc;
+        background: repeating-linear-gradient(
+          45deg,
+          #2d1f4a,
+          #2d1f4a 16px,
+          #39255c 16px,
+          #39255c 32px
+        );
+        box-shadow: 0 0 0 5px rgba(192, 132, 252, 0.35);
+      }
       #interaction-zone.active {
         border-color: #ffad42;
         background: #382817;
+      }
+      #interaction-feedback {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        display: flex;
+        align-items: flex-start;
+        justify-content: flex-end;
+        padding: 10px;
+        pointer-events: none;
+      }
+      #interaction-feedback span {
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: rgba(8, 11, 17, 0.8);
+        color: #e8d5ff;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      #interaction-feedback span:empty {
+        display: none;
       }
       #vision-target {
         width: 180px;
@@ -271,6 +304,9 @@
           aria-label="安全指针区域：仅用于观察输入"
         >
           <div id="vision-target">VISION TARGET</div>
+          <div id="interaction-feedback" aria-hidden="true">
+            <span id="click-feedback-label"></span>
+          </div>
         </div>
       </section>
       <section id="operator-panel" aria-label="操作员控制与事件结果">
@@ -299,6 +335,14 @@
             <div class="status">
               <strong>观察状态</strong
               ><span id="observation-state">检测中</span>
+            </div>
+            <div class="status">
+              <strong>Completed clicks (session)</strong>
+              <span id="completed-click-count" class="clear">0</span>
+            </div>
+            <div class="status">
+              <strong>Last click evidence</strong>
+              <span id="last-click" class="clear">none</span>
             </div>
           </div>
           <p class="small-note">
@@ -355,7 +399,11 @@
         const input = document.querySelector("#text-target");
         const resultStatus = document.querySelector("#result-status");
         const fallback = document.querySelector("#clipboard-fallback");
+        const clickFeedbackLabel = document.querySelector(
+          "#click-feedback-label",
+        );
         const textEvidence = [];
+        let primaryClickCompleted = false;
         let sequence = 0;
 
         const renderHeld = () => {
@@ -363,6 +411,10 @@
           const keyNode = document.querySelector("#held-keys");
           const buttonNode = document.querySelector("#held-buttons");
           const observationNode = document.querySelector("#observation-state");
+          const clickCountNode = document.querySelector(
+            "#completed-click-count",
+          );
+          const lastClickNode = document.querySelector("#last-click");
           keyNode.textContent = snapshot.heldKeys.length
             ? snapshot.heldKeys
                 .map(
@@ -383,6 +435,25 @@
           observationNode.className =
             snapshot.observationState === "known" ? "clear" : "held";
           zone.classList.toggle("active", snapshot.heldButtons.length > 0);
+          zone.classList.toggle("clicked", primaryClickCompleted);
+          clickCountNode.textContent = String(snapshot.completedClickCount);
+          clickCountNode.className = snapshot.completedClickCount
+            ? "held"
+            : "clear";
+          lastClickNode.textContent = snapshot.lastClick
+            ? [
+                `time=${snapshot.lastClick.timeStamp ?? "null"}`,
+                `client=(${snapshot.lastClick.clientX ?? "null"},${
+                  snapshot.lastClick.clientY ?? "null"
+                })`,
+                `button=${snapshot.lastClick.button ?? "null"}`,
+                `isTrusted=${snapshot.lastClick.isTrusted}`,
+              ].join("; ")
+            : "none";
+          lastClickNode.className = snapshot.lastClick ? "held" : "clear";
+          clickFeedbackLabel.textContent = primaryClickCompleted
+            ? "PRIMARY CLICK RECORDED"
+            : "";
         };
         const log = (message, evidence = null) => {
           sequence += 1;
@@ -453,6 +524,18 @@
           },
           true,
         );
+        zone.addEventListener(
+          "click",
+          (event) => {
+            const evidence = state.clickEvent(event);
+            if (evidence.lastClick.button === 0) {
+              primaryClickCompleted = true;
+            }
+            log("click", evidence);
+            renderHeld();
+          },
+          true,
+        );
         window.addEventListener("blur", () => {
           state.windowEvent("blur", document.visibilityState);
           log("window blur; observation is now uncertain", state.snapshot());
@@ -487,6 +570,7 @@
           const sessionTransition = state.startNewSession("operator_clear");
           input.value = "";
           textEvidence.length = 0;
+          primaryClickCompleted = false;
           logNode.textContent = "";
           sequence = 0;
           renderHeld();

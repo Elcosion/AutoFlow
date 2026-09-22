@@ -1,5 +1,22 @@
 # Runtime safety refactor — checkpoint
 
+## Current snapshot baseline before this documentation update — 2026-09-21
+
+- Before this status-document update, the source/document baseline was branch
+  `codex/cleanup-dead-code` at commit
+  `9f2d8f7dd49d337ab072030923189804498888cb`, 7 commits ahead of
+  `origin/codex/cleanup-dead-code`.
+- This document-only update will add a commit and may advance HEAD/ahead counts;
+  it does not change the runtime evidence recorded below.
+- The working tree is **not clean**: protected Pro v2.1 workflow/configuration and
+  `AGENTS.md` changes remain uncommitted. They are preserved and are not evidence
+  of a clean implementation snapshot.
+- Manual acceptance has not been executed. There is no approved manual-playback
+  candidate; an engineering candidate that built successfully in an earlier
+  checkpoint does not clear the human gate.
+- The dated and numbered evidence below is historical checkpoint evidence, not a
+  full-suite re-verification of this HEAD. The manual gate remains pending.
+
 Status: implementation in progress; **not cleared for real-input testing**.
 
 ## Manual acceptance package
@@ -15,11 +32,12 @@ Status: implementation in progress; **not cleared for real-input testing**.
 **Manual acceptance has not yet been executed.** The package above defines the
 Level 0–7 gates and does not authorize real-input testing by itself.
 
-## 2026-09-19 end-to-end safety acceptance checkpoint
+## Historical checkpoint — 2026-09-19 end-to-end safety acceptance
 
 Baseline: commit `26e1d353abb0e3b861fc1c9a51817ac6d8ef5f4e`, with a clean
 working tree at `2026-09-19T03:58:05.6381822Z`. This checkpoint did not run the
 Tauri GUI, install native hooks, execute a user macro, or send desktop input.
+It is historical evidence for that baseline, not a current-HEAD full-suite run.
 
 ### Stage status
 
@@ -31,11 +49,17 @@ Tauri GUI, install native hooks, execute a user macro, or send desktop input.
 | 3. Emergency stop and rearm | Implemented in code; Windows boundary pending | The F12 detector is independent of ordinary RPC work, reports heartbeat/desktop health, revokes before cleanup, and requires trigger release before rearm. Automated tests use injected detector state. Actual lock screen, suspend/resume, integrity-level boundaries, hook starvation, and physical F12 latency remain manual Windows gates. |
 | 4. Graph, Rhai, biomimetic, mapping, and text paths | Implemented and automatically verified | All production sends converge on the permit/broker. New deterministic tests prove a vision result that returns after cancellation cannot reach the next Rhai input action, and a completed biomimetic trajectory cannot reach its writer after permit revocation. No static bypass from an execution path to input sending was found. |
 | 5. GUI, safety service, and executor isolation | Implemented in code and mock-process tests; native acceptance pending | The GUI uses a private safety-service client; the safety service owns hooks/controller/ledgers; execution runs in a separately supervised job process. Authenticated bounded IPC, lease loss, blocked RPC, child death, exit confirmation, stale requests, and unsafe-cleanup quarantine have input-free tests. Real Windows job, pipe, desktop, abrupt-process, and OS input cleanup behavior remains unproved. |
-| 6. Observer UI, diagnostics, and recovery | Implemented for the current operator flows | Status/config/focus/overlay refresh remains observational and cannot start playback. Behavior recording now exposes pending and incomplete results: a complete result can be trained and claimed only after persistence succeeds; incomplete data cannot be trained; explicit confirmed discard uses a two-phase bounded drain and retains state on failure. |
+| 6. Observer UI, diagnostics, and recovery | Basic observation flow implemented; claim/train UI pending | Status/config/focus/overlay refresh remains observational and cannot start playback. The `BehaviorRecordingStatus` pending/incomplete state and the operator-facing claim/train entry remain unfinished; the retained inactive result has no completed claim path yet. |
 | 7. Fault injection and automated acceptance | Substantially complete; native fault matrix pending | Rust unit/integration/process suites, frontend component tests, typecheck, strict Clippy, formatting, production web build, and a Tauri CLI no-bundle build pass. The suite uses mock/probe input authorities. Physical-device faults, desktop transitions, and timing/resource stress on supported Windows systems remain outside automated proof. |
 | 8. Candidate and human-test gate | Candidate built; gate not cleared | `src-tauri/target/release/autoflow.exe` was produced only by `tauri build --no-bundle` and was not launched. It is an engineering candidate for further controlled validation, not approval for real macro playback. |
 
-### Architecture decisions in this checkpoint
+The Stage 6 row is the state recorded at the 26e1d353 historical baseline. In the
+post-baseline follow-up/current pre-document code, `BehaviorRecordingStatus` now
+has pending/incomplete states, `complete_claim` is gated on successful
+persistence, and `BehaviorPage` has save/train entry points. These later code
+changes still have not passed manual acceptance.
+
+### Architecture decisions recorded after this historical baseline
 
 - Safety-service identity validation applies uniformly to ordinary commands.
   Stop and Shutdown stay callable with stale identity because they are containment
@@ -82,7 +106,7 @@ executor crash and hang behavior, native partial SendInput/release failure, and
 cleanup/quarantine recovery. The candidate path above is recorded because the
 required Tauri CLI build succeeded; it is not a safety certification.
 
-## Release-failure fault-latch checkpoint
+## Historical checkpoint — release-failure fault-latch
 
 The central cleanup-report handler now fault-locks the lifecycle controller on
 any unsuccessful release report. A subsequent empty/successful cleanup report
@@ -99,7 +123,7 @@ the cleanup callback is not proof that native releases succeeded. Lane failure
 or panic does not publish completion; a returned callback still requires the
 ledger/report, fault-state and actual thread-exit checks before safe shutdown.
 
-## F12 behavior-recording retention checkpoint — 2026-09-18
+## Historical checkpoint — F12 behavior-recording retention — 2026-09-18
 
 The confirmed destructive `BehaviorRecorder::reset` in emergency cleanup has
 been replaced by an inactive, retained capture state. A first freeze records a
@@ -133,10 +157,11 @@ protocol, 8 safety-service). Strict `cargo clippy --manifest-path
 src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`, `cargo fmt
 --manifest-path src-tauri/Cargo.toml --all -- --check` and `git diff --check`
 pass. `corepack pnpm typecheck`, `corepack pnpm test:run` (43 tests) and
-`corepack pnpm build` also pass. Cargo uses the existing
-`src-tauri/target-safety-fix` directory. Root performed only narrow mechanical
-formatting of the two worker-owned Rust files, integration review and this
-documentation update; delegated implementation was not silently rewritten.
+  `corepack pnpm build` also pass. The historical run used a temporary Cargo
+  target directory that is not retained in the current workspace; its old path
+  is not a currently usable build path. Root performed only narrow mechanical
+  formatting of the two worker-owned Rust files, integration review and this
+  documentation update; delegated implementation was not silently rewritten.
 
 ### Actual local-role execution, not native mixed-provider spawning
 
@@ -189,9 +214,9 @@ The v4 flow archive matched SHA256
 `8894EA0C0FBA66BF84B4E278EBD60CED3AE072830E93A5E25D25FD5EFDB9F7DE`.
 Only its `.codex` and astra-orchestrator skill files were merged after model
 calls finished; previous flow files were backed up under system temporary
-`codex-pro-flow-v4-c415dbe8ab97402eb322a0251c4b161a`. The model catalog points to
-the absolute project `.codex/models.json`, Pro concurrency remains 4, and default
-DeepSeek model remains `deepseek-flash`. Six root-run offline checks cover both
+`codex-pro-flow-v4-c415dbe8ab97402eb322a0251c4b161a`. The historical project-local
+model catalog file is not retained in the current workspace. Pro concurrency
+remains 4, and the default DeepSeek model remains `deepseek-flash`. Six root-run offline checks cover both
 runner/adapter official-host direct routing, custom-endpoint environment routing,
 explicit proxy modes/override, isolated opener behavior and TOML/JSON/Python
 syntax. No upstream call or adapter start is part of those offline checks.
@@ -208,7 +233,7 @@ already absent when checked at cleanup, so no unrelated/reused PID was killed.
 Port 8765 has no listener, the temporary Key environment variable is absent, and
 no owned role runner remains running.
 
-### Next incomplete gate — identified, not changed this turn
+### Historical next incomplete gate — identified at that checkpoint
 
 `BehaviorRecordingStatus` and the TypeScript counterpart still lack an explicit
 pending/incomplete state. `BehaviorPage.tsx` renders its stop/train action only
@@ -218,11 +243,17 @@ pending/incomplete status, show stopped/pending versus faulted capture accuratel
 provide a one-time train/claim path for complete results, and test refresh/error
 and deliberate discard/recovery UX without automatic data loss or restart.
 
+This section preserves the earlier checkpoint state; it is not a claim that the
+post-baseline code still lacks these entries. Manual acceptance remains pending.
+
 The complete original eight-stage refactor, full API/trigger/isolation/fault/
 stress/resource-leak matrix and correctly packaged production-candidate gates
 remain incomplete. This checkpoint is NOT permission for human macro playback.
 
-## Implemented in this checkpoint
+## Historical implementation index (not current HEAD)
+
+The entries below preserve implementation facts from earlier checkpoints; they
+are not a current-HEAD completion claim.
 
 - Single lifecycle authority with run identity and cancellation generation.
 - Admission leases prevent rejected/cancelled starts from damaging active runs.
@@ -264,7 +295,16 @@ remain incomplete. This checkpoint is NOT permission for human macro playback.
 - Remap down/up now execute on one bounded worker (32 pending tasks), not inside the low-level keyboard hook. Nonblocking down submission reserves source/target before queueing so immediate up remains associated; failed admission rolls back reservation and preserves physical input. Duplicate target reservations are rejected. Up submission is recovery-only; a full/unavailable queue requests the independent emergency stop. Invalidated down permission introduces no OS input and does not cancel a newer macro. Shutdown closes remap admission. A channel-controlled mock regression verifies order, reservation rollback and priority stop on full release queue. Cross-producer ledger ownership, canceled reservation lifetime and recording/remap admission remain acceptance work; no complete safety claim is made.
 - Unit-test construction does not install Windows hooks. Test diagnostics use a temporary directory, not production AppData diagnostics.
 
-## Verified
+## Historical verification index (not current HEAD)
+
+The entries in this section preserve results from earlier checkpoint snapshots;
+they are not a claim that the full suite was rerun on the current HEAD. The
+2026-09-19 baseline is commit `26e1d353abb0e3b861fc1c9a51817ac6d8ef5f4e`, and
+the 2026-09-20 runtime-safety snapshot is commit `ba1a9665b8ad8a0b64437bda31a7355d2a1d5a03`.
+The original per-checkpoint counts—including 325, 289, 280 and 250 Rust tests,
+the 12 Vitest files / 53 frontend tests, and their associated build and
+subprocess results—remain attached to their historical entries and retain their
+input-free/native-boundary qualifications.
 
 - Prestarted priority-cleanup checkpoint: production construction now creates a dedicated cleanup lane before publishing/installing hooks. Live stop entries revoke input first, allocate a nonwrapping sequence in a close-fenced atomic word, and unpark the existing worker; no live callback takes cleanup registry/business locks or creates a cleanup thread. One lane serializes and coalesces pending sequences. Shutdown closes admission only after execution/hook/background quiescence, drains accepted cleanup requests and confirms the retained lane OS handle including TLS destructors. Closed-lane duplicate shutdown requests cannot publish work behind exit. Unconfirmed cleanup/panic is not completion and cannot automatically retry/recover. Exhausted sequence identity makes readiness false. Legacy one-shot helpers remain only for partial-construction rollback before hooks exist and isolated input-free fixtures. Nine new tests cover 1000 coalesced requests, failed/panicked lane quarantine, 100 producer-close races, delayed TLS exit, sequence exhaustion, business-lock-independent live handoff with no legacy spawn, closed-lane shutdown fencing and HookService panic fault locking. All 289 library tests and 17 subprocess/mock-input tests pass in an all-targets run; strict Clippy, Rust formatting and whitespace checks pass. Producer-close races also pass 20 repeated runs (2000 races). Full original API/trigger/recording-retention/isolation/stress/resource-leak acceptance and the production candidate package gates are still incomplete. This is software fail-closed coordination, not a guarantee against an already-entered unbounded Windows system call. No user macro or real desktop input was executed; human playback remains blocked.
 

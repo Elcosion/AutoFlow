@@ -1,40 +1,64 @@
 # Rhai automation
 
-AutoFlow configuration schema v2 keeps the common macro metadata and stores
-the executable content in one `program` value:
+AutoFlow currently writes configuration schema 6. The root `config.json` keeps
+the macro index (`macros: []` plus `macroFiles`); each indexed `MacroRule` is
+stored as one JSON file under `<AppData>/data/scripts/`.
+
+The following root JSON is an excerpt of macro-storage fields, not a complete
+`AppConfig` file:
 
 ```json
 {
-  "schemaVersion": 2,
-  "macros": [
+  "schemaVersion": 6,
+  "globalEnabled": true,
+  "emergencyStop": "F12",
+  "hotkeys": [],
+  "textExpansions": [],
+  "macros": [],
+  "macroFiles": [
     {
       "id": "macro-example",
       "name": "Daily action",
-      "enabled": false,
-      "triggerKeys": ["Ctrl", "F8"],
-      "mode": "once",
-      "repeatCount": 1,
-      "speed": 1,
-      "recordMouseMove": true,
-      "recordMouseClicks": true,
-      "program": {
-        "kind": "macro",
-        "steps": [{ "type": "delay", "durationMs": 300 }]
-      }
+      "fileName": "Daily action.json"
     }
   ]
 }
 ```
 
-`program.kind = "macro"` is produced by recording and edited graphically.
-`program.kind = "rhai"` is `{ "source": "...", "apiVersion": 1 }` and is
-used for scripts containing variables, conditions, loops or user functions.
-Schema v1 and rules containing only the old `steps` field are migrated into
-the macro variant before validation and persistence.
+The indexed file `data/scripts/Daily action.json` contains the complete
+`MacroRule`. This safe Rhai example is disabled and has no trigger keys:
+
+```json
+{
+  "id": "macro-example",
+  "name": "Daily action",
+  "enabled": false,
+  "triggerKeys": [],
+  "mode": "once",
+  "repeatCount": 1,
+  "speed": 1,
+  "recordMouseMove": true,
+  "recordMouseClicks": true,
+  "program": {
+    "kind": "rhai",
+    "source": "wait_ms(100);",
+    "apiVersion": 1
+  }
+}
+```
+
+For a graphical macro, replace `program` with
+`{ "kind": "macro", "steps": [{ "type": "delay", "durationMs": 300 }] }`.
+`apiVersion` is currently only `1`, and a Rhai program's `source` must be
+non-empty. A missing schema version is read as v1; schema 1, schema 2 and
+rules with only the old top-level `steps` field remain readable and migrate to
+the nested program form before validation and persistence. The current writer
+always emits schema 6; `schemaVersion > 6` is rejected.
 
 ## API v1
 
-The allowed AutoFlow functions are:
+以下是常用/示例 API，不是穷举清单；重载、参数约束和实际可用函数以
+`src-tauri/src/rhai_runtime.rs` 的 `register_api` 为准：
 
 ```text
 wait_ms(ms)
@@ -50,6 +74,9 @@ click(button, x, y)
 scroll(delta_x, delta_y)
 type_text(text)
 is_cancelled()
+stop_with_message(message)
+stop_with_message(title, message)
+stop_with_message(message, options)
 active_window_title() -> String
 window_exists(title_query) -> bool
 window_rect(title_query) -> Map { found, x, y, width, height }
@@ -61,6 +88,25 @@ wait_image(file_name, region_x, region_y, region_width, region_height, threshold
 find_image(file_name, region_x, region_y, region_width, region_height, threshold, options) -> Map
 wait_image(file_name, region_x, region_y, region_width, region_height, threshold, timeout_ms, poll_ms, options) -> Map
 ```
+
+`stop_with_message` 在安全释放输入后成功结束当前脚本。原有单参数和双字符串
+调用都使用后台通知；双字符串调用的第二个参数始终是消息，即使内容恰好是
+`"foreground"`。可用 Map 明确选择展示模式：
+
+```rhai
+stop_with_message("任务已完成");
+stop_with_message("完成", "任务已完成");
+stop_with_message("任务已完成", #{ mode: "background" });
+stop_with_message("请检查运行结果", #{ mode: "foreground" });
+```
+
+`options` 可为空（仍是后台），且只接受字符串字段 `mode`，值只能是
+`"background"` 或 `"foreground"`。前台模式是尽力而为的窗口展示请求；若
+系统拒绝显示、还原或聚焦，会降级为普通后台展示，通知保持待手动确认，不会
+恢复或重新启动脚本。
+
+运行时还注册了取消、仿生输入、窗口、像素和图像诊断等函数；文档示例不构成
+独立的兼容性契约。
 
 The optional image-search map uses `mode: "auto"`, `"exact"`, or `"fast"`,
 `prefer_last: true|false`, `max_candidates` from 1 to 32, and scale values as
@@ -107,9 +153,10 @@ fields are diagnostic only and do not change old scripts.
 
 Wait values are non-negative integers, coordinates and wheel values are i32,
 buttons are `left`, `right`, `middle`, `x1` or `x2`, and text/key arguments are
-strings. Compatible source uses only top-level calls and can be converted to
-`MacroStep[]`; `press` and `click` become balanced down/up pairs. Strings are
-JSON-escaped so quotes, backslashes, newlines and Unicode survive a round trip.
+strings. The frontend parser in `src/lib/macroSource.ts` handles compatible
+source with only top-level calls and converts it to `MacroStep[]`; `press` and
+`click` become balanced down/up pairs. Strings are JSON-escaped so quotes,
+backslashes, newlines and Unicode survive a round trip.
 
 Window queries use physical screen pixels. Matching is case-insensitive and
 uses title substrings. `window_rect` returns the extended outer frame in screen
