@@ -52,15 +52,27 @@ export function RuntimeNotifications() {
   const [error, setError] = useState<string | null>(null);
   const acknowledged = useRef(new Set<number>());
   const presentedForeground = useRef(new Set<number>());
+  const foregroundInFlight = useRef(new Set<Promise<void>>());
+  const dismissingId = useRef<number | null>(null);
+  const [presentationRetry, setPresentationRetry] = useState(0);
   const foregroundEpoch = useRef(0);
   const pollInFlight = useRef<Promise<void> | null>(null);
   const mounted = useRef(false);
   async function dismiss() {
-    if (!notification || confirming) return;
+    if (!notification || confirming || dismissingId.current === notification.id)
+      return;
     const dismissed = notification;
+    // Publish synchronously: a same-id background -> foreground upgrade
+    // cannot schedule a new focus while the ACK request is in flight.
+    dismissingId.current = dismissed.id;
     setConfirming(true);
+    let acknowledgedSuccessfully = false;
     try {
+      // Do not clear the backend input barrier while a delayed window focus
+      // call for this notice could still complete and steal the next target.
+      await Promise.all([...foregroundInFlight.current]);
       if (await acknowledgeRuntimeNotification(dismissed.id)) {
+        acknowledgedSuccessfully = true;
         // Invalidate an in-flight window sequence before React schedules the
         // dialog clear; effect cleanup may not run until the batch commits.
         foregroundEpoch.current += 1;
@@ -82,6 +94,12 @@ export function RuntimeNotifications() {
         setError("通知服务暂时不可用，请重试；宏不会重新启动。");
       }
     } finally {
+      if (!acknowledgedSuccessfully && dismissingId.current === dismissed.id) {
+        dismissingId.current = null;
+        if (mounted.current) setPresentationRetry((value) => value + 1);
+      }
+      // On success keep this id fenced until React unmounts/replaces it;
+      // older IPC polls must never enqueue late window focus after ACK.
       if (mounted.current) setConfirming(false);
     }
   }
@@ -102,9 +120,10 @@ export function RuntimeNotifications() {
           if (next && !acknowledged.current.has(next.id)) {
             const normalized = normalizeNotification(next);
             setNotification((current) => {
-              if (current && current.id !== normalized.id) return current;
               if (current && sameNotification(current, normalized))
                 return current;
+              // A fault may be inserted ahead of a non-fault notice. Switch
+              // to the new front; the displaced notice remains in the queue.
               return normalized;
             });
           }
@@ -131,6 +150,7 @@ export function RuntimeNotifications() {
     if (
       !notification ||
       notification.mode !== "foreground" ||
+      dismissingId.current === notification.id ||
       !isTauriRuntime()
     ) {
       return;
@@ -138,12 +158,20 @@ export function RuntimeNotifications() {
     let cancelled = false;
     let token: number | undefined;
     const isCurrent = () =>
-      !cancelled && token !== undefined && foregroundEpoch.current === token;
+      !cancelled &&
+      token !== undefined &&
+      foregroundEpoch.current === token &&
+      dismissingId.current !== notification.id;
     const present = async () => {
       // Deferring the claim lets React StrictMode finish its development-only
       // setup/cleanup probe without consuming this notification's one attempt.
       await Promise.resolve();
-      if (cancelled || presentedForeground.current.has(notification.id)) return;
+      if (
+        cancelled ||
+        dismissingId.current === notification.id ||
+        presentedForeground.current.has(notification.id)
+      )
+        return;
       presentedForeground.current.add(notification.id);
       token = foregroundEpoch.current + 1;
       foregroundEpoch.current = token;
@@ -179,14 +207,18 @@ export function RuntimeNotifications() {
       }
       if (!isCurrent()) return;
     };
-    void present();
+    const promise = present();
+    foregroundInFlight.current.add(promise);
+    void promise.finally(() => {
+      foregroundInFlight.current.delete(promise);
+    });
     return () => {
       cancelled = true;
       if (token !== undefined && foregroundEpoch.current === token) {
         foregroundEpoch.current += 1;
       }
     };
-  }, [notification?.id, notification?.mode]);
+  }, [notification?.id, notification?.mode, presentationRetry]);
 
   if (!notification) return null;
   return (

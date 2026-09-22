@@ -34,6 +34,7 @@ import {
   stopMacro,
   stopMacroRecording,
   validateRhaiSource,
+  type RhaiValidationReport,
 } from "../lib/tauri";
 import { nextCapturedKeys } from "../lib/triggerCapture";
 import {
@@ -69,6 +70,25 @@ type MacroUndoEntry = {
   label: string;
   macros: MacroRule[];
   selectedId: string | null;
+};
+
+type SourceCheckResult = {
+  macroId: string;
+  source: string;
+  sourceRevision: number;
+  status: "checking" | "success" | "error";
+  message?: string;
+  report?: RhaiValidationReport;
+  line?: number | null;
+  column?: number | null;
+};
+
+type SourceCheckError = {
+  macroId: string;
+  sourceRevision: number;
+  message: string;
+  line: number | null;
+  column: number | null;
 };
 
 const rhaiReferenceSnippets: RhaiReferenceSnippet[] = [
@@ -340,6 +360,10 @@ export function MacrosPage() {
   const [sourceText, setSourceText] = useState("");
   const [sourceDirty, setSourceDirty] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
+  const [sourceCheckResult, setSourceCheckResult] =
+    useState<SourceCheckResult | null>(null);
+  const [sourceCheckError, setSourceCheckError] =
+    useState<SourceCheckError | null>(null);
   const [sourceErrorLine, setSourceErrorLine] = useState<number | null>(null);
   const [sourceErrorColumn, setSourceErrorColumn] = useState<number | null>(
     null,
@@ -371,12 +395,38 @@ export function MacrosPage() {
   const playbackTimerRef = useRef<number | null>(null);
   const configRef = useRef(config);
   const selectedIdRef = useRef(selectedId);
+  const sourceRevisionRef = useRef(0);
+  const sourceCheckRequestRef = useRef(0);
   const undoStackRef = useRef(undoStack);
   const undoLastMacroChangeRef = useRef<() => Promise<void>>(async () => {});
   const editorMacroIdRef = useRef<string | null>(null);
   const recordingMacroIdRef = useRef<string | null>(null);
   const finishingRecordingRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const selectMacro = (id: string | null) => {
+    selectedIdRef.current = id;
+    setSelectedId(id);
+  };
+
+  const invalidateSourceCheck = (clearResult: boolean) => {
+    sourceRevisionRef.current += 1;
+    sourceCheckRequestRef.current += 1;
+    if (clearResult) {
+      setSourceCheckResult(null);
+    } else {
+      setSourceCheckResult((current) =>
+        current?.status === "checking" ? null : current,
+      );
+    }
+    setSourceCheckError(null);
+  };
+
+  const dismissSourceCheck = () => {
+    sourceCheckRequestRef.current += 1;
+    setSourceCheckResult(null);
+    setSourceCheckError(null);
+  };
 
   useEffect(() => {
     configRef.current = config;
@@ -400,7 +450,7 @@ export function MacrosPage() {
   );
 
   useEffect(() => {
-    if (!selectedId && config.macros[0]) setSelectedId(config.macros[0].id);
+    if (!selectedId && config.macros[0]) selectMacro(config.macros[0].id);
   }, [config.macros, selectedId]);
 
   useEffect(() => {
@@ -414,16 +464,21 @@ export function MacrosPage() {
   useEffect(() => {
     const next = config.macros.find((macro) => macro.id === selectedId);
     const previousMacroId = editorMacroIdRef.current;
+    const nextSource = next ? macroToSource(next) : "";
     if (!shouldHydrateSourceDraft(previousMacroId, selectedId, sourceDirty)) {
       return;
     }
     if (previousMacroId !== selectedId) {
+      invalidateSourceCheck(true);
       setEditorView(next?.program.kind === "rhai" ? "source" : "visual");
       editorMacroIdRef.current = selectedId;
+    } else if (nextSource !== sourceText) {
+      invalidateSourceCheck(false);
     }
-    setSourceText(next ? macroToSource(next) : "");
+    setSourceText(nextSource);
     setSourceDirty(false);
     setSourceError(next?.importError ?? null);
+    setSourceCheckError(null);
     setSourceErrorLine(null);
     setSourceErrorColumn(null);
   }, [config.macros, selectedId, sourceDirty]);
@@ -495,6 +550,11 @@ export function MacrosPage() {
   const selected = draft;
   const selectedSteps = selected ? macroSteps(selected) : [];
   const selectedSourceKind = classifyMacroSource(sourceText);
+  const activeSourceCheckError =
+    sourceCheckError?.macroId === selected?.id &&
+    sourceCheckError?.sourceRevision === sourceRevisionRef.current
+      ? sourceCheckError
+      : null;
   const hasCustomBehaviorPolicy = selected?.behaviorPolicy !== undefined;
   const selectedBehaviorPolicy =
     selected?.behaviorPolicy ?? config.behaviorPolicy;
@@ -604,12 +664,14 @@ export function MacrosPage() {
       const restoredMacro = savedConfig.macros.find(
         (macro) => macro.id === restoredId,
       );
-      setSelectedId(restoredId);
+      selectMacro(restoredId);
       setSelectedIds(new Set());
       setDraft(restoredMacro ? copyMacro(restoredMacro) : null);
+      invalidateSourceCheck(false);
       setSourceText(restoredMacro ? macroToSource(restoredMacro) : "");
       setSourceDirty(false);
       setSourceError(restoredMacro?.importError ?? null);
+      setSourceCheckError(null);
       showNotice(`已撤销：${entry.label}`);
     } catch (reason) {
       setError(toErrorMessage(reason));
@@ -735,13 +797,17 @@ export function MacrosPage() {
 
   const openSourceEditor = () => {
     if (!selected) return;
-    setSourceText(macroToSource(selected));
+    const nextSource = macroToSource(selected);
+    if (nextSource !== sourceText) invalidateSourceCheck(false);
+    setSourceText(nextSource);
     setSourceDirty(false);
     setSourceError(null);
+    setSourceCheckError(null);
     setEditorView("source");
   };
 
   const showSourceError = (reason: unknown) => {
+    setSourceCheckError(null);
     if (reason instanceof MacroSourceError) {
       setSourceErrorLine(reason.line);
       setSourceErrorColumn(reason.column);
@@ -753,27 +819,86 @@ export function MacrosPage() {
   };
 
   const checkSource = async () => {
+    if (!selected) return;
+    const macroId = selected.id;
+    const source = sourceText;
+    const sourceRevision = sourceRevisionRef.current;
+    const requestId = ++sourceCheckRequestRef.current;
+    const isCurrent = () =>
+      requestId === sourceCheckRequestRef.current &&
+      sourceRevision === sourceRevisionRef.current &&
+      selectedIdRef.current === macroId;
+
+    setSourceCheckResult({
+      macroId,
+      source,
+      sourceRevision,
+      status: "checking",
+    });
+    setSourceCheckError(null);
+    setSourceError(null);
+    setSourceErrorLine(null);
+    setSourceErrorColumn(null);
+
+    const setCheckFailure = (reason: unknown) => {
+      if (!isCurrent()) return;
+      const line = reason instanceof MacroSourceError ? reason.line : null;
+      const column = reason instanceof MacroSourceError ? reason.column : null;
+      const message = toErrorMessage(reason);
+      setSourceCheckError({
+        macroId,
+        sourceRevision,
+        message,
+        line,
+        column,
+      });
+      setSourceCheckResult({
+        macroId,
+        source,
+        sourceRevision,
+        status: "error",
+        message,
+        line,
+        column,
+      });
+    };
+
     try {
-      if (classifyMacroSource(sourceText) === "advanced") {
-        await validateRhaiSource(sourceText);
+      if (classifyMacroSource(source) === "advanced") {
+        const report = await validateRhaiSource(source);
+        if (!isCurrent()) return;
+        setSourceCheckResult({
+          macroId,
+          source,
+          sourceRevision,
+          status: "success",
+          report,
+        });
+        setSourceCheckError(null);
         setSourceError(null);
-        showNotice("高级 Rhai 语法检查通过");
         setSourceErrorLine(null);
         setSourceErrorColumn(null);
         return;
       }
-      if (!selected) return;
-      parseMacroSource(sourceText, selected);
+      parseMacroSource(source, selected);
+      if (!isCurrent()) return;
       setSourceError(null);
       setSourceErrorLine(null);
       setSourceErrorColumn(null);
-      showNotice("语法检查通过");
+      setSourceCheckError(null);
+      setSourceCheckResult({
+        macroId,
+        source,
+        sourceRevision,
+        status: "success",
+      });
     } catch (reason) {
-      showSourceError(reason);
+      setCheckFailure(reason);
     }
   };
 
   const formatSource = () => {
+    setSourceCheckError(null);
     const result = formatRhaiSource(sourceText);
     if (!result.ok) {
       setSourceError(result.error.message);
@@ -830,7 +955,9 @@ export function MacrosPage() {
           (macro) => macro.id === candidate.id,
         );
         setDraft(copyMacro(savedMacro ?? candidate));
-        setSourceText(macroToSource(savedMacro ?? candidate));
+        const savedSource = macroToSource(savedMacro ?? candidate);
+        if (savedSource !== sourceText) invalidateSourceCheck(false);
+        setSourceText(savedSource);
         setSourceDirty(false);
         setSourceError(null);
         setSourceErrorLine(null);
@@ -865,7 +992,9 @@ export function MacrosPage() {
         (macro) => macro.id === candidate.id,
       );
       setDraft(copyMacro(savedMacro ?? candidate));
-      setSourceText(macroToSource(savedMacro ?? candidate));
+      const savedSource = macroToSource(savedMacro ?? candidate);
+      if (savedSource !== sourceText) invalidateSourceCheck(false);
+      setSourceText(savedSource);
       setSourceDirty(false);
       setSourceError(null);
       setSourceErrorLine(null);
@@ -892,7 +1021,7 @@ export function MacrosPage() {
 
   const addMacro = () => {
     const macro = blankMacro(config.macros);
-    setSelectedId(macro.id);
+    selectMacro(macro.id);
     setDraft(macro);
     void save([...config.macros, macro], "已创建宏");
   };
@@ -901,7 +1030,7 @@ export function MacrosPage() {
     if (!selected) return;
     void stopMacro();
     const next = config.macros.filter((macro) => macro.id !== selected.id);
-    setSelectedId(next[0]?.id ?? null);
+    selectMacro(next[0]?.id ?? null);
     setSelectedIds((current) => {
       const nextIds = new Set(current);
       nextIds.delete(selected.id);
@@ -932,7 +1061,7 @@ export function MacrosPage() {
     void stopMacro();
     const next = config.macros.filter((macro) => !selectedIds.has(macro.id));
     if (selected && selectedIds.has(selected.id)) {
-      setSelectedId(next[0]?.id ?? null);
+      selectMacro(next[0]?.id ?? null);
     }
     setSelectedIds(new Set());
     void save(next, `已删除 ${config.macros.length - next.length} 个宏`);
@@ -1027,7 +1156,7 @@ export function MacrosPage() {
           [...configRef.current.macros, macro],
           "创建录制宏",
         );
-        setSelectedId(macro.id);
+        selectMacro(macro.id);
         setDraft(macro);
       }
       await startMacroRecording(
@@ -1111,7 +1240,7 @@ export function MacrosPage() {
             recordingMacroIdRef.current = macro.id;
             if (!selected) {
               const macros = [...configRef.current.macros, macro];
-              setSelectedId(macro.id);
+              selectMacro(macro.id);
               setDraft(copyMacro(macro));
               void persistMacroChange(macros, "创建录制宏").catch((reason) =>
                 setError(toErrorMessage(reason)),
@@ -1352,11 +1481,11 @@ export function MacrosPage() {
                 <div
                   className={`rule-list-item ${selectedId === macro.id ? "is-selected" : ""}`}
                   key={macro.id}
-                  onClick={() => setSelectedId(macro.id)}
+                  onClick={() => selectMacro(macro.id)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      setSelectedId(macro.id);
+                      selectMacro(macro.id);
                     }
                   }}
                   role="button"
@@ -1484,12 +1613,26 @@ export function MacrosPage() {
                     </button>
                   </div>
                   <RhaiEditor
-                    errorColumn={sourceError ? sourceErrorColumn : null}
-                    errorLine={sourceError ? sourceErrorLine : null}
+                    errorColumn={
+                      activeSourceCheckError
+                        ? activeSourceCheckError.column
+                        : sourceError
+                          ? sourceErrorColumn
+                          : null
+                    }
+                    errorLine={
+                      activeSourceCheckError
+                        ? activeSourceCheckError.line
+                        : sourceError
+                          ? sourceErrorLine
+                          : null
+                    }
                     onChange={(value) => {
+                      invalidateSourceCheck(false);
                       setSourceText(value);
                       setSourceDirty(true);
                       setSourceError(null);
+                      setSourceCheckError(null);
                     }}
                     onCheck={checkSource}
                     onFormat={formatSource}
@@ -1516,7 +1659,87 @@ export function MacrosPage() {
                     <small>
                       高级脚本可使用变量、条件、循环和函数，但不能访问文件、网络、进程或系统命令。
                     </small>
+                    <small>
+                      静态检查无法保证脚本可以运行；输入、窗口和动态值仍需运行时确认。
+                    </small>
                   </div>
+                  {sourceCheckResult?.macroId === selected.id ? (
+                    <div
+                      aria-live="polite"
+                      className="rhai-source-help"
+                      role="status"
+                    >
+                      <div className="rhai-source-help-summary">
+                        <div>
+                          <strong>
+                            {sourceCheckResult.status === "checking"
+                              ? "正在检查"
+                              : sourceCheckResult.status === "error"
+                                ? "语法检查失败"
+                                : sourceCheckResult.report
+                                  ? "静态检查完成"
+                                  : "语法检查通过"}
+                          </strong>
+                        </div>
+                        <button
+                          aria-label="关闭检查结果"
+                          className="button button-secondary"
+                          onClick={dismissSourceCheck}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              dismissSourceCheck();
+                            }
+                          }}
+                          type="button"
+                        >
+                          关闭
+                        </button>
+                      </div>
+                      {sourceCheckResult.sourceRevision !==
+                      sourceRevisionRef.current ? (
+                        <small>内容已更改，结果已过期，请重新检查。</small>
+                      ) : null}
+                      {sourceCheckResult.status === "checking" &&
+                      sourceCheckResult.sourceRevision ===
+                        sourceRevisionRef.current ? (
+                        <small>正在检查当前脚本，请稍候。</small>
+                      ) : null}
+                      {sourceCheckResult.status === "error" ? (
+                        <>
+                          <small>{sourceCheckResult.message}</small>
+                          {sourceCheckResult.line ? (
+                            <small>
+                              第 {sourceCheckResult.line} 行第{" "}
+                              {sourceCheckResult.column ?? 1} 列
+                            </small>
+                          ) : null}
+                        </>
+                      ) : null}
+                      {sourceCheckResult.status === "success" &&
+                      sourceCheckResult.report ? (
+                        <>
+                          <strong>
+                            {sourceCheckResult.report.unverifiedCalls.length}{" "}
+                            处调用未验证
+                          </strong>
+                          {sourceCheckResult.report.unverifiedCalls.map(
+                            (call, index) => (
+                              <small
+                                key={`${call.name}-${call.line}-${call.column}-${index}`}
+                              >
+                                {call.name}（第 {call.line ?? "?"} 行第{" "}
+                                {call.column ?? "?"} 列）：{call.reason}
+                              </small>
+                            ),
+                          )}
+                          <small>
+                            检查未发现确定错误不代表运行成功；请在安全条件下人工验证。
+                          </small>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <AssetManager
                     assets={config.assets}
                     onError={(message) => setError(message)}

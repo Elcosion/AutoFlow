@@ -24,7 +24,9 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
-rhai = "1.23"
+# AST and registered-function metadata are used for source-only API validation.
+# Keep these `internals` structures pinned to the reviewed Rhai release.
+rhai = { version = "=1.26.0", features = ["internals"] }
 sha2 = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 imageproc = { version = "0.27.0", default-features = false, features = ["rayon"] }

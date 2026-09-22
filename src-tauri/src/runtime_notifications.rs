@@ -1,7 +1,9 @@
-//! Bounded presentation mailbox. Producers never wait for a UI or a mutex.
+//! Ordinary notices are bounded and nonblocking. Runtime faults are retained
+//! until acknowledged, and may only be published by a worker after cleanup.
 use crate::runtime_protocol::ScriptStopMode;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const CAPACITY: usize = 16;
@@ -13,6 +15,8 @@ pub struct RuntimeNotification {
     pub title: String,
     pub message: String,
     pub mode: ScriptStopMode,
+    #[serde(skip)]
+    fault: bool,
 }
 
 #[derive(Default)]
@@ -22,7 +26,10 @@ struct Mailbox {
 }
 
 #[derive(Default)]
-pub(crate) struct RuntimeNotifications(Mutex<Mailbox>);
+pub(crate) struct RuntimeNotifications {
+    mailbox: Mutex<Mailbox>,
+    pending_faults: AtomicUsize,
+}
 
 impl RuntimeNotifications {
     pub(crate) fn publish(&self, title: &str, message: &str) -> bool {
@@ -35,7 +42,7 @@ impl RuntimeNotifications {
         message: &str,
         mode: ScriptStopMode,
     ) -> bool {
-        let Ok(mut mailbox) = self.0.try_lock() else {
+        let Ok(mut mailbox) = self.mailbox.try_lock() else {
             return false;
         };
         let title: String = title.chars().take(128).collect();
@@ -50,7 +57,7 @@ impl RuntimeNotifications {
             }
             return true;
         }
-        if mailbox.pending.len() == CAPACITY {
+        if mailbox.pending.len() >= CAPACITY {
             // Never evict a notice the UI may already be displaying.
             return false;
         }
@@ -61,22 +68,65 @@ impl RuntimeNotifications {
             title,
             message,
             mode,
+            fault: false,
         });
         true
+    }
+
+    /// Called only from a playback/trigger worker, after input has been
+    /// revoked. Never call from the hook, emergency stop, or an input lock.
+    pub(crate) fn publish_fault(&self, title: &str, message: &str) {
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        mailbox.next_id = mailbox.next_id.saturating_add(1);
+        let id = mailbox.next_id;
+        // Faults take precedence over ordinary completion notices; retain
+        // every older fault in order and never discard displaced notices.
+        let fault_position = mailbox.pending.iter().take_while(|item| item.fault).count();
+        mailbox.pending.insert(
+            fault_position,
+            RuntimeNotification {
+                id,
+                title: title.chars().take(128).collect(),
+                message: message.chars().take(2000).collect(),
+                mode: ScriptStopMode::Foreground,
+                fault: true,
+            },
+        );
+        // Publish while holding the same lock that owns this notification.
+        self.pending_faults.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn fault_pending(&self) -> bool {
+        self.pending_faults.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn take(&self) -> Option<RuntimeNotification> {
         // Reads do not consume: React remounts or delayed IPC responses must
         // not lose a notification. Only explicit acknowledgement removes it.
-        self.0.try_lock().ok()?.pending.front().cloned()
+        self.mailbox.try_lock().ok()?.pending.front().cloned()
+    }
+
+    /// A notice remains visible in the open UI while foreground presentation
+    /// is unsafe; later polls promote the same id once inputs quiesce.
+    pub(crate) fn take_when_safe(&self, safe_to_focus: bool) -> Option<RuntimeNotification> {
+        let mut notice = self.take()?;
+        if !safe_to_focus {
+            notice.mode = ScriptStopMode::Background;
+        }
+        Some(notice)
     }
 
     pub(crate) fn acknowledge(&self, id: u64) -> bool {
-        let Ok(mut mailbox) = self.0.try_lock() else {
+        let Ok(mut mailbox) = self.mailbox.try_lock() else {
             return false;
         };
         if mailbox.pending.front().is_some_and(|item| item.id == id) {
-            mailbox.pending.pop_front();
+            if mailbox.pending.pop_front().is_some_and(|item| item.fault) {
+                self.pending_faults.fetch_sub(1, Ordering::Release);
+            }
             true
         } else {
             false
@@ -112,7 +162,7 @@ mod tests {
     #[test]
     fn presentation_contention_does_not_wait_or_mutate_execution() {
         let queue = RuntimeNotifications::default();
-        let guard = queue.0.lock().expect("mailbox");
+        let guard = queue.mailbox.lock().expect("mailbox");
         assert!(!queue.publish("title", "message"));
         assert!(queue.take().is_none());
         drop(guard);
@@ -147,5 +197,34 @@ mod tests {
         assert_eq!(queue.take().expect("first remains").id, first.id);
         assert!(queue.acknowledge(first.id));
         assert_eq!(queue.take().expect("second follows").title, "second");
+    }
+
+    #[test]
+    fn faults_survive_full_mailbox_and_contention_until_exact_ack() {
+        let queue = std::sync::Arc::new(RuntimeNotifications::default());
+        for index in 0..CAPACITY {
+            assert!(queue.publish("ordinary", &index.to_string()));
+        }
+        let guard = queue.mailbox.lock().expect("mailbox");
+        let worker = std::sync::Arc::clone(&queue);
+        let spawned = std::thread::spawn(move || worker.publish_fault("failed", "runtime error"));
+        drop(guard);
+        spawned.join().expect("fault producer");
+        assert!(queue.fault_pending());
+        let deferred = queue.take_when_safe(false).expect("deferred fault");
+        assert_eq!(deferred.mode, ScriptStopMode::Background);
+        let visible = queue.take_when_safe(true).expect("promoted fault");
+        assert_eq!(visible.id, deferred.id);
+        assert_eq!(visible.mode, ScriptStopMode::Foreground);
+        assert_eq!(visible.message, "runtime error");
+        assert!(!queue.acknowledge(visible.id + 1));
+        assert!(queue.acknowledge(visible.id));
+        assert!(!queue.fault_pending());
+        for _ in 0..CAPACITY {
+            let current = queue.take().expect("ordinary front retained");
+            assert!(!queue.acknowledge(current.id + 1));
+            assert!(queue.acknowledge(current.id));
+        }
+        assert!(queue.take().is_none());
     }
 }

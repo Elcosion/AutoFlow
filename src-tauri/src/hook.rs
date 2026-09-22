@@ -158,8 +158,22 @@ impl HookService {
         generation: u64,
         admission_revision: u64,
     ) -> Result<(), AppError> {
-        self.shared
-            .start_playback_at_revision(rule, generation, admission_revision)
+        let name = rule.name.clone();
+        let result = self
+            .shared
+            .start_playback_at_revision(rule, generation, admission_revision);
+        if let Err(error) = &result {
+            if should_show_start_error(&error.code) {
+                let _admission = self
+                    .shared
+                    .mode_admission
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.shared
+                    .publish_runtime_fault(&format!("{} · 启动失败", name), &error.message);
+            }
+        }
+        result
     }
 
     #[cfg(windows)]
@@ -174,7 +188,26 @@ impl HookService {
     pub(crate) fn take_runtime_notification(
         &self,
     ) -> Option<crate::runtime_notifications::RuntimeNotification> {
-        self.shared.notifications.take()
+        #[cfg(windows)]
+        let safe_to_focus = self.shared.mode_admission.try_lock().is_ok()
+            && self.shared.controller.phase() == RuntimePhase::Idle
+            && self.shared.playback_thread_owner.load(Ordering::Acquire) == 0
+            && self.shared.playback_thread_quiescent()
+            && self.shared.emergency_cleanup_quiescent()
+            && !self.shared.input_recovery_required.load(Ordering::Acquire)
+            && !self
+                .shared
+                .executor_containment_unknown
+                .load(Ordering::Acquire)
+            && self.shared.tracked_input_counts() == (0, 0)
+            && self
+                .shared
+                .active_remaps
+                .try_lock()
+                .is_ok_and(|remaps| remaps.is_empty());
+        #[cfg(not(windows))]
+        let safe_to_focus = true;
+        self.shared.notifications.take_when_safe(safe_to_focus)
     }
 
     pub(crate) fn acknowledge_runtime_notification(&self, id: u64) -> bool {
@@ -1253,6 +1286,16 @@ struct HookShared {
 }
 
 impl HookShared {
+    #[cfg(windows)]
+    fn publish_runtime_fault(&self, title: &str, message: &str) {
+        // Both callers hold mode_admission and have relinquished input. An
+        // old queued hotkey or background task must remain stale after ACK.
+        self.notifications.publish_fault(title, message);
+        // Producers that entered before publication kept the old revision;
+        // producers after publication see fault_pending and cannot enter.
+        self.controller.invalidate_background_admission();
+    }
+
     fn new(config: AppConfig, vision: Arc<VisionService>) -> Self {
         #[cfg(windows)]
         let input_broker = Arc::new(InputBroker::default());
@@ -2019,7 +2062,8 @@ impl HookShared {
         let Ok(behavior) = self.behavior.try_lock() else {
             return false;
         };
-        !recorder.active
+        !self.notifications.fault_pending()
+            && !recorder.active
             && !self.initializing.load(Ordering::Acquire)
             && !behavior.status().active
             && self.playback_thread_owner.load(Ordering::Acquire) == 0
@@ -2749,6 +2793,15 @@ impl HookShared {
 
     #[cfg(windows)]
     fn acquire_mode_admission(&self) -> Result<std::sync::MutexGuard<'_, ()>, AppError> {
+        let fault_busy = || {
+            AppError::invalid(
+                "runtime_fault_pending",
+                "上一条运行失败通知尚未确认，请先查看并确认错误，再启动新的输入操作",
+            )
+        };
+        if self.notifications.fault_pending() {
+            return Err(fault_busy());
+        }
         if self.initializing.load(Ordering::Acquire) {
             return Err(AppError::invalid(
                 "runtime_initializing",
@@ -2764,12 +2817,16 @@ impl HookShared {
                 "上一执行或急停清理尚未完成退出收尾，未排队启动",
             ));
         }
-        self.mode_admission.try_lock().map_err(|_| {
+        let admission = self.mode_admission.try_lock().map_err(|_| {
             AppError::invalid(
                 "runtime_admission_busy",
                 "播放或录制的启动准入正在处理中，未排队，请重新操作",
             )
-        })
+        })?;
+        if self.notifications.fault_pending() {
+            return Err(fault_busy());
+        }
+        Ok(admission)
     }
 
     #[cfg(windows)]
@@ -3100,6 +3157,9 @@ impl HookShared {
 
     #[cfg(windows)]
     fn submit_remap_down(&self, source: u32, target: u32, generation: u64) -> bool {
+        if self.notifications.fault_pending() {
+            return false;
+        }
         let Ok(mut remaps) = self.active_remaps.try_lock() else {
             return false;
         };
@@ -3670,10 +3730,17 @@ impl HookShared {
                         );
                     }
                     if should_show_start_error(&error.code) {
-                        shared.set_playback_start_error(error.message.clone());
-                        shared
-                            .notifications
-                            .publish(&format!("{} · 启动失败", task.rule.name), &error.message);
+                        let _admission = shared
+                            .mode_admission
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if shared.controller.phase() == RuntimePhase::Idle {
+                            shared.set_playback_start_error(error.message.clone());
+                        }
+                        shared.publish_runtime_fault(
+                            &format!("{} · 启动失败", task.rule.name),
+                            &error.message,
+                        );
                     }
                     shared.record_safety("macro_trigger_failed", &[("error", error.message)]);
                 } else {
@@ -3737,6 +3804,7 @@ impl HookShared {
         // At most one admitted startup, including the task currently handled.
         // This is not a deferred playback queue: busy starts are never stored.
         if self.shutdown.load(Ordering::Acquire)
+            || self.notifications.fault_pending()
             || self.emergency_generation.load(Ordering::Acquire) != generation
             || controller_generation != generation
             || !self.trigger_config_revision_is_current(config_revision)
@@ -4204,6 +4272,8 @@ impl HookShared {
                     // Retire this exact owner before allowing a newer run.
                     shared.retire_hold_lifecycle(epoch);
                 }
+                // Until the fault is published this worker still owns the
+                // playback thread, so no new input-producing start can enter.
                 let controller_finalized = shared.controller.finish(run_token, cleanup_safe);
                 if !controller_finalized {
                     shared.record_safety(
@@ -4276,9 +4346,14 @@ impl HookShared {
                 if let Some(error) =
                     playback_error.filter(|error| should_show_playback_error(error))
                 {
-                    shared
-                        .notifications
-                        .publish(&format!("{} · 运行失败", execution_rule.name), &error);
+                    let _admission = shared
+                        .mode_admission
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    shared.publish_runtime_fault(
+                        &format!("{} · 运行失败", execution_rule.name),
+                        &error,
+                    );
                 } else if cleanup_safe && controller_finalized {
                     if let Some(message) = script_stop_message {
                         // Presentation happens only after the run has relinquished
@@ -4395,6 +4470,8 @@ fn trigger_release_gate_status(
 ) -> TriggerReleaseGateStatus {
     if shared.shutdown.load(Ordering::Acquire) || shared.controller.is_shutting_down() {
         TriggerReleaseGateStatus::Shutdown
+    } else if shared.notifications.fault_pending() {
+        TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::AdmissionRevision)
     } else if shared.emergency_generation.load(Ordering::Acquire) != task.generation {
         TriggerReleaseGateStatus::Cancelled(TriggerReleaseCancellation::TaskGeneration)
     } else if shared.controller.generation() != task.controller_generation {
@@ -5391,6 +5468,9 @@ unsafe extern "system" fn keyboard_hook(
     // They must not inject while a macro owns the input broker; otherwise a
     // playback cleanup could release another feature's key or a stale worker
     // could resume after playback ends.
+    if shared.notifications.fault_pending() {
+        return CallNextHookEx(None, code, message, data);
+    }
     let background_generation = shared.controller.background_generation();
     if !shared
         .controller
@@ -6659,6 +6739,7 @@ fn should_show_start_error(code: &str) -> bool {
             | "emergency_stop_unavailable"
             | "macro_trigger_config_stale"
             | "macro_hold_released"
+            | "runtime_fault_pending"
     )
 }
 
@@ -8371,6 +8452,60 @@ mod tests {
             crate::runtime_control::RuntimePhase::FaultLocked
         );
         assert!(!service.shared.controller.background_input_allowed());
+    }
+
+    #[test]
+    fn unacknowledged_runtime_fault_blocks_starts_and_background_input_without_hiding_notice() {
+        let service = test_hook_service();
+        let shared = &service.shared;
+        let background_generation = shared.controller.background_generation();
+        assert!(shared.background_input_allowed_at(background_generation));
+        {
+            let _admission = shared.mode_admission.lock().expect("publish gate");
+            shared.publish_runtime_fault("macro · 运行失败", "runtime error");
+        }
+        assert_eq!(
+            shared
+                .acquire_mode_admission()
+                .expect_err("barrier must reject starts")
+                .code,
+            "runtime_fault_pending"
+        );
+        assert!(!shared.background_input_allowed_at(background_generation));
+        assert!(!shared.submit_remap_down(0x41, 0x42, background_generation));
+        assert!(shared.active_remaps.lock().expect("remaps").is_empty());
+        shared.playback_thread_owner.store(1, Ordering::Release);
+        let deferred = service.take_runtime_notification().expect("fault retained");
+        assert_eq!(
+            deferred.mode,
+            crate::runtime_protocol::ScriptStopMode::Background
+        );
+        shared.playback_thread_owner.store(0, Ordering::Release);
+        shared
+            .input_recovery_required
+            .store(true, Ordering::Release);
+        assert_eq!(
+            service
+                .take_runtime_notification()
+                .expect("unsafe fault retained")
+                .mode,
+            crate::runtime_protocol::ScriptStopMode::Background
+        );
+        shared
+            .input_recovery_required
+            .store(false, Ordering::Release);
+        let promoted = service.take_runtime_notification().expect("fault promoted");
+        assert_eq!(promoted.id, deferred.id);
+        assert_eq!(
+            promoted.mode,
+            crate::runtime_protocol::ScriptStopMode::Foreground
+        );
+        assert!(!service.acknowledge_runtime_notification(promoted.id + 1));
+        assert!(shared.acquire_mode_admission().is_err());
+        assert!(service.acknowledge_runtime_notification(promoted.id));
+        assert!(shared.acquire_mode_admission().is_ok());
+        assert!(!shared.background_input_allowed_at(background_generation));
+        assert!(shared.background_input_allowed_at(shared.controller.background_generation()));
     }
 
     #[test]
@@ -10751,6 +10886,106 @@ mod tests {
                 .shared
                 .trigger_config_revision
                 .load(Ordering::Acquire),
+        }
+    }
+
+    #[test]
+    fn runtime_fault_cancels_queued_release_and_hold_across_ack_without_replaying() {
+        for mode in [MacroMode::Once, MacroMode::Hold] {
+            let mut config = trigger_config_fixture();
+            config.macros[0].mode = mode;
+            let service = HookService::isolated(
+                config,
+                crate::automation::VisionService::new(std::env::temp_dir()),
+            );
+            let pending = configured_trigger_task(&service);
+            assert_eq!(
+                super::trigger_release_gate_status(&service.shared, &pending),
+                super::TriggerReleaseGateStatus::Current
+            );
+            let generation = pending.generation;
+            let config_revision = pending.config_revision;
+            let old_background = pending.admission_revision;
+            let in_publication_window = {
+                let _admission = service.shared.mode_admission.lock().expect("publish gate");
+                // Two deterministic phases of publish_runtime_fault: pending
+                // becomes visible before the background revision changes.
+                service
+                    .shared
+                    .notifications
+                    .publish_fault("macro failed", "synthetic fault");
+                assert!(!service.shared.submit_macro_trigger(
+                    &pending.rule,
+                    generation,
+                    config_revision,
+                    pending.trigger_vk,
+                ));
+                let window = super::MacroTriggerTask {
+                    rule: pending.rule.clone(),
+                    start_timing: pending.start_timing,
+                    hold_epoch: pending.hold_epoch,
+                    trigger_vk: pending.trigger_vk,
+                    hold_owner_vk: pending.hold_owner_vk,
+                    hold_modifier_vks: pending.hold_modifier_vks.clone(),
+                    generation,
+                    controller_generation: pending.controller_generation,
+                    admission_revision: service.shared.controller.background_generation(),
+                    config_revision,
+                };
+                assert_eq!(window.admission_revision, old_background);
+                assert_eq!(
+                    super::trigger_release_gate_status(&service.shared, &window),
+                    super::TriggerReleaseGateStatus::Cancelled(
+                        super::TriggerReleaseCancellation::AdmissionRevision
+                    ),
+                    "a task must not enter while the revision is still old"
+                );
+                service.shared.controller.invalidate_background_admission();
+                window
+            };
+            assert_ne!(
+                service.shared.controller.background_generation(),
+                old_background
+            );
+            assert!(!service.shared.submit_macro_trigger(
+                &pending.rule,
+                generation,
+                config_revision,
+                pending.trigger_vk,
+            ));
+            assert_eq!(
+                super::trigger_release_gate_status(&service.shared, &pending),
+                super::TriggerReleaseGateStatus::Cancelled(
+                    super::TriggerReleaseCancellation::AdmissionRevision
+                )
+            );
+            let notice = service.take_runtime_notification().expect("retained fault");
+            assert!(service.acknowledge_runtime_notification(notice.id));
+            assert_eq!(
+                super::trigger_release_gate_status(&service.shared, &pending),
+                super::TriggerReleaseGateStatus::Cancelled(
+                    super::TriggerReleaseCancellation::AdmissionRevision
+                ),
+                "old hotkey may not resume after ACK"
+            );
+            assert_eq!(
+                super::trigger_release_gate_status(&service.shared, &in_publication_window),
+                super::TriggerReleaseGateStatus::Cancelled(
+                    super::TriggerReleaseCancellation::AdmissionRevision
+                ),
+                "even an observed task in the publication window must not resume after ACK"
+            );
+            if let Some(epoch) = pending.hold_epoch {
+                service.shared.retire_hold_lifecycle(epoch);
+            }
+            assert_eq!(
+                super::trigger_release_gate_status(
+                    &service.shared,
+                    &configured_trigger_task(&service)
+                ),
+                super::TriggerReleaseGateStatus::Current,
+                "a new physical hotkey after ACK is admissible"
+            );
         }
     }
 
