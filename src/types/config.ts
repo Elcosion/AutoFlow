@@ -269,13 +269,6 @@ export function macroSteps(rule: MacroRule): MacroStep[] {
   return rule.program.kind === "macro" ? rule.program.steps : [];
 }
 
-export function withMacroSteps(rule: MacroRule, steps: MacroStep[]): MacroRule {
-  return {
-    ...rule,
-    program: { kind: "macro", steps },
-  };
-}
-
 export type AppConfig = {
   schemaVersion: number;
   globalEnabled: boolean;

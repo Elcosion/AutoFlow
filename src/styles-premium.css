@@ -6531,10 +6531,15 @@ button:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
-/* Playback progress is a separate, click-through Tauri window. Keep its
-   document transparent so only the compact card is visible. */
-body.playback-overlay-body {
+/* The head script marks only the exact playback-overlay URL before first paint. */
+html[data-autoflow-window="playback-overlay"],
+html[data-autoflow-window="playback-overlay"] body,
+html[data-autoflow-window="playback-overlay"] #root {
   background: transparent !important;
+  background-image: none !important;
+}
+
+html[data-autoflow-window="playback-overlay"] body {
   overflow: hidden !important;
 }
 
@@ -6722,7 +6727,23 @@ body.playback-overlay-body {
   box-shadow: 0 8px 28px #40331f26;
   font-size: 13px;
 }
-.runtime-safety-notice p { margin: 9px 0; line-height: 1.5; }
-.runtime-safety-notice button { padding: 8px 12px; border: 1px solid #c7a36d; border-radius: 8px; background: #fff; color: inherit; cursor: pointer; }
-.runtime-safety-notice button:disabled { opacity: 0.55; cursor: not-allowed; }
-.runtime-safety-notice button:focus-visible { outline: 2px solid #8b642a; outline-offset: 3px; }
+.runtime-safety-notice p {
+  margin: 9px 0;
+  line-height: 1.5;
+}
+.runtime-safety-notice button {
+  padding: 8px 12px;
+  border: 1px solid #c7a36d;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+  cursor: pointer;
+}
+.runtime-safety-notice button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.runtime-safety-notice button:focus-visible {
+  outline: 2px solid #8b642a;
+  outline-offset: 3px;
+}

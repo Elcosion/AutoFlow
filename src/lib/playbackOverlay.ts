@@ -9,7 +9,36 @@ const terminalPhases = new Set<MacroPlaybackStatus["phase"]>([
   "failed",
   "cleanup_failed",
   "fault_locked",
+  "unknown",
 ]);
+
+export function unavailablePlaybackStatus(
+  previous: MacroPlaybackStatus | null,
+): MacroPlaybackStatus {
+  return {
+    running: false,
+    currentStep: previous?.currentStep ?? 0,
+    totalSteps: previous?.totalSteps ?? 0,
+    playbackId: previous?.playbackId ?? 0,
+    macroId: previous?.macroId,
+    macroName: previous?.macroName,
+    programKind: previous?.programKind ?? "unknown",
+    actionKind: previous?.actionKind,
+    actionSummary: previous?.actionSummary,
+    elapsedMs: previous?.elapsedMs ?? 0,
+    phase: "unknown",
+    phaseObservation: "unavailable",
+    phaseProvenance: "transport_error",
+    cleanupStatus: "unknown",
+    overlayVisible: previous?.overlayVisible ?? false,
+  };
+}
+
+export function observedPlaybackPhase(
+  status: MacroPlaybackStatus,
+): MacroPlaybackStatus["phase"] {
+  return status.phaseObservation === "confirmed" ? status.phase : "unknown";
+}
 
 export function shouldShowPlaybackOverlay(
   status: MacroPlaybackStatus | null,
@@ -54,6 +83,8 @@ export function playbackPhaseLabel(
       return "执行失败";
     case "cleanup_failed":
       return "输入清理失败";
+    case "unknown":
+      return "状态暂不可确认";
     case "idle":
     default:
       return "待机";

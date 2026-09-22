@@ -1,7 +1,7 @@
 //! Private safety-service control protocol. UI exit does NOT kill this service
 //! via a UI-owned Job: the independent lease watcher must clean input first.
 use crate::hook::HookService;
-use crate::runtime_control::RuntimeController;
+use crate::runtime_control::{RuntimeController, RuntimePhaseObservation, RuntimePhaseProvenance};
 use crate::service_lease::{claim_authority, ControllerLease, ParentWatch};
 use crate::service_transport::{read_document, write_document, DocumentWriter};
 use crate::{AppConfig, AppError, MacroRule};
@@ -546,9 +546,29 @@ impl ServiceRuntime {
                     Ok(Value::Null)
                 }
                 SafetyCommand::Shutdown => Ok(Value::Bool(self.shutdown())),
-                SafetyCommand::PlaybackStatus => Ok(
-                    serde_json::json!({"running": control.active_token().is_some(), "phase": format!("{:?}", control.phase()), "generation": control.generation()}),
-                ),
+                SafetyCommand::PlaybackStatus => {
+                    let (phase, observation, provenance) = match control.observe_phase() {
+                        RuntimePhaseObservation::Confirmed { phase, provenance } => (
+                            format!("{phase:?}"),
+                            "confirmed",
+                            match provenance {
+                                RuntimePhaseProvenance::State => "controller_state",
+                                RuntimePhaseProvenance::FaultLatch => "fault_latch",
+                                RuntimePhaseProvenance::ShutdownLatch => "shutdown_latch",
+                            },
+                        ),
+                        RuntimePhaseObservation::Unavailable => {
+                            ("Unknown".to_string(), "unavailable", "controller_busy")
+                        }
+                    };
+                    Ok(serde_json::json!({
+                        "running": control.active_token().is_some(),
+                        "phase": phase,
+                        "phaseObservation": observation,
+                        "phaseProvenance": provenance,
+                        "generation": control.generation()
+                    }))
+                }
                 SafetyCommand::Recover => {
                     if let Some(hook) = recovery_commit_hook {
                         hook(control);

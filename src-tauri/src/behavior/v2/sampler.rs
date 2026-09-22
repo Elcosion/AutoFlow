@@ -16,14 +16,6 @@ impl SeededRng {
         }
     }
 
-    pub fn random() -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        Self::from_seed(seed)
-    }
-
     pub fn next_u64(&mut self) -> u64 {
         let mut value = self.state;
         value ^= value << 13;
@@ -35,10 +27,6 @@ impl SeededRng {
 
     pub fn next_unit(&mut self) -> f32 {
         (self.next_u64() as f64 / u64::MAX as f64) as f32
-    }
-
-    pub fn signed_unit(&mut self) -> f32 {
-        self.next_unit() * 2.0 - 1.0
     }
 }
 

@@ -5,10 +5,9 @@ use crate::automation::{
     VisionPollBudget, VisionPollOptions, VisionSearchResult, WindowRectValue, MAX_WAIT_MS,
     MIN_POLL_MS,
 };
-use crate::{MacroStep, MouseButton};
+use crate::runtime_protocol::{ScriptStopMessage, ScriptStopMode};
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position};
 use std::collections::HashSet;
-use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -24,12 +23,7 @@ const SCRIPT_STOP_REQUESTED: &str = "__autoflow_stop_with_message__";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptOutcome {
     Completed,
-    StoppedWithMessage { title: String, message: String },
-}
-
-struct ScriptStopMessage {
-    title: String,
-    message: String,
+    StoppedWithMessage(ScriptStopMessage),
 }
 
 pub trait AutomationInput: Send + Sync {
@@ -229,7 +223,12 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn(
         "stop_with_message",
         move |message: String| -> Result<(), Box<EvalAltResult>> {
-            request_script_stop(&current, "AutoFlow".to_string(), message)
+            request_script_stop(
+                &current,
+                "AutoFlow".to_string(),
+                message,
+                ScriptStopMode::Background,
+            )
         },
     );
 
@@ -237,7 +236,16 @@ fn register_api(engine: &mut Engine, state: Arc<Mutex<ExecutionContext>>) {
     engine.register_fn(
         "stop_with_message",
         move |title: String, message: String| -> Result<(), Box<EvalAltResult>> {
-            request_script_stop(&current, title, message)
+            request_script_stop(&current, title, message, ScriptStopMode::Background)
+        },
+    );
+
+    let current = Arc::clone(&state);
+    engine.register_fn(
+        "stop_with_message",
+        move |message: String, options: Map| -> Result<(), Box<EvalAltResult>> {
+            let mode = parse_stop_message_options(&options).map_err(runtime_error)?;
+            request_script_stop(&current, "AutoFlow".to_string(), message, mode)
         },
     );
 
@@ -954,6 +962,7 @@ fn request_script_stop(
     state: &Arc<Mutex<ExecutionContext>>,
     title: String,
     message: String,
+    mode: ScriptStopMode,
 ) -> Result<(), Box<EvalAltResult>> {
     let title = title.trim();
     let message = message.trim();
@@ -978,8 +987,26 @@ fn request_script_stop(
             title.to_string()
         },
         message: message.to_string(),
+        mode,
     });
     Err(runtime_error(SCRIPT_STOP_REQUESTED))
+}
+
+fn parse_stop_message_options(options: &Map) -> Result<ScriptStopMode, String> {
+    if let Some(key) = options.keys().find(|key| key.as_str() != "mode") {
+        return Err(format!("stop_with_message 的选项包含未知字段：{key}"));
+    }
+    let Some(value) = options.get("mode") else {
+        return Ok(ScriptStopMode::Background);
+    };
+    let Some(mode) = value.clone().try_cast::<String>() else {
+        return Err("stop_with_message 的 mode 必须是字符串 background 或 foreground".to_string());
+    };
+    match mode.as_str() {
+        "background" => Ok(ScriptStopMode::Background),
+        "foreground" => Ok(ScriptStopMode::Foreground),
+        _ => Err("stop_with_message 的 mode 必须是 background 或 foreground".to_string()),
+    }
 }
 
 fn parse_behavior_options(options: &Map) -> Result<(Option<f32>, bool), String> {
@@ -1123,10 +1150,7 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<Script
         if let Some(error) = cleanup_error {
             return Err(format!("脚本停止后输入清理失败，当前状态不安全: {error}"));
         }
-        return Ok(ScriptOutcome::StoppedWithMessage {
-            title: stop_message.title,
-            message: stop_message.message,
-        });
+        return Ok(ScriptOutcome::StoppedWithMessage(stop_message));
     }
     if let Some(error) = cleanup_error {
         return Err(format!(
@@ -1271,386 +1295,10 @@ fn strip_strings_and_comments(source: &str) -> String {
     result
 }
 
-fn strip_inline_comment(line: &str) -> &str {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut characters = line.char_indices().peekable();
-    while let Some((index, character)) = characters.next() {
-        if let Some(current_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == current_quote {
-                quote = None;
-            }
-            continue;
-        }
-        if character == '"' || character == '\'' {
-            quote = Some(character);
-            continue;
-        }
-        if character == '/' && characters.peek().is_some_and(|(_, next)| *next == '/') {
-            return &line[..index];
-        }
-    }
-    line
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompatibleParseError {
-    pub line: usize,
-    pub column: usize,
-    pub advanced: bool,
-    pub message: String,
-}
-
-impl Display for CompatibleParseError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "第 {} 行第 {} 列：{}",
-            self.line, self.column, self.message
-        )
-    }
-}
-
-pub fn macro_steps_to_rhai(steps: &[MacroStep]) -> String {
-    steps
-        .iter()
-        .map(|step| match step {
-            MacroStep::Delay {
-                duration_ms,
-                duration_max_ms: Some(maximum),
-            } if maximum > duration_ms => {
-                format!("wait_random_ms({duration_ms}, {maximum});")
-            }
-            MacroStep::Delay { duration_ms, .. } => format!("wait_ms({duration_ms});"),
-            MacroStep::Key { key, action } => format!(
-                "{}({});",
-                if matches!(action, crate::KeyAction::Down) {
-                    "key_down"
-                } else {
-                    "key_up"
-                },
-                json_string(key)
-            ),
-            MacroStep::MouseButton {
-                button,
-                action,
-                x,
-                y,
-            } => format!(
-                "{}({}, {x}, {y});",
-                if matches!(action, crate::KeyAction::Down) {
-                    "mouse_down"
-                } else {
-                    "mouse_up"
-                },
-                json_string(&mouse_button_name(*button))
-            ),
-            MacroStep::MouseMove { x, y } => format!("move_to({x}, {y});"),
-            MacroStep::Wheel { delta_x, delta_y } => format!("scroll({delta_x}, {delta_y});"),
-            MacroStep::Text { text } => format!("type_text({});", json_string(text)),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
-}
-
-fn mouse_button_name(button: MouseButton) -> String {
-    match button {
-        MouseButton::Left => "left",
-        MouseButton::Right => "right",
-        MouseButton::Middle => "middle",
-        MouseButton::X1 => "x1",
-        MouseButton::X2 => "x2",
-    }
-    .to_string()
-}
-
-pub fn parse_compatible_rhai(source: &str) -> Result<Vec<MacroStep>, CompatibleParseError> {
-    let code = strip_strings_and_comments(source);
-    if contains_advanced_syntax(&code) {
-        return Err(CompatibleParseError {
-            line: 1,
-            column: 1,
-            advanced: true,
-            message: "源码包含循环、条件、变量或函数定义，不能转换为图形宏".to_string(),
-        });
-    }
-    let mut steps = Vec::new();
-    for (index, line) in source.lines().enumerate() {
-        let line_number = index + 1;
-        let line = strip_inline_comment(line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parsed = parse_compatible_line(line, line_number)?;
-        let function_name = line.split('(').next().unwrap_or_default().trim();
-        let is_press = function_name == "press";
-        let is_click = function_name == "click";
-        steps.push(parsed.clone());
-        if is_press {
-            if let MacroStep::Key { key, .. } = &parsed {
-                steps.push(MacroStep::Key {
-                    key: key.clone(),
-                    action: crate::KeyAction::Up,
-                });
-            }
-        }
-        if is_click {
-            if let MacroStep::MouseButton { button, x, y, .. } = &parsed {
-                steps.push(MacroStep::MouseButton {
-                    button: *button,
-                    action: crate::KeyAction::Up,
-                    x: *x,
-                    y: *y,
-                });
-            }
-        }
-    }
-    Ok(steps)
-}
-
-fn contains_advanced_syntax(code: &str) -> bool {
-    [
-        "let", "const", "if", "else", "for", "while", "loop", "fn", "return", "import", "export",
-        "eval",
-    ]
-    .iter()
-    .any(|token| contains_identifier(code, token))
-        || code.contains('{')
-        || code.contains('}')
-        || code.lines().any(|line| line.contains('='))
-}
-
-fn parse_compatible_line(
-    line: &str,
-    line_number: usize,
-) -> Result<MacroStep, CompatibleParseError> {
-    let Some(opening) = line.find('(') else {
-        return Err(compatible_error(
-            line_number,
-            "每行必须是以分号结尾的 API 调用",
-        ));
-    };
-    if !line.ends_with(");") {
-        return Err(compatible_error(
-            line_number,
-            "每行必须是以分号结尾的 API 调用",
-        ));
-    }
-    let name = line[..opening].trim();
-    let raw_arguments = &line[opening + 1..line.len() - 2];
-    let arguments = split_arguments(raw_arguments, line_number)?;
-    let get_string = |index: usize| parse_string(arguments.get(index), line_number, name);
-    let get_integer = |index: usize| parse_integer(arguments.get(index), line_number, name);
-    match name {
-        "wait_ms" => {
-            expect_argument_count(&arguments, 1, line_number, name)?;
-            let duration_ms = get_integer(0)?;
-            if duration_ms < 0 {
-                return Err(compatible_error(line_number, "wait_ms 参数不能为负数"));
-            }
-            Ok(MacroStep::Delay {
-                duration_ms: duration_ms as u64,
-                duration_max_ms: None,
-            })
-        }
-        "wait_random_ms" => {
-            expect_argument_count(&arguments, 2, line_number, name)?;
-            let minimum = get_integer(0)?;
-            let maximum = get_integer(1)?;
-            if minimum < 0 || maximum < minimum {
-                return Err(compatible_error(
-                    line_number,
-                    "wait_random_ms 的参数范围无效",
-                ));
-            }
-            Ok(MacroStep::Delay {
-                duration_ms: minimum as u64,
-                duration_max_ms: Some(maximum as u64),
-            })
-        }
-        "key_down" | "key_up" => {
-            expect_argument_count(&arguments, 1, line_number, name)?;
-            Ok(MacroStep::Key {
-                key: get_string(0)?,
-                action: if name == "key_down" {
-                    crate::KeyAction::Down
-                } else {
-                    crate::KeyAction::Up
-                },
-            })
-        }
-        "press" => {
-            expect_argument_count(&arguments, 1, line_number, name)?;
-            let key = get_string(0)?;
-            Ok(MacroStep::Key {
-                key,
-                action: crate::KeyAction::Down,
-            })
-        }
-        "click" => {
-            expect_argument_count(&arguments, 1, line_number, name)?;
-            Ok(MacroStep::MouseButton {
-                button: parse_button(&get_string(0)?, line_number)?,
-                action: crate::KeyAction::Down,
-                x: 0,
-                y: 0,
-            })
-        }
-        "move_to" => {
-            expect_argument_count(&arguments, 2, line_number, name)?;
-            Ok(MacroStep::MouseMove {
-                x: get_integer(0)? as i32,
-                y: get_integer(1)? as i32,
-            })
-        }
-        "mouse_down" | "mouse_up" => {
-            expect_argument_count(&arguments, 3, line_number, name)?;
-            let button = parse_button(&get_string(0)?, line_number)?;
-            Ok(MacroStep::MouseButton {
-                button,
-                action: if name == "mouse_down" {
-                    crate::KeyAction::Down
-                } else {
-                    crate::KeyAction::Up
-                },
-                x: get_integer(1)? as i32,
-                y: get_integer(2)? as i32,
-            })
-        }
-        "scroll" => {
-            expect_argument_count(&arguments, 2, line_number, name)?;
-            Ok(MacroStep::Wheel {
-                delta_x: get_integer(0)? as i32,
-                delta_y: get_integer(1)? as i32,
-            })
-        }
-        "type_text" => {
-            expect_argument_count(&arguments, 1, line_number, name)?;
-            Ok(MacroStep::Text {
-                text: get_string(0)?,
-            })
-        }
-        _ => Err(compatible_error(
-            line_number,
-            &format!("未知函数 {name}；兼容宏只能调用 AutoFlow API"),
-        )),
-    }
-}
-
-fn compatible_error(line: usize, message: &str) -> CompatibleParseError {
-    CompatibleParseError {
-        line,
-        column: 1,
-        advanced: false,
-        message: message.to_string(),
-    }
-}
-
-fn split_arguments(text: &str, line: usize) -> Result<Vec<String>, CompatibleParseError> {
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut arguments = Vec::new();
-    let mut current = String::new();
-    let mut quote = false;
-    let mut escaped = false;
-    for character in text.chars() {
-        if quote {
-            current.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                quote = false;
-            }
-        } else if character == '"' {
-            quote = true;
-            current.push(character);
-        } else if character == ',' {
-            arguments.push(current.trim().to_string());
-            current.clear();
-        } else {
-            current.push(character);
-        }
-    }
-    if quote {
-        return Err(compatible_error(line, "字符串缺少结束双引号"));
-    }
-    arguments.push(current.trim().to_string());
-    if arguments.iter().any(String::is_empty) {
-        return Err(compatible_error(line, "参数不能为空"));
-    }
-    Ok(arguments)
-}
-
-fn expect_argument_count(
-    arguments: &[String],
-    expected: usize,
-    line: usize,
-    name: &str,
-) -> Result<(), CompatibleParseError> {
-    if arguments.len() != expected {
-        Err(compatible_error(
-            line,
-            &format!(
-                "{name} 需要 {expected} 个参数，实际得到 {} 个",
-                arguments.len()
-            ),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn parse_string(
-    value: Option<&String>,
-    line: usize,
-    name: &str,
-) -> Result<String, CompatibleParseError> {
-    let value = value.ok_or_else(|| compatible_error(line, "缺少参数"))?;
-    serde_json::from_str(value)
-        .map_err(|_| compatible_error(line, &format!("{name} 参数必须是有效双引号字符串")))
-}
-
-fn parse_integer(
-    value: Option<&String>,
-    line: usize,
-    name: &str,
-) -> Result<i64, CompatibleParseError> {
-    let value = value.ok_or_else(|| compatible_error(line, "缺少参数"))?;
-    value
-        .parse::<i64>()
-        .map_err(|_| compatible_error(line, &format!("{name} 参数必须是整数")))
-}
-
-fn parse_button(value: &str, line: usize) -> Result<MouseButton, CompatibleParseError> {
-    match value {
-        "left" => Ok(MouseButton::Left),
-        "right" => Ok(MouseButton::Right),
-        "middle" => Ok(MouseButton::Middle),
-        "x1" => Ok(MouseButton::X1),
-        "x2" => Ok(MouseButton::X2),
-        _ => Err(compatible_error(
-            line,
-            "鼠标按钮必须是 left、right、middle、x1 或 x2",
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::automation::ImageMatch;
-    use crate::KeyAction;
     use std::sync::atomic::AtomicUsize;
 
     struct TestInput;
@@ -1792,41 +1440,6 @@ mod tests {
     }
 
     #[test]
-    fn macro_steps_round_trip_through_compatible_rhai() {
-        let steps = vec![
-            MacroStep::Delay {
-                duration_ms: 300,
-                duration_max_ms: Some(800),
-            },
-            MacroStep::Key {
-                key: "Ctrl".to_string(),
-                action: KeyAction::Down,
-            },
-            MacroStep::MouseButton {
-                button: MouseButton::Left,
-                action: KeyAction::Up,
-                x: 820,
-                y: 430,
-            },
-            MacroStep::Text {
-                text: "中文 \\\"quoted\\\"\n第二行".to_string(),
-            },
-        ];
-        let source = macro_steps_to_rhai(&steps);
-        assert_eq!(
-            parse_compatible_rhai(&source).expect("compatible source"),
-            steps
-        );
-    }
-
-    #[test]
-    fn advanced_syntax_is_rejected_by_compatible_parser() {
-        let error = parse_compatible_rhai("let count = 2;\nwhile count > 0 { count -= 1; }")
-            .expect_err("advanced source should not become macro steps");
-        assert!(error.advanced);
-    }
-
-    #[test]
     fn rhai_api_validates_arguments_and_operation_limit() {
         let cancel = Arc::new(AtomicBool::new(false));
         let context = ExecutionContext::new(Arc::new(TestInput), Arc::clone(&cancel), 1.0, None);
@@ -1886,11 +1499,114 @@ mod tests {
         .expect("custom stop should not be reported as a runtime failure");
         assert_eq!(
             outcome,
-            ScriptOutcome::StoppedWithMessage {
+            ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
                 title: "完成".to_string(),
                 message: "任务已经结束".to_string(),
-            }
+                mode: ScriptStopMode::Background,
+            })
         );
+    }
+
+    #[test]
+    fn legacy_one_argument_stop_uses_default_title_and_blocks_later_input() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ExecutionContext::new(
+            Arc::new(CountingInput {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        assert_eq!(
+            run_rhai_script(r#"stop_with_message("任务已经结束"); press("B");"#, context,)
+                .expect("legacy one-argument stop"),
+            ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
+                title: "AutoFlow".into(),
+                message: "任务已经结束".into(),
+                mode: ScriptStopMode::Background,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stop_with_message_supports_background_and_foreground_options() {
+        for (source, expected_mode) in [
+            (
+                r#"stop_with_message("完成", #{});"#,
+                ScriptStopMode::Background,
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: "background" });"#,
+                ScriptStopMode::Background,
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: "foreground" });"#,
+                ScriptStopMode::Foreground,
+            ),
+        ] {
+            let context = ExecutionContext::new(
+                Arc::new(TestInput),
+                Arc::new(AtomicBool::new(false)),
+                1.0,
+                None,
+            );
+            assert_eq!(
+                run_rhai_script(source, context).expect("valid stop options"),
+                ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
+                    title: "AutoFlow".into(),
+                    message: "完成".into(),
+                    mode: expected_mode,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn stop_with_message_two_strings_remain_title_and_message() {
+        let context = ExecutionContext::new(
+            Arc::new(TestInput),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            None,
+        );
+        assert_eq!(
+            run_rhai_script(r#"stop_with_message("完成", "foreground");"#, context)
+                .expect("two-string overload"),
+            ScriptOutcome::StoppedWithMessage(ScriptStopMessage {
+                title: "完成".into(),
+                message: "foreground".into(),
+                mode: ScriptStopMode::Background,
+            })
+        );
+    }
+
+    #[test]
+    fn stop_with_message_rejects_invalid_options_explicitly() {
+        for (source, expected) in [
+            (
+                r#"stop_with_message("完成", #{ surprise: true });"#,
+                "未知字段",
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: 1 });"#,
+                "mode 必须是字符串",
+            ),
+            (
+                r#"stop_with_message("完成", #{ mode: "urgent" });"#,
+                "mode 必须是 background 或 foreground",
+            ),
+        ] {
+            let context = ExecutionContext::new(
+                Arc::new(TestInput),
+                Arc::new(AtomicBool::new(false)),
+                1.0,
+                None,
+            );
+            let error = run_rhai_script(source, context).expect_err("invalid stop options");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]

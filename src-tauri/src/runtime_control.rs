@@ -21,6 +21,22 @@ pub(crate) enum RuntimePhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimePhaseProvenance {
+    State,
+    FaultLatch,
+    ShutdownLatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimePhaseObservation {
+    Confirmed {
+        phase: RuntimePhase,
+        provenance: RuntimePhaseProvenance,
+    },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RunToken {
     pub(crate) id: u64,
     pub(crate) generation: u64,
@@ -468,6 +484,37 @@ impl RuntimeController {
             .unwrap_or(RuntimePhase::FaultLocked)
     }
 
+    /// Presentation-only observation. Unlike `phase`, contention is reported
+    /// as unavailable rather than being conflated with the fail-closed decision
+    /// fallback. Atomic shutdown/fault latches remain authoritative observations.
+    pub(crate) fn observe_phase(&self) -> RuntimePhaseObservation {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return RuntimePhaseObservation::Confirmed {
+                phase: RuntimePhase::ShuttingDown,
+                provenance: RuntimePhaseProvenance::ShutdownLatch,
+            };
+        }
+        if self.fault_latched.load(Ordering::Acquire) {
+            return RuntimePhaseObservation::Confirmed {
+                phase: RuntimePhase::FaultLocked,
+                provenance: RuntimePhaseProvenance::FaultLatch,
+            };
+        }
+        self.state
+            .try_lock()
+            .map(|state| RuntimePhaseObservation::Confirmed {
+                phase: state.phase,
+                provenance: RuntimePhaseProvenance::State,
+            })
+            .unwrap_or(RuntimePhaseObservation::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn while_state_locked<T>(&self, observe: impl FnOnce() -> T) -> T {
+        let _state = self.state.lock().expect("runtime controller state");
+        observe()
+    }
+
     pub(crate) fn active_token(&self) -> Option<RunToken> {
         self.state.try_lock().ok().and_then(|state| state.active)
     }
@@ -521,7 +568,10 @@ impl Drop for StartLease {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeController, RuntimePhase, StartError};
+    use super::{
+        RuntimeController, RuntimePhase, RuntimePhaseObservation, RuntimePhaseProvenance,
+        StartError,
+    };
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -613,6 +663,13 @@ mod tests {
         controller.lock_fault();
         assert_eq!(state.phase, RuntimePhase::Idle);
         assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        assert_eq!(
+            controller.observe_phase(),
+            RuntimePhaseObservation::Confirmed {
+                phase: RuntimePhase::FaultLocked,
+                provenance: RuntimePhaseProvenance::FaultLatch,
+            }
+        );
         assert!(!controller.background_input_allowed());
         drop(state);
 
@@ -624,6 +681,26 @@ mod tests {
             .recover_after_cleanup_at(controller.generation(), controller.background_generation()));
         assert_eq!(controller.phase(), RuntimePhase::Idle);
         assert!(controller.background_input_allowed());
+    }
+
+    #[test]
+    fn state_contention_is_observationally_unavailable_but_decisions_remain_fail_closed() {
+        let controller = RuntimeController::new();
+        let state = controller.state.lock().expect("state");
+        assert_eq!(
+            controller.observe_phase(),
+            RuntimePhaseObservation::Unavailable
+        );
+        assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        assert!(!controller.background_input_allowed());
+        drop(state);
+        assert_eq!(
+            controller.observe_phase(),
+            RuntimePhaseObservation::Confirmed {
+                phase: RuntimePhase::Idle,
+                provenance: RuntimePhaseProvenance::State,
+            }
+        );
     }
 
     #[test]
@@ -823,6 +900,13 @@ mod tests {
         controller.begin_cleaning(token);
         assert!(controller.finish(token, false));
         assert_eq!(controller.phase(), RuntimePhase::FaultLocked);
+        assert_eq!(
+            controller.observe_phase(),
+            RuntimePhaseObservation::Confirmed {
+                phase: RuntimePhase::FaultLocked,
+                provenance: RuntimePhaseProvenance::FaultLatch,
+            }
+        );
         assert!(matches!(
             controller.begin_start(None),
             Err(StartError::SafetyLocked)

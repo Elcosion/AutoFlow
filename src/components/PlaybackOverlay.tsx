@@ -15,12 +15,14 @@ import {
 import {
   formatElapsed,
   playbackActionLabel,
+  observedPlaybackPhase,
   playbackPhaseLabel,
   playbackProgressLabel,
   playbackPollInterval,
   PLAYBACK_OVERLAY_IDLE_POLL_MS,
   shortPlaybackError,
   shouldShowPlaybackOverlay,
+  unavailablePlaybackStatus,
 } from "../lib/playbackOverlay";
 
 const OVERLAY_SIZE = new LogicalSize(320, 178);
@@ -77,7 +79,10 @@ export function PlaybackOverlay() {
         const next = await getMacroPlaybackStatus();
         if (!active) return;
         setStatus(next);
-        if (next.playbackId !== 0 && next.playbackId !== latestPlaybackId.current) {
+        if (
+          next.playbackId !== 0 &&
+          next.playbackId !== latestPlaybackId.current
+        ) {
           latestPlaybackId.current = next.playbackId;
           await positionOnCurrentTargetMonitor(overlay);
         }
@@ -91,6 +96,7 @@ export function PlaybackOverlay() {
         // The overlay is deliberately best-effort. A closed or unavailable
         // overlay must never affect macro execution or F12 cleanup.
         console.warn("[playback-overlay] 更新悬浮窗失败", error);
+        if (active) setStatus((current) => unavailablePlaybackStatus(current));
         schedule(PLAYBACK_OVERLAY_IDLE_POLL_MS);
       } finally {
         polling.current = false;
@@ -112,21 +118,29 @@ export function PlaybackOverlay() {
 
   return (
     <main className="playback-overlay-root" aria-live="polite">
-      <section className={`playback-overlay-card ${cleanupFailed ? "is-danger" : ""}`}>
+      <section
+        className={`playback-overlay-card ${cleanupFailed ? "is-danger" : ""}`}
+      >
         <div className="playback-overlay-heading">
           <span className="playback-overlay-dot" />
           <strong>{status?.macroName}</strong>
           <span className="playback-overlay-phase">
-            {playbackPhaseLabel(status?.phase ?? "idle")}
+            {status
+              ? playbackPhaseLabel(observedPlaybackPhase(status))
+              : playbackPhaseLabel("unknown")}
           </span>
         </div>
-        <div className="playback-overlay-action">{status && playbackActionLabel(status)}</div>
+        <div className="playback-overlay-action">
+          {status && playbackActionLabel(status)}
+        </div>
         <div className="playback-overlay-meta">
           <span>{status && playbackProgressLabel(status)}</span>
           <span>{formatElapsed(status?.elapsedMs ?? 0)}</span>
         </div>
         {error ? <div className="playback-overlay-error">{error}</div> : null}
-        <div className="playback-overlay-hint">F12 可随时停止，输入状态将在清理完成后结束</div>
+        <div className="playback-overlay-hint">
+          F12 可随时停止，输入状态将在清理完成后结束
+        </div>
       </section>
     </main>
   );

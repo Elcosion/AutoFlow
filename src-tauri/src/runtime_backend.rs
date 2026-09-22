@@ -7,6 +7,18 @@ use crate::{AppConfig, AppError, BehaviorRecordingResult, BehaviorRecordingStatu
 use std::sync::Arc;
 
 pub(crate) struct RuntimeBackend(SafetyClient);
+
+fn preserve_playback_status_observation(
+    response: Result<MacroPlaybackStatus, AppError>,
+) -> Result<MacroPlaybackStatus, AppError> {
+    // Transport failures have no controller provenance and must remain errors.
+    response
+}
+
+fn playback_activity_fail_closed(response: Result<bool, AppError>) -> bool {
+    response.unwrap_or(true)
+}
+
 impl RuntimeBackend {
     pub fn start(config: AppConfig, vision: Arc<VisionService>) -> Result<Self, AppError> {
         let executable =
@@ -70,30 +82,10 @@ impl RuntimeBackend {
     }
     pub fn is_playback_running(&self) -> bool {
         // Unknown authority state must not be treated as permission to start.
-        self.0.call(SafetyCommand::IsPlaying).unwrap_or(true)
+        playback_activity_fail_closed(self.0.call(SafetyCommand::IsPlaying))
     }
     pub fn playback_status(&self) -> Result<MacroPlaybackStatus, AppError> {
-        self.0.call(SafetyCommand::PlaybackStatus).or_else(|error| {
-            if error.code == "safety_service_busy" {
-                return Err(error);
-            }
-            Ok(MacroPlaybackStatus {
-                running: false,
-                current_step: 0,
-                total_steps: 0,
-                last_error: Some(error.message),
-                playback_id: 0,
-                macro_id: None,
-                macro_name: None,
-                program_kind: "unknown".into(),
-                action_kind: None,
-                action_summary: None,
-                elapsed_ms: 0,
-                phase: "fault_locked".into(),
-                cleanup_status: "unknown".into(),
-                overlay_visible: false,
-            })
-        })
+        preserve_playback_status_observation(self.0.call(SafetyCommand::PlaybackStatus))
     }
     pub fn recording_status(&self) -> Result<MacroRecordingStatus, AppError> {
         self.0.call(SafetyCommand::RecordingStatus)
@@ -108,5 +100,40 @@ impl RuntimeBackend {
         self.0
             .call(SafetyCommand::Acknowledge { id })
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_failures_never_become_confirmed_fault_statuses() {
+        for code in [
+            "safety_service_busy",
+            "safety_service_unavailable",
+            "safety_service_stale_request",
+        ] {
+            let result = preserve_playback_status_observation(Err(AppError::invalid(code, "x")));
+            assert_eq!(
+                result.expect_err("RPC failure must remain an error").code,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_failures_remain_fail_closed_for_playback_admission() {
+        assert!(!playback_activity_fail_closed(Ok(false)));
+        assert!(playback_activity_fail_closed(Ok(true)));
+        for code in [
+            "safety_service_busy",
+            "safety_service_unavailable",
+            "safety_service_stale_request",
+        ] {
+            assert!(playback_activity_fail_closed(Err(AppError::invalid(
+                code, "x"
+            ))));
+        }
     }
 }

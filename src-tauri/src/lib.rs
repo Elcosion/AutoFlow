@@ -17,7 +17,8 @@ mod input_safety;
 #[cfg(windows)]
 mod priority_cleanup;
 mod rhai_runtime;
-#[cfg(all(windows, not(test)))]
+#[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 mod runtime_backend;
 mod runtime_control;
 pub mod runtime_executor;
