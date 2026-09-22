@@ -352,8 +352,10 @@ pub fn acknowledge_runtime_notification(
 }
 
 #[tauri::command]
-pub fn validate_rhai_source(source: String) -> Result<(), AppError> {
-    crate::rhai_runtime::validate_rhai_source(&source)
+pub fn validate_rhai_source(
+    source: String,
+) -> Result<crate::rhai_runtime::RhaiValidationReport, AppError> {
+    crate::rhai_runtime::inspect_rhai_source(&source)
         .map_err(|message| AppError::invalid("rhai_compile_error", message))
 }
 

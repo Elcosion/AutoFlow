@@ -6,8 +6,13 @@ use crate::automation::{
     MIN_POLL_MS,
 };
 use crate::runtime_protocol::{ScriptStopMessage, ScriptStopMode};
-use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position};
-use std::collections::HashSet;
+use rhai::{
+    ASTNode, Array, Dynamic, Engine, EvalAltResult, Expr, FnCallExpr, ImmutableString, Map,
+    Position, Stmt,
+};
+use serde::Serialize;
+use std::any::TypeId;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1178,6 +1183,344 @@ pub fn run_rhai_script(source: &str, context: ExecutionContext) -> Result<Script
 }
 
 pub fn validate_rhai_source(source: &str) -> Result<(), String> {
+    inspect_rhai_source(source).map(|_| ())
+}
+
+/// A successful compile is not proof that the script is executable: arguments
+/// can be dynamic, user functions can shadow native APIs, and automation can
+/// fail at runtime. The UI always calls this a *static* inspection.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RhaiValidationReport {
+    pub unverified_calls: Vec<UnverifiedRhaiCall>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnverifiedRhaiCall {
+    pub name: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub reason: &'static str,
+}
+
+#[derive(Clone)]
+struct NativeSignature {
+    argument_types: Vec<TypeId>,
+}
+
+// Never run or even instantiate the real input/vision adapters during static
+// validation. register_api merely captures this inert state in native closures.
+struct ValidationInput;
+
+impl AutomationInput for ValidationInput {
+    fn wait_ms(&self, _: u64, _: f32, _: &AtomicBool) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn wait_random_ms(&self, _: u64, _: u64, _: f32, _: &AtomicBool) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn key_down(&self, _: &str) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn key_up(&self, _: &str) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn move_to(&self, _: i32, _: i32) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn mouse_down(&self, _: &str, _: i32, _: i32) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn mouse_up(&self, _: &str, _: i32, _: i32) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn scroll(&self, _: i32, _: i32) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+    fn type_text(&self, _: &str) -> Result<(), String> {
+        unreachable!("static validation must not execute input")
+    }
+}
+
+struct ValidationVision;
+
+impl VisionApi for ValidationVision {
+    fn active_window_title(&self) -> Result<String, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn window_exists(&self, _: &str) -> Result<bool, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn window_rect(&self, _: &str) -> Result<WindowRectValue, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn wait_window(&self, _: &str, _: VisionPollOptions<'_>) -> Result<bool, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn pixel_matches(
+        &self,
+        _: Point,
+        _: RgbColor,
+        _: u8,
+        _: &AtomicBool,
+    ) -> Result<bool, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn wait_pixel(
+        &self,
+        _: Point,
+        _: RgbColor,
+        _: u8,
+        _: VisionPollOptions<'_>,
+    ) -> Result<bool, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn find_image(
+        &self,
+        _: &str,
+        _: ScreenRect,
+        _: f32,
+        _: &AtomicBool,
+    ) -> Result<Option<crate::automation::ImageMatch>, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+    fn wait_image(
+        &self,
+        _: &str,
+        _: ScreenRect,
+        _: f32,
+        _: VisionPollOptions<'_>,
+    ) -> Result<Option<crate::automation::ImageMatch>, VisionError> {
+        unreachable!("static validation must not access vision")
+    }
+}
+
+fn validation_context(cancel: Arc<AtomicBool>) -> ExecutionContext {
+    ExecutionContext::new_with_vision(
+        Arc::new(ValidationInput),
+        cancel,
+        1.0,
+        None,
+        Arc::new(ValidationVision),
+    )
+}
+
+fn registered_api_signatures(engine: &Engine) -> HashMap<String, Vec<NativeSignature>> {
+    let mut signatures: HashMap<String, Vec<NativeSignature>> = HashMap::new();
+    // `false` excludes Rhai's standard packages, leaving precisely the
+    // functions installed by register_api on this particular engine.
+    for (name, argument_types) in engine.collect_fn_metadata(
+        None,
+        |info| {
+            Some((
+                info.metadata.name.to_string(),
+                info.metadata.param_types.to_vec(),
+            ))
+        },
+        false,
+    ) {
+        signatures
+            .entry(name)
+            .or_default()
+            .push(NativeSignature { argument_types });
+    }
+    signatures
+}
+
+// Rhai 1.26's syntactic builtins in engine.rs/func/call.rs bypass the native
+// function registry and are consequently absent from collect_fn_metadata.
+// These are Rhai language intrinsics, never AutoFlow API signatures.
+const RHAI_SYNTACTIC_FUNCTIONS: &[&str] = &[
+    "Fn",
+    "print",
+    "debug",
+    "type_of",
+    "call",
+    "curry",
+    "is_shared",
+    "is_def_fn",
+    "is_def_var",
+];
+
+fn known_literal_type(expr: &Expr) -> Option<TypeId> {
+    match expr {
+        Expr::IntegerConstant(..) => Some(TypeId::of::<i64>()),
+        Expr::FloatConstant(..) => Some(TypeId::of::<f64>()),
+        Expr::StringConstant(..) => Some(TypeId::of::<ImmutableString>()),
+        Expr::BoolConstant(..) => Some(TypeId::of::<bool>()),
+        Expr::CharConstant(..) => Some(TypeId::of::<char>()),
+        Expr::Map(..) => Some(TypeId::of::<Map>()),
+        Expr::Array(..) => Some(TypeId::of::<Array>()),
+        Expr::Unit(..) => Some(TypeId::of::<()>()),
+        // Dynamic constants, expressions and variables are never assumed to
+        // have a fixed type, even if an optimizer folds them in another mode.
+        _ => None,
+    }
+}
+
+fn call_position(position: Position) -> (Option<usize>, Option<usize>) {
+    (position.line(), position.position())
+}
+
+fn unchecked_call(
+    report: &mut RhaiValidationReport,
+    name: &str,
+    position: Position,
+    reason: &'static str,
+) {
+    let (line, column) = call_position(position);
+    report.unverified_calls.push(UnverifiedRhaiCall {
+        name: name.to_owned(),
+        line,
+        column,
+        reason,
+    });
+}
+
+struct StaticApiEnvironment<'a> {
+    native: &'a HashMap<String, Vec<NativeSignature>>,
+    known_engine_names: &'a HashSet<String>,
+    scripted: &'a HashMap<String, Vec<usize>>,
+    shadowed: &'a HashSet<String>,
+}
+
+impl StaticApiEnvironment<'_> {
+    fn check_call(
+        &self,
+        report: &mut RhaiValidationReport,
+        call: &FnCallExpr,
+        receiver: Option<&Expr>,
+        position: Position,
+    ) -> Result<(), String> {
+        let name = call.name.as_str();
+        let native = self.native;
+        let known_engine_names = self.known_engine_names;
+        let scripted = self.scripted;
+        let shadowed = self.shadowed;
+        let qualified = call.is_qualified();
+        if qualified {
+            unchecked_call(report, name, position, "带命名空间的调用需运行时确认");
+            return Ok(());
+        }
+        if shadowed.contains(name) {
+            unchecked_call(report, name, position, "同名变量或函数指针可能覆盖 API");
+            return Ok(());
+        }
+        // Rhai script methods receive `this` implicitly. Native method calls
+        // instead dispatch with the receiver as argument zero.
+        let scripted_arity = call.args.len();
+        let arity = scripted_arity + usize::from(receiver.is_some());
+        if scripted
+            .get(name)
+            .is_some_and(|overloads| overloads.contains(&scripted_arity))
+        {
+            unchecked_call(report, name, position, "用户定义的同名函数需运行时确认");
+            return Ok(());
+        }
+        if receiver.is_some_and(|expr| {
+            // Object maps can expose FnPtr fields as methods. A variable or
+            // computed value may be such a map even if its name matches a
+            // native API; neither its target nor its arity is proven here.
+            matches!(expr, Expr::Map(..)) || known_literal_type(expr).is_none()
+        }) {
+            unchecked_call(
+                report,
+                name,
+                position,
+                "对象方法可能是函数指针，接收者类型需运行时确认",
+            );
+            return Ok(());
+        }
+        let Some(overloads) = native.get(name) else {
+            if known_engine_names.contains(name) || RHAI_SYNTACTIC_FUNCTIONS.contains(&name) {
+                unchecked_call(
+                    report,
+                    name,
+                    position,
+                    "Rhai 内建函数不属于 AutoFlow API，需运行时确认",
+                );
+                return Ok(());
+            }
+            if let Some(accepted) = scripted.get(name) {
+                return Err(format_static_api_error(
+                    name,
+                    position,
+                    &format!(
+                        "用户函数参数个数为 {scripted_arity}，允许 {} 个",
+                        accepted
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                ));
+            }
+            return Err(format_static_api_error(
+                name,
+                position,
+                "未识别为 AutoFlow API、Rhai 内建函数或用户函数",
+            ));
+        };
+        let matching_arity: Vec<_> = overloads
+            .iter()
+            .filter(|sig| sig.argument_types.len() == arity)
+            .collect();
+        if matching_arity.is_empty() {
+            let mut accepted = overloads
+                .iter()
+                .map(|sig| sig.argument_types.len())
+                .collect::<Vec<_>>();
+            accepted.extend(scripted.get(name).into_iter().flatten().copied());
+            accepted.sort_unstable();
+            accepted.dedup();
+            return Err(format_static_api_error(
+                name,
+                position,
+                &format!(
+                    "参数个数为 {arity}，允许 {} 个",
+                    accepted
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                ),
+            ));
+        }
+        let literal_types = receiver
+            .into_iter()
+            .chain(call.args.iter())
+            .map(known_literal_type)
+            .collect::<Vec<_>>();
+        if !matching_arity.iter().any(|sig| {
+            sig.argument_types
+                .iter()
+                .zip(&literal_types)
+                .all(|(expected, actual)| actual.is_none_or(|actual| *expected == actual))
+        }) {
+            return Err(format_static_api_error(
+                name,
+                position,
+                "字面量参数类型与任何已注册重载均不匹配",
+            ));
+        }
+        if literal_types.iter().any(Option::is_none) {
+            unchecked_call(report, name, position, "变量或表达式的参数类型无法静态确认");
+        }
+        Ok(())
+    }
+}
+
+fn format_static_api_error(name: &str, position: Position, problem: &str) -> String {
+    match call_position(position) {
+        (Some(line), Some(column)) => {
+            format!("Rhai API 调用错误（第 {line} 行第 {column} 列）：{name}: {problem}")
+        }
+        _ => format!("Rhai API 调用错误：{name}: {problem}"),
+    }
+}
+
+pub fn inspect_rhai_source(source: &str) -> Result<RhaiValidationReport, String> {
     let code = strip_strings_and_comments(source);
     for forbidden in [
         "import",
@@ -1201,68 +1544,87 @@ pub fn validate_rhai_source(source: &str) -> Result<(), String> {
             ));
         }
     }
+    let cancel = Arc::new(AtomicBool::new(false));
     let mut engine = Engine::new();
-    configure_engine(&mut engine, Arc::new(AtomicBool::new(false)));
-    compile_source(&engine, source)?;
-    validate_known_move_to_arity(source, &code)
-}
-
-// This deliberately recognizes only unambiguous direct calls with one simple
-// argument. Rhai compilation does not resolve native API overloads; all other
-// calls (including nested arguments and locally defined functions) remain
-// runtime-checked rather than risking a false rejection during editing.
-fn validate_known_move_to_arity(source: &str, code: &str) -> Result<(), String> {
-    if source.contains("/*") || source.contains('`') || contains_identifier(code, "fn") {
-        return Ok(());
+    configure_engine(&mut engine, Arc::clone(&cancel));
+    engine.set_optimization_level(rhai::OptimizationLevel::None);
+    register_api(
+        &mut engine,
+        Arc::new(Mutex::new(validation_context(cancel))),
+    );
+    let native = registered_api_signatures(&engine);
+    let known_engine_names: HashSet<String> = engine
+        .collect_fn_metadata(None, |info| Some(info.metadata.name.to_string()), true)
+        .into_iter()
+        .collect();
+    let ast = compile_source(&engine, source)?;
+    let mut scripted: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut shadowed = HashSet::new();
+    for function in ast.iter_functions() {
+        let arities = scripted.entry(function.name.to_owned()).or_default();
+        arities.push(function.params.len());
+        shadowed.extend(function.params.iter().map(|name| (*name).to_owned()));
     }
-    // A local function pointer or variable can shadow this native API.
-    for declaration in ["let", "const", "for"] {
-        let mut remaining = code;
-        while let Some(found) = remaining.find(declaration) {
-            let before = remaining[..found].chars().next_back();
-            let tail = &remaining[found + declaration.len()..];
-            if !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                && tail.chars().next().is_some_and(char::is_whitespace)
-                && tail.trim_start().starts_with("move_to")
-            {
-                return Ok(());
+    ast.walk(&mut |path| {
+        if let Some(ASTNode::Stmt(statement)) = path.last() {
+            match statement {
+                Stmt::Var(data, ..) => {
+                    shadowed.insert(data.0.name.to_string());
+                }
+                Stmt::For(data, ..) => {
+                    shadowed.insert(data.0.name.to_string());
+                    if let Some(index) = &data.1 {
+                        shadowed.insert(index.name.to_string());
+                    }
+                }
+                Stmt::TryCatch(data, ..) => {
+                    if let Expr::Variable(variable, ..) = &data.expr {
+                        shadowed.insert(variable.1.to_string());
+                    }
+                }
+                _ => (),
             }
-            remaining = tail;
         }
-    }
-    let mut offset = 0;
-    while let Some(found) = code[offset..].find("move_to") {
-        let start = offset + found;
-        let end = start + "move_to".len();
-        offset = end;
-        let before = code[..start].chars().next_back();
-        let preceding_token = code[..start].chars().rev().find(|c| !c.is_whitespace());
-        let after = code[end..].chars().next();
-        if matches!(preceding_token, Some('.' | ':'))
-            || before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-            || after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            continue;
-        }
-        let rest = code[end..].trim_start();
-        let Some(arguments) = rest.strip_prefix('(') else {
-            continue;
+        true
+    });
+    let mut result = RhaiValidationReport::default();
+    let mut error = None;
+    let environment = StaticApiEnvironment {
+        native: &native,
+        known_engine_names: &known_engine_names,
+        scripted: &scripted,
+        shadowed: &shadowed,
+    };
+    ast.walk(&mut |path| {
+        let current = path.last().copied();
+        let (call, position, receiver): (&FnCallExpr, Position, Option<&Expr>) = match current {
+            Some(ASTNode::Stmt(Stmt::FnCall(call, position))) => (call, *position, None),
+            Some(ASTNode::Expr(Expr::FnCall(call, position))) => (call, *position, None),
+            Some(ASTNode::Expr(Expr::MethodCall(call, position))) => {
+                let receiver = path.iter().rev().nth(1).and_then(|parent| match parent {
+                    ASTNode::Expr(Expr::Dot(binary, ..)) => Some(&binary.lhs),
+                    _ => None,
+                });
+                // A receiver not present in this AST shape cannot be safely
+                // counted/typed; preserve the call for runtime confirmation.
+                if receiver.is_none() {
+                    unchecked_call(&mut result, &call.name, *position, "方法接收者无法静态确认");
+                    return true;
+                }
+                (call, *position, receiver)
+            }
+            _ => return true,
         };
-        let Some(close) = arguments.find(')') else {
-            continue;
-        };
-        let arguments = arguments[..close].trim();
-        let one_argument = arguments.trim_end_matches(',').trim();
-        if !one_argument.is_empty()
-            && arguments.chars().filter(|&c| c == ',').count() <= 1
-            && one_argument
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-        {
-            return Err("move_to 需要两个坐标参数 (x, y)；末尾逗号不代表第二个参数".into());
+        if call.is_operator_call() {
+            return true;
         }
-    }
-    Ok(())
+        if let Err(problem) = environment.check_call(&mut result, call, receiver, position) {
+            error = Some(problem);
+            return false;
+        }
+        true
+    });
+    error.map_or(Ok(result), Err)
 }
 
 fn compile_source(engine: &Engine, source: &str) -> Result<rhai::AST, String> {
@@ -1704,7 +2066,7 @@ mod tests {
         let missing = "let x = 1; move_to(x,  );";
         assert!(validate_rhai_source(missing)
             .expect_err("trailing comma is not a second argument")
-            .contains("两个坐标参数"));
+            .contains("参数个数"));
         assert!(validate_rhai_source("move_to(10)").is_err());
         assert!(validate_rhai_source("move_to(10, 20)").is_ok());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1730,8 +2092,213 @@ mod tests {
         assert!(validate_rhai_source("let x = 1; /* move_to(x, ); */ move_to(x, 20);").is_ok());
         let shadowed = "let move_to = Fn(\"print\"); move_to(10);";
         assert!(
-            validate_known_move_to_arity(shadowed, &strip_strings_and_comments(shadowed)).is_ok()
+            validate_rhai_source(shadowed).is_ok(),
+            "{:?}",
+            validate_rhai_source(shadowed)
         );
+    }
+
+    #[test]
+    fn all_registered_autoflow_api_overloads_are_validated_from_real_signatures() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut engine = Engine::new();
+        register_api(
+            &mut engine,
+            Arc::new(Mutex::new(validation_context(cancel))),
+        );
+        let signatures = registered_api_signatures(&engine);
+        let count = signatures.values().map(Vec::len).sum::<usize>();
+        assert_eq!(
+            (signatures.len(), count),
+            (24, 33),
+            "update this contract when API registration changes"
+        );
+
+        for (name, overloads) in &signatures {
+            for overload in overloads {
+                let args = overload
+                    .argument_types
+                    .iter()
+                    .map(|type_id| {
+                        if *type_id == TypeId::of::<i64>() {
+                            "1"
+                        } else if *type_id == TypeId::of::<f64>() {
+                            "0.5"
+                        } else if *type_id == TypeId::of::<ImmutableString>() {
+                            "\"A\""
+                        } else if *type_id == TypeId::of::<Map>() {
+                            "#{}"
+                        } else {
+                            panic!("unknown API parameter TypeId in {name}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let valid = format!("{name}({args});");
+                assert!(validate_rhai_source(&valid).is_ok(), "valid {valid}");
+            }
+            let highest = overloads
+                .iter()
+                .map(|sig| sig.argument_types.len())
+                .max()
+                .unwrap();
+            for count in 0..=highest + 1 {
+                if overloads
+                    .iter()
+                    .any(|sig| sig.argument_types.len() == count)
+                {
+                    continue;
+                }
+                let args = vec!["1"; count].join(", ");
+                let invalid = format!("{name}({args});");
+                assert!(
+                    validate_rhai_source(&invalid)
+                        .unwrap_err()
+                        .contains("参数个数"),
+                    "invalid {invalid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inspection_distinguishes_static_errors_from_runtime_unknowns() {
+        let wrong_arity = "// leading\nmove_to(1,);";
+        let error =
+            inspect_rhai_source(wrong_arity).expect_err("trailing comma is not an argument");
+        assert!(error.contains("第 2 行第 1 列"), "{error}");
+        assert!(inspect_rhai_source("move_to(1, true)")
+            .unwrap_err()
+            .contains("类型"));
+        assert!(inspect_rhai_source("click(1, 2)").is_ok());
+        assert!(inspect_rhai_source("click(\"left\", 1)")
+            .unwrap_err()
+            .contains("类型"));
+        assert!(
+            inspect_rhai_source("stop_with_message(\"ok\", #{ mode: \"foreground\" })").is_ok()
+        );
+        assert!(inspect_rhai_source("stop_with_message(\"ok\", 1)")
+            .unwrap_err()
+            .contains("类型"));
+        assert!(inspect_rhai_source("foo(1)")
+            .unwrap_err()
+            .contains("未识别"));
+        assert!(inspect_rhai_source("fn foo(a, b) { a + b } foo(1)")
+            .unwrap_err()
+            .contains("用户函数"));
+        let dynamic_method = inspect_rhai_source("let x = 1; x.move_to(2, 3)")
+            .expect("dynamic receiver might be a map method");
+        assert!(dynamic_method
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "move_to"));
+        assert!(inspect_rhai_source("1.move_to(20, 30)")
+            .unwrap_err()
+            .contains("参数个数"));
+        assert!(inspect_rhai_source("1.move_to(20)").is_ok());
+        assert!(inspect_rhai_source("\"A\".press()").is_ok());
+        assert!(inspect_rhai_source("\"A\".press(1)")
+            .unwrap_err()
+            .contains("参数个数"));
+        assert!(inspect_rhai_source("fn move_to(a) { a } move_to(10)").is_ok());
+        assert!(
+            inspect_rhai_source("let f = Fn(\"print\"); f(1)").is_ok(),
+            "{:?}",
+            inspect_rhai_source("let f = Fn(\"print\"); f(1)")
+        );
+        let unresolved = inspect_rhai_source("let x = 1; move_to(x, 20)")
+            .expect("variable type remains dynamic");
+        assert!(unresolved
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "move_to" && call.line == Some(1)));
+        assert!(inspect_rhai_source(
+            "let s = \"move_to(1,)\"; /* move_to(1,) */ move_to((1 + 1), 20)"
+        )
+        .is_ok());
+        assert!(inspect_rhai_source("let x = 1; x.move_to(20)").is_ok());
+    }
+
+    #[test]
+    fn scripted_method_uses_implicit_this_without_native_receiver_arity() {
+        let source = "fn foo(a) { this + a } let x = 1; x.foo(2)";
+        let report = inspect_rhai_source(source).expect("script method is legal");
+        assert!(report
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "foo"));
+        assert_eq!(
+            Engine::new()
+                .eval::<i64>(source)
+                .expect("pure Rhai evaluation"),
+            3
+        );
+
+        let shadowing = "fn move_to(a) { this + a } 1.move_to(2)";
+        let report =
+            inspect_rhai_source(shadowing).expect("script method takes precedence over API");
+        assert!(report
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "move_to"));
+        assert_eq!(
+            Engine::new()
+                .eval::<i64>(shadowing)
+                .expect("pure Rhai evaluation"),
+            3
+        );
+
+        let wrong = inspect_rhai_source("fn foo(a, b) { a + b } 1.foo()")
+            .expect_err("script method has zero explicit arguments");
+        assert!(wrong.contains("用户函数参数个数为 0，允许 2 个"), "{wrong}");
+    }
+
+    #[test]
+    fn object_fnptr_methods_remain_unverified_instead_of_falsely_rejected() {
+        let source = "fn foo(a) { a + 1 } let o = #{ f: Fn(\"foo\") }; o.f(1)";
+        let report = inspect_rhai_source(source).expect("object FnPtr method is legal");
+        assert!(report.unverified_calls.iter().any(|call| call.name == "f"));
+        assert_eq!(
+            Engine::new()
+                .eval::<i64>(source)
+                .expect("pure Rhai evaluation"),
+            2
+        );
+
+        let matching_api_name =
+            "fn foo(a) { a + 1 } let o = #{ move_to: Fn(\"foo\") }; o.move_to(1)";
+        let report = inspect_rhai_source(matching_api_name).expect("map FnPtr method shadows API");
+        assert!(report
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "move_to"));
+        assert_eq!(
+            Engine::new()
+                .eval::<i64>(matching_api_name)
+                .expect("pure Rhai evaluation"),
+            2
+        );
+    }
+
+    #[test]
+    fn catch_binding_of_function_pointer_remains_unverified() {
+        let source = "fn target(a) { a + 1 } try { throw Fn(\"target\") } catch(f) { f(1) }";
+        let report = inspect_rhai_source(source).expect("catch binding is a dynamic callable");
+        assert!(report.unverified_calls.iter().any(|call| call.name == "f"));
+        // Rhai 1.26 does not resolve this catch-bound variable as a direct
+        // function call; static inspection must still not claim certainty.
+        assert!(Engine::new().eval::<i64>(source).is_err());
+
+        let explicit = "fn target(a) { a + 1 } try { throw Fn(\"target\") } catch(f) { f.call(1) }";
+        let report =
+            inspect_rhai_source(explicit).expect("explicit FnPtr dispatch remains unverified");
+        assert!(report
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "call"));
+        let _ = Engine::new()
+            .eval::<Dynamic>(explicit)
+            .expect("pure Rhai evaluation succeeds");
     }
 
     #[test]

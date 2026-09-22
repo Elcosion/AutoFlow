@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   play: vi.fn(),
   recordingStatus: vi.fn(),
   stop: vi.fn(),
+  validate: vi.fn(),
 }));
 const app = vi.hoisted(() => ({
   hook: vi.fn(),
@@ -21,7 +22,11 @@ const app = vi.hoisted(() => ({
 vi.mock("../components/AssetManager", () => ({ AssetManager: () => null }));
 vi.mock("../components/BulkActions", () => ({ BulkActions: () => null }));
 vi.mock("../components/PageHeader", () => ({ PageHeader: () => null }));
-vi.mock("../components/RhaiEditor", () => ({ RhaiEditor: () => null }));
+vi.mock("../components/RhaiEditor", () => ({
+  RhaiEditor: ({ onCheck }: { onCheck: () => void }) => (
+    <button onClick={onCheck}>检查 Rhai</button>
+  ),
+}));
 vi.mock("../lib/useAutoSave", () => ({ useAutoSave: () => undefined }));
 vi.mock("../lib/config", () => ({
   toErrorMessage: (reason: unknown) =>
@@ -37,7 +42,7 @@ vi.mock("../lib/tauri", () => ({
   startMacroRecording: vi.fn(),
   stopMacro: api.stop,
   stopMacroRecording: vi.fn(),
-  validateRhaiSource: vi.fn(),
+  validateRhaiSource: api.validate,
 }));
 
 const macro: MacroRule = {
@@ -71,6 +76,7 @@ beforeEach(() => {
     captureMouseClicks: false,
   });
   api.stop.mockResolvedValue(undefined);
+  api.validate.mockResolvedValue({ unverifiedCalls: [] });
   app.persist.mockResolvedValue(defaultConfig);
   app.refresh.mockResolvedValue(undefined);
   app.hook.mockReturnValue({
@@ -82,6 +88,44 @@ beforeEach(() => {
     persist: app.persist,
     refresh: app.refresh,
   });
+});
+
+it("keeps dynamic-call diagnostics visible after static inspection", async () => {
+  app.hook.mockReturnValue({
+    config: {
+      ...defaultConfig,
+      macros: [
+        {
+          ...macro,
+          program: {
+            kind: "rhai",
+            source: "let x = 10; move_to(x, 20)",
+            apiVersion: 1,
+          },
+        },
+      ],
+    },
+    loading: false,
+    saving: false,
+    error: null,
+    setError: app.setError,
+    persist: app.persist,
+    refresh: app.refresh,
+  });
+  api.validate.mockResolvedValue({
+    unverifiedCalls: [
+      { name: "move_to", line: 1, column: 13, reason: "变量类型无法静态确认" },
+    ],
+  });
+  const view = await mount();
+  await act(async () => button(view.host, "源码")?.click());
+  await act(async () => button(view.host, "检查 Rhai")?.click());
+  expect(view.host.textContent).toContain("1 处调用未验证");
+  expect(view.host.textContent).toContain(
+    "move_to（第 1 行第 13 列）：变量类型无法静态确认",
+  );
+  expect(view.host.textContent).toContain("不代表运行成功");
+  await view.close();
 });
 
 afterEach(() => {

@@ -589,9 +589,22 @@ export async function getMacroPlaybackStatus(): Promise<MacroPlaybackStatus> {
   return invoke<MacroPlaybackStatus>("get_macro_playback_status");
 }
 
-export async function validateRhaiSource(source: string): Promise<void> {
-  if (!isTauriRuntime()) return;
-  await invoke("validate_rhai_source", { source });
+export interface UnverifiedRhaiCall {
+  name: string;
+  line: number | null;
+  column: number | null;
+  reason: string;
+}
+
+export interface RhaiValidationReport {
+  unverifiedCalls: UnverifiedRhaiCall[];
+}
+
+export async function validateRhaiSource(
+  source: string,
+): Promise<RhaiValidationReport> {
+  if (!isTauriRuntime()) return { unverifiedCalls: [] };
+  return invoke<RhaiValidationReport>("validate_rhai_source", { source });
 }
 
 export async function startBehaviorRecording(name: string): Promise<void> {

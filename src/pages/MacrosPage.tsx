@@ -34,6 +34,7 @@ import {
   stopMacro,
   stopMacroRecording,
   validateRhaiSource,
+  type RhaiValidationReport,
 } from "../lib/tauri";
 import { nextCapturedKeys } from "../lib/triggerCapture";
 import {
@@ -340,6 +341,10 @@ export function MacrosPage() {
   const [sourceText, setSourceText] = useState("");
   const [sourceDirty, setSourceDirty] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
+  const [sourceInspection, setSourceInspection] = useState<{
+    source: string;
+    report: RhaiValidationReport;
+  } | null>(null);
   const [sourceErrorLine, setSourceErrorLine] = useState<number | null>(null);
   const [sourceErrorColumn, setSourceErrorColumn] = useState<number | null>(
     null,
@@ -755,10 +760,14 @@ export function MacrosPage() {
   const checkSource = async () => {
     try {
       if (classifyMacroSource(sourceText) === "advanced") {
-        await validateRhaiSource(sourceText);
+        const report = await validateRhaiSource(sourceText);
+        setSourceInspection({ source: sourceText, report });
         setSourceError(null);
+        const first = report.unverifiedCalls[0];
         showNotice(
-          "Rhai 语法及部分已知参数检查通过；变量与运行结果仍需实际执行验证",
+          first
+            ? `静态检查未发现确定错误；${report.unverifiedCalls.length} 处调用尚未验证。首处：${first.name}（第 ${first.line ?? "?"} 行第 ${first.column ?? "?"} 列）：${first.reason}。运行结果仍需实际验证`
+            : "静态语法和已注册 API 调用检查未发现确定错误；运行结果仍需实际验证",
         );
         setSourceErrorLine(null);
         setSourceErrorColumn(null);
@@ -1518,7 +1527,33 @@ export function MacrosPage() {
                     <small>
                       高级脚本可使用变量、条件、循环和函数，但不能访问文件、网络、进程或系统命令。
                     </small>
+                    <small>
+                      静态检查无法保证脚本可以运行；输入、窗口和动态值仍需运行时确认。
+                    </small>
                   </div>
+                  {selectedSourceKind === "advanced" &&
+                  sourceInspection?.source === sourceText ? (
+                    <div role="status" className="rhai-source-help">
+                      <strong>
+                        静态检查：
+                        {sourceInspection.report.unverifiedCalls.length}{" "}
+                        处调用未验证
+                      </strong>
+                      {sourceInspection.report.unverifiedCalls.map(
+                        (call, index) => (
+                          <small
+                            key={`${call.name}-${call.line}-${call.column}-${index}`}
+                          >
+                            {call.name}（第 {call.line ?? "?"} 行第{" "}
+                            {call.column ?? "?"} 列）：{call.reason}
+                          </small>
+                        ),
+                      )}
+                      <small>
+                        检查未发现确定错误不代表运行成功；请在安全条件下人工验证。
+                      </small>
+                    </div>
+                  ) : null}
                   <AssetManager
                     assets={config.assets}
                     onError={(message) => setError(message)}
