@@ -1359,6 +1359,111 @@ fn known_literal_type(expr: &Expr) -> Option<TypeId> {
     }
 }
 
+// A finite over-approximation: every possible successful evaluation must
+// have one of these types. Unknown is deliberately contagious; a false
+// "verified" verdict would hide a real input-time failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StaticType {
+    Types(Vec<TypeId>),
+    Unknown(&'static str),
+}
+
+impl StaticType {
+    fn literal(expr: &Expr) -> Self {
+        known_literal_type(expr).map_or_else(
+            || Self::Unknown("表达式结果需要运行时确认"),
+            |kind| Self::Types(vec![kind]),
+        )
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Types(left), Self::Types(right)) if left.len() + right.len() <= 16 => {
+                let mut kinds = left.clone();
+                for kind in right {
+                    if !kinds.contains(kind) {
+                        kinds.push(*kind);
+                    }
+                }
+                Self::Types(kinds)
+            }
+            _ => Self::Unknown("分支或动态路径的参数类型无法静态确认"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalFact {
+    kind: StaticType,
+    mutable: bool,
+}
+
+// Lexical frames are copied at a branch; only bindings that existed before
+// the branch can flow out. A shadow binding never replaces its outer binding.
+#[derive(Clone, Default)]
+struct FlowScope(Vec<HashMap<String, LocalFact>>);
+
+impl FlowScope {
+    fn root() -> Self {
+        Self(vec![HashMap::new()])
+    }
+
+    fn lookup(&self, name: &str) -> StaticType {
+        self.0
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(name))
+            .map_or(
+                StaticType::Unknown("变量来自未知作用域或外部值"),
+                |fact| fact.kind.clone(),
+            )
+    }
+
+    fn assign(&mut self, name: &str, kind: StaticType) {
+        if let Some(fact) = self
+            .0
+            .iter_mut()
+            .rev()
+            .find_map(|frame| frame.get_mut(name))
+        {
+            fact.kind = kind;
+        } else {
+            self.havoc();
+        }
+    }
+
+    fn declare(&mut self, name: &str, kind: StaticType, mutable: bool) {
+        self.0
+            .last_mut()
+            .expect("scope has a frame")
+            .insert(name.to_owned(), LocalFact { kind, mutable });
+    }
+
+    fn havoc(&mut self) {
+        for frame in &mut self.0 {
+            for fact in frame.values_mut().filter(|fact| fact.mutable) {
+                fact.kind = StaticType::Unknown("循环、闭包或动态调用可能更改变量");
+            }
+        }
+    }
+
+    fn joined(&self, other: &Self) -> Self {
+        let mut result = self.clone();
+        for (index, frame) in result.0.iter_mut().enumerate() {
+            for (name, fact) in frame {
+                fact.kind = fact.kind.join(
+                    &other.0[index]
+                        .get(name)
+                        .map_or(StaticType::Unknown("分支中变量不可用"), |other| {
+                            other.kind.clone()
+                        }),
+                );
+            }
+        }
+        result
+    }
+}
+
 fn call_position(position: Position) -> (Option<usize>, Option<usize>) {
     (position.line(), position.position())
 }
@@ -1392,6 +1497,7 @@ impl StaticApiEnvironment<'_> {
         call: &FnCallExpr,
         receiver: Option<&Expr>,
         position: Position,
+        argument_types: &[StaticType],
     ) -> Result<(), String> {
         let name = call.name.as_str();
         let native = self.native;
@@ -1422,7 +1528,12 @@ impl StaticApiEnvironment<'_> {
             // Object maps can expose FnPtr fields as methods. A variable or
             // computed value may be such a map even if its name matches a
             // native API; neither its target nor its arity is proven here.
-            matches!(expr, Expr::Map(..)) || known_literal_type(expr).is_none()
+            matches!(expr, Expr::Map(..))
+                || matches!(argument_types.first(), Some(StaticType::Unknown(_)))
+                || argument_types.first().is_some_and(|kind| match kind {
+                    StaticType::Types(kinds) => kinds.contains(&TypeId::of::<Map>()),
+                    StaticType::Unknown(_) => true,
+                })
         }) {
             unchecked_call(
                 report,
@@ -1487,27 +1598,414 @@ impl StaticApiEnvironment<'_> {
                 ),
             ));
         }
-        let literal_types = receiver
-            .into_iter()
-            .chain(call.args.iter())
-            .map(known_literal_type)
-            .collect::<Vec<_>>();
-        if !matching_arity.iter().any(|sig| {
-            sig.argument_types
+        // Evaluate *complete* argument tuples against complete overloads.  A
+        // combination is an error only when no overload can accept it. Loss
+        // of path correlation may add tuples, never remove actual outcomes.
+        let mut compatible = false;
+        let mut incompatible = false;
+        let mut dynamic = false;
+        fn enumerate(
+            arguments: &[StaticType],
+            tuple: &mut Vec<TypeId>,
+            overloads: &[&NativeSignature],
+            compatible: &mut bool,
+            incompatible: &mut bool,
+            dynamic: &mut bool,
+        ) {
+            let Some((first, rest)) = arguments.split_first() else {
+                if overloads
+                    .iter()
+                    .any(|sig| sig.argument_types.as_slice() == tuple.as_slice())
+                {
+                    *compatible = true;
+                } else {
+                    *incompatible = true;
+                }
+                return;
+            };
+            match first {
+                StaticType::Unknown(_) => *dynamic = true,
+                StaticType::Types(kinds) => {
+                    for kind in kinds {
+                        tuple.push(*kind);
+                        enumerate(rest, tuple, overloads, compatible, incompatible, dynamic);
+                        tuple.pop();
+                    }
+                }
+            }
+        }
+        // Unknown is a wildcard only when some overload could still accept
+        // the known parts. An unrelated known argument can prove rejection.
+        let possible = matching_arity.iter().any(|signature| {
+            signature
+                .argument_types
                 .iter()
-                .zip(&literal_types)
-                .all(|(expected, actual)| actual.is_none_or(|actual| *expected == actual))
-        }) {
+                .zip(argument_types)
+                .all(|(expected, actual)| match actual {
+                    StaticType::Unknown(_) => true,
+                    StaticType::Types(kinds) => kinds.contains(expected),
+                })
+        });
+        if !possible {
             return Err(format_static_api_error(
                 name,
                 position,
-                "字面量参数类型与任何已注册重载均不匹配",
+                "参数类型与任何已注册重载均不匹配",
             ));
         }
-        if literal_types.iter().any(Option::is_none) {
-            unchecked_call(report, name, position, "变量或表达式的参数类型无法静态确认");
+        // Static checking runs on every editor inspection. The Cartesian
+        // product may be exponential in arity; never enumerate an unbounded
+        // number of paths on the UI command thread.
+        const MAX_TYPE_COMBINATIONS: usize = 256;
+        let combinations = argument_types
+            .iter()
+            .try_fold(1usize, |count, kind| match kind {
+                StaticType::Types(kinds) => count.checked_mul(kinds.len()),
+                StaticType::Unknown(_) => None,
+            });
+        if combinations.is_none_or(|count| count > MAX_TYPE_COMBINATIONS) {
+            let reason = if argument_types
+                .iter()
+                .any(|kind| matches!(kind, StaticType::Unknown(_)))
+            {
+                argument_types
+                    .iter()
+                    .find_map(|kind| match kind {
+                        StaticType::Unknown(reason) => Some(*reason),
+                        StaticType::Types(_) => None,
+                    })
+                    .unwrap_or("参数类型无法静态确认")
+            } else {
+                "可能的参数类型组合过多，需运行时确认"
+            };
+            unchecked_call(report, name, position, reason);
+            return Ok(());
+        }
+        enumerate(
+            argument_types,
+            &mut Vec::new(),
+            &matching_arity,
+            &mut compatible,
+            &mut incompatible,
+            &mut dynamic,
+        );
+        if incompatible && !compatible && !dynamic {
+            return Err(format_static_api_error(
+                name,
+                position,
+                "参数类型与任何已注册重载均不匹配",
+            ));
+        }
+        if dynamic || incompatible {
+            let reason = if incompatible && compatible {
+                "部分可达参数类型与已注册重载不匹配，需运行时确认"
+            } else {
+                argument_types
+                    .iter()
+                    .find_map(|kind| match kind {
+                        StaticType::Unknown(reason) => Some(*reason),
+                        StaticType::Types(_) => None,
+                    })
+                    .unwrap_or("参数类型无法静态确认")
+            };
+            unchecked_call(report, name, position, reason);
         }
         Ok(())
+    }
+}
+
+// Top-level statements have a meaningful execution order. Function bodies
+// have no public AST boundary in Rhai 1.26; the final AST walk checks them
+// separately with unknown local state rather than guessing call-time facts.
+struct FlowInspector<'a> {
+    environment: &'a StaticApiEnvironment<'a>,
+    report: &'a mut RhaiValidationReport,
+    visited: HashSet<usize>,
+    error: Option<String>,
+}
+
+impl FlowInspector<'_> {
+    fn block(&mut self, statements: &[Stmt], scope: &mut FlowScope, nested: bool) {
+        if nested {
+            scope.0.push(HashMap::new());
+        }
+        for stmt in statements {
+            if self.error.is_some() {
+                break;
+            }
+            self.statement(stmt, scope);
+        }
+        if nested {
+            scope.0.pop();
+        }
+    }
+
+    fn call(
+        &mut self,
+        call: &FnCallExpr,
+        position: Position,
+        receiver: Option<(&Expr, StaticType)>,
+        scope: &mut FlowScope,
+    ) -> StaticType {
+        let mut arguments = Vec::with_capacity(call.args.len() + usize::from(receiver.is_some()));
+        if let Some((_, kind)) = &receiver {
+            arguments.push(kind.clone());
+        }
+        for argument in &call.args {
+            arguments.push(self.expression(argument, scope));
+        }
+        // Rhai 1.26's normal func(variable, ...) path dereferences the first
+        // variable AFTER evaluating later arguments (func/call.rs). Method
+        // receivers can likewise be an lvalue reference. Reconcile every
+        // variable argument against the environment after the last argument:
+        // over-approximation is safer than relying on dispatch/eval details.
+        for (index, expression) in receiver
+            .as_ref()
+            .map(|(expr, _)| *expr)
+            .into_iter()
+            .chain(call.args.iter())
+            .enumerate()
+        {
+            if let Expr::Variable(variable, ..) = expression {
+                if variable.2.is_empty() {
+                    let after = scope.lookup(&variable.1);
+                    if after != arguments[index] {
+                        arguments[index] = arguments[index].join(&after);
+                    }
+                }
+            }
+        }
+        self.visited.insert(call as *const FnCallExpr as usize);
+        if !call.is_operator_call() && self.error.is_none() {
+            if let Err(problem) = self.environment.check_call(
+                self.report,
+                call,
+                receiver.as_ref().map(|(expr, _)| *expr),
+                position,
+                &arguments,
+            ) {
+                self.error = Some(problem);
+            }
+        }
+        // A scripted function, function pointer or unknown native call may
+        // invoke a closure that writes captured variables. Never retain facts
+        // across such a call. Registered AutoFlow API is not given access to
+        // the script's lexical variables.
+        let native_direct = !call.is_qualified()
+            && !self.environment.shadowed.contains(call.name.as_str())
+            && self.environment.native.contains_key(call.name.as_str())
+            && receiver.as_ref().is_none_or(|_| {
+                let kind = &arguments[0];
+                matches!(kind, StaticType::Types(kinds) if !kinds.contains(&TypeId::of::<Map>()))
+            })
+            && !self
+                .environment
+                .scripted
+                .get(call.name.as_str())
+                .is_some_and(|arities| arities.contains(&call.args.len()));
+        if !native_direct && !call.is_operator_call() {
+            scope.havoc();
+        }
+        if call.is_operator_call() {
+            let kinds = arguments.as_slice();
+            // These three primitive operations retain a fixed result type
+            // under Rhai's built-in dispatch. All others remain unknown;
+            // expressions cannot be evaluated just to discover their type.
+            if kinds.len() == 1 {
+                if matches!((call.name.as_str(), &kinds[0]), ("-" | "+", StaticType::Types(types)) if types == &vec![TypeId::of::<i64>()])
+                {
+                    return StaticType::Types(vec![TypeId::of::<i64>()]);
+                }
+                if matches!((call.name.as_str(), &kinds[0]), ("!", StaticType::Types(types)) if types == &vec![TypeId::of::<bool>()])
+                {
+                    return StaticType::Types(vec![TypeId::of::<bool>()]);
+                }
+            }
+            if kinds.len() == 2 && kinds.iter().all(|kind| matches!(kind, StaticType::Types(types) if types == &vec![TypeId::of::<i64>()]))
+                && matches!(call.name.as_str(), "+" | "-" | "*" | "/" | "%") {
+                return StaticType::Types(vec![TypeId::of::<i64>()]);
+            }
+        }
+        StaticType::Unknown("函数返回类型或运算结果需要运行时确认")
+    }
+
+    fn expression(&mut self, expr: &Expr, scope: &mut FlowScope) -> StaticType {
+        match expr {
+            Expr::Variable(variable, ..) if variable.2.is_empty() => scope.lookup(&variable.1),
+            Expr::Variable(..) => StaticType::Unknown("带命名空间的变量类型无法静态确认"),
+            Expr::FnCall(call, position) => self.call(call, *position, None, scope),
+            Expr::Dot(pair, ..) if matches!(&pair.rhs, Expr::MethodCall(..)) => {
+                let receiver = self.expression(&pair.lhs, scope);
+                if let Expr::MethodCall(call, position) = &pair.rhs {
+                    self.call(call, *position, Some((&pair.lhs, receiver)), scope)
+                } else {
+                    unreachable!()
+                }
+            }
+            Expr::Dot(pair, ..) | Expr::Index(pair, ..) => {
+                self.expression(&pair.lhs, scope);
+                self.expression(&pair.rhs, scope);
+                // Getters/indexers can dispatch to script functions.
+                scope.havoc();
+                StaticType::Unknown("属性或下标值需要运行时确认")
+            }
+            Expr::MethodCall(call, position) => {
+                // An unbound method AST has no proven receiver.
+                self.visited.insert(&**call as *const FnCallExpr as usize);
+                unchecked_call(self.report, &call.name, *position, "方法接收者无法静态确认");
+                for argument in &call.args {
+                    self.expression(argument, scope);
+                }
+                scope.havoc();
+                StaticType::Unknown("方法结果需要运行时确认")
+            }
+            Expr::Array(items, ..) | Expr::InterpolatedString(items, ..) => {
+                for item in items {
+                    self.expression(item, scope);
+                }
+                if matches!(expr, Expr::Array(..)) {
+                    StaticType::Types(vec![TypeId::of::<Array>()])
+                } else {
+                    StaticType::Types(vec![TypeId::of::<ImmutableString>()])
+                }
+            }
+            Expr::Map(entries, ..) => {
+                for (_, value) in &entries.0 {
+                    self.expression(value, scope);
+                }
+                StaticType::Types(vec![TypeId::of::<Map>()])
+            }
+            Expr::And(items, ..) | Expr::Or(items, ..) | Expr::Coalesce(items, ..) => {
+                let mut branches = scope.clone();
+                let mut result = StaticType::Unknown("短路表达式结果需要运行时确认");
+                for (index, item) in items.iter().enumerate() {
+                    let kind = self.expression(item, &mut branches);
+                    if index == 0 {
+                        result = kind;
+                    } else {
+                        result = result.join(&kind);
+                    }
+                    *scope = scope.joined(&branches);
+                }
+                result
+            }
+            Expr::Stmt(block) => {
+                scope.0.push(HashMap::new());
+                for stmt in block.statements() {
+                    self.statement(stmt, scope);
+                }
+                scope.0.pop();
+                // A trailing semicolon changes Rhai block return semantics.
+                // The public AST's final Stmt::Expr cannot prove that the
+                // block returns the expression's type in all contexts.
+                StaticType::Unknown("语句块的返回类型需要运行时确认")
+            }
+            Expr::Custom(..) => {
+                scope.havoc();
+                StaticType::Unknown("自定义表达式类型需要运行时确认")
+            }
+            _ => StaticType::literal(expr),
+        }
+    }
+
+    fn statement(&mut self, stmt: &Stmt, scope: &mut FlowScope) {
+        match stmt {
+            Stmt::Var(value, flags, ..) => {
+                let kind = self.expression(&value.1, scope);
+                scope.declare(
+                    &value.0.name,
+                    kind,
+                    !flags.contains(rhai::ASTFlags::CONSTANT),
+                );
+            }
+            Stmt::Assignment(value) => {
+                let kind = self.expression(&value.1.rhs, scope);
+                if let Expr::Variable(variable, ..) = &value.1.lhs {
+                    if !variable.2.is_empty() {
+                        scope.havoc();
+                        return;
+                    }
+                    scope.assign(
+                        &variable.1,
+                        if value.0.is_op_assignment() {
+                            StaticType::Unknown("复合赋值结果需要运行时确认")
+                        } else {
+                            kind
+                        },
+                    );
+                } else {
+                    self.expression(&value.1.lhs, scope);
+                    scope.havoc();
+                }
+            }
+            Stmt::FnCall(call, position) => {
+                self.call(call, *position, None, scope);
+            }
+            Stmt::Expr(expr) => {
+                self.expression(expr, scope);
+            }
+            Stmt::Block(block) => self.block(block.statements(), scope, true),
+            Stmt::If(flow, ..) => {
+                self.expression(&flow.expr, scope);
+                let mut main = scope.clone();
+                let mut alternative = scope.clone();
+                self.block(flow.body.statements(), &mut main, true);
+                self.block(flow.branch.statements(), &mut alternative, true);
+                *scope = main.joined(&alternative);
+            }
+            Stmt::While(flow, ..) => {
+                scope.havoc();
+                self.expression(&flow.expr, scope);
+                let mut body = scope.clone();
+                self.block(flow.body.statements(), &mut body, true);
+                *scope = scope.joined(&body);
+                scope.havoc();
+            }
+            Stmt::Do(flow, ..) => {
+                // The body runs before the guard, unlike while. A do loop can
+                // repeat, so all mutable facts are unknown already at its
+                // first body visit (the AST call represents every iteration).
+                scope.havoc();
+                let mut body = scope.clone();
+                self.block(flow.body.statements(), &mut body, true);
+                // A continue (including one hidden in a nested branch) skips
+                // the remaining body statements and jumps to this guard.
+                // The linear body's final facts are not true on that path.
+                body.havoc();
+                self.expression(&flow.expr, &mut body);
+                *scope = scope.joined(&body);
+                scope.havoc();
+            }
+            Stmt::For(value, ..) => {
+                // Iterable executes once; body may execute many times. Forget
+                // mutable facts after iterable evaluation but BEFORE the
+                // shared body AST is checked for any iteration.
+                self.expression(&value.2.expr, scope);
+                scope.havoc();
+                let mut body = scope.clone();
+                body.0.push(HashMap::new());
+                body.declare(
+                    &value.0.name,
+                    StaticType::Unknown("循环变量类型需要运行时确认"),
+                    true,
+                );
+                if let Some(index) = &value.1 {
+                    body.declare(
+                        &index.name,
+                        StaticType::Unknown("循环索引类型需要运行时确认"),
+                        true,
+                    );
+                }
+                self.block(value.2.body.statements(), &mut body, false);
+                body.0.pop();
+                *scope = scope.joined(&body);
+                scope.havoc();
+            }
+            // Switch, exception handlers, continue, capture and custom
+            // constructs have non-linear effects. Inspect nested API calls
+            // via the conservative AST walk, then forget mutable facts.
+            _ => scope.havoc(),
+        }
     }
 }
 
@@ -1595,12 +2093,26 @@ pub fn inspect_rhai_source(source: &str) -> Result<RhaiValidationReport, String>
         scripted: &scripted,
         shadowed: &shadowed,
     };
+    let mut inspector = FlowInspector {
+        environment: &environment,
+        report: &mut result,
+        visited: HashSet::new(),
+        error: None,
+    };
+    inspector.block(ast.statements(), &mut FlowScope::root(), false);
+    if let Some(problem) = inspector.error.take() {
+        return Err(problem);
+    }
+    let visited = inspector.visited;
     ast.walk(&mut |path| {
         let current = path.last().copied();
         let (call, position, receiver): (&FnCallExpr, Position, Option<&Expr>) = match current {
             Some(ASTNode::Stmt(Stmt::FnCall(call, position))) => (call, *position, None),
             Some(ASTNode::Expr(Expr::FnCall(call, position))) => (call, *position, None),
             Some(ASTNode::Expr(Expr::MethodCall(call, position))) => {
+                if visited.contains(&(&**call as *const FnCallExpr as usize)) {
+                    return true;
+                }
                 let receiver = path.iter().rev().nth(1).and_then(|parent| match parent {
                     ASTNode::Expr(Expr::Dot(binary, ..)) => Some(&binary.lhs),
                     _ => None,
@@ -1615,10 +2127,17 @@ pub fn inspect_rhai_source(source: &str) -> Result<RhaiValidationReport, String>
             }
             _ => return true,
         };
-        if call.is_operator_call() {
+        if call.is_operator_call() || visited.contains(&(call as *const FnCallExpr as usize)) {
             return true;
         }
-        if let Err(problem) = environment.check_call(&mut result, call, receiver, position) {
+        let argument_types = receiver
+            .into_iter()
+            .chain(call.args.iter())
+            .map(StaticType::literal)
+            .collect::<Vec<_>>();
+        if let Err(problem) =
+            environment.check_call(&mut result, call, receiver, position, &argument_types)
+        {
             error = Some(problem);
             return false;
         }
@@ -1721,6 +2240,266 @@ mod tests {
     use super::*;
     use crate::automation::ImageMatch;
     use std::sync::atomic::AtomicUsize;
+
+    // Fixed corpus measured on unmodified HEAD 5c101721 via
+    // `cargo test --lib flow_corpus_unverified_counts -- --nocapture`:
+    // seven calls unverified, one in each case. These tests only compile ASTs.
+    const FLOW_CORPUS: &[(&str, &str)] = &[
+        ("local", "let x = 10; move_to(x, 20)"),
+        ("alias", "let x = 10; let y = x; move_to(y, 20)"),
+        ("assignment", "let x = 10; x = 20; move_to(x, 20)"),
+        (
+            "branch_same",
+            "let x = 10; if true { x = 20 } else { x = 30 } move_to(x, 20)",
+        ),
+        (
+            "branch_mixed",
+            "let x = 10; if true { x = \"text\" } move_to(x, 20)",
+        ),
+        (
+            "loop",
+            "let x = 10; while false { x = \"text\" } move_to(x, 20)",
+        ),
+        (
+            "unknown_return",
+            "let x = window_exists(\"test\"); move_to(x, 20)",
+        ),
+    ];
+
+    #[test]
+    fn flow_corpus_unverified_counts() {
+        let counts: Vec<_> = FLOW_CORPUS
+            .iter()
+            .map(|(name, source)| {
+                let report =
+                    inspect_rhai_source(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+                (name, report.unverified_calls.len())
+            })
+            .collect();
+        println!(
+            "FLOW_CORPUS counts: {counts:?}; total={}",
+            counts.iter().map(|(_, count)| count).sum::<usize>()
+        );
+        assert_eq!(
+            counts.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+            [0, 0, 0, 0, 1, 1, 1]
+        );
+    }
+
+    fn api_calls_unverified(source: &str, name: &str) -> usize {
+        inspect_rhai_source(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"))
+            .unverified_calls
+            .iter()
+            .filter(|call| call.name == name)
+            .count()
+    }
+
+    #[test]
+    fn ordered_flow_resolves_locals_aliases_and_scoped_branches() {
+        for source in [
+            "let x=10; let y=x; move_to(y,20)",
+            "const x=10; move_to(x,20)",
+            "let x=10; x=20; move_to(x,20)",
+            "let x=10; { let x=\"bad\"; } move_to(x,20)",
+            "let x=10; if window_exists(\"test\") {x=20} else {x=30} move_to(x,20)",
+            "let x=10; move_to((x),20)",
+            "let x=10; move_to(x+2,20)",
+            "const x=10; while window_exists(\"test\") { move_to(x,20) } move_to(x,20)",
+        ] {
+            assert_eq!(api_calls_unverified(source, "move_to"), 0, "{source}");
+        }
+        for source in [
+            "let x=\"bad\"; move_to(x,20)",
+            "let x=10; x=\"bad\"; move_to(x,20)",
+            "let x=10; let y=x; y=\"bad\"; move_to(y,20)",
+        ] {
+            assert!(inspect_rhai_source(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn merge_and_dynamic_paths_cannot_claim_verified_or_reject_mixed() {
+        for source in [
+            "let x=10; if window_exists(\"test\") {x=\"bad\"} move_to(x,20)",
+            "let x=10; while window_exists(\"test\") {move_to(x,20); x=\"bad\"} move_to(x,20)",
+            "let x=10; while window_exists(\"test\") {move_to(x,20); x=\"bad\"; continue;} move_to(x,20)",
+            "let x=10; for item in [1, 2] {move_to(x,20); x=\"bad\";} move_to(x,20)",
+            "let x=10; if window_exists(\"test\") && { x=\"bad\"; true } {} move_to(x,20)",
+            "let x=10; let f=Fn(\"type_of\"); f(x); move_to(x,20)",
+            "fn change() { 10 } let x=10; change(); move_to(x,20)",
+            "let x=10; let o=#{move_to: Fn(\"type_of\")}; o.move_to(1); move_to(x,20)",
+            "let x=window_exists(\"test\"); move_to(x,20)",
+        ] {
+            assert!(api_calls_unverified(source, "move_to") > 0, "{source}");
+        }
+        let mixed =
+            inspect_rhai_source("let x=10; if window_exists(\"test\") {x=\"bad\"} move_to(x,20)")
+                .unwrap();
+        assert!(mixed
+            .unverified_calls
+            .iter()
+            .any(|call| call.name == "move_to"
+                && call.reason.contains("部分可达")
+                && call.line == Some(1)));
+    }
+
+    #[test]
+    fn do_and_for_check_first_body_against_every_iteration() {
+        // A do body precedes its guard. A for iterable is evaluated once,
+        // before any body evaluation, but the body may run repeatedly.
+        for source in [
+            "let x=\"bad\"; do {move_to(x,20);} while false || {x=10; false};",
+            "let x=10; for item in [1,2] {move_to(x,20); x=\"bad\";} move_to(x,20)",
+            "let x=\"bad\"; for item in [{x=10;0},1] {move_to(x,20); x=\"bad\";}",
+            "let x=10; do {move_to(x,20); x=\"bad\";} while false;",
+            "let x=\"bad\"; do {if window_exists(\"t\") {continue;} x=10;} while false || {move_to(x,20); false};",
+        ] {
+            assert!(api_calls_unverified(source, "move_to") > 0, "{source}");
+        }
+        let iterable_first = inspect_rhai_source(
+            "let x=10; for item in [move_to(x,20),2] {move_to(x,20); x=\"bad\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            iterable_first
+                .unverified_calls
+                .iter()
+                .filter(|call| call.name == "move_to")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn later_argument_changes_first_variable_before_rhai_dereferences_it() {
+        for source in [
+            // Earlier known-invalid first variable may become valid after
+            // evaluating a later argument: never hard-reject this script.
+            "let x=\"bad\"; move_to(x, {x=10;20})",
+            // Earlier valid first variable may become invalid later: never
+            // claim the API call fully statically verified.
+            "let x=10; move_to(x, {x=\"bad\";20})",
+            "let x=\"body\"; stop_with_message(x, #{mode: {x=1; \"background\"}})",
+            "let x=10; let f=Fn(\"type_of\"); move_to(x, f(x))",
+        ] {
+            let inspected =
+                inspect_rhai_source(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert!(
+                inspected
+                    .unverified_calls
+                    .iter()
+                    .any(|call| call.name == "move_to" || call.name == "stop_with_message"),
+                "{source}"
+            );
+        }
+        for source in [
+            "let x=\"bad\"; x.move_to({x=10;20})",
+            "let x=10; x.move_to({x=\"bad\";20})",
+            "let x=10; let f=Fn(\"type_of\"); x.move_to(f(x))",
+        ] {
+            assert!(api_calls_unverified(source, "move_to") > 0, "{source}");
+        }
+    }
+
+    #[test]
+    fn high_cardinality_type_products_have_a_finite_inspection_budget() {
+        use std::time::{Duration, Instant};
+
+        let engine = Engine::new();
+        let ast = engine.compile("many(1,1,1,1,1,1,1,1,1)").expect("AST only");
+        let native = HashMap::from([(
+            "many".to_owned(),
+            vec![NativeSignature {
+                argument_types: vec![TypeId::of::<i64>(); 9],
+            }],
+        )]);
+        let known_names = HashSet::new();
+        let scripted = HashMap::new();
+        let shadowed = HashSet::new();
+        let environment = StaticApiEnvironment {
+            native: &native,
+            known_engine_names: &known_names,
+            scripted: &scripted,
+            shadowed: &shadowed,
+        };
+        let kind = StaticType::Types(vec![
+            TypeId::of::<i64>(),
+            TypeId::of::<f64>(),
+            TypeId::of::<ImmutableString>(),
+            TypeId::of::<bool>(),
+            TypeId::of::<char>(),
+            TypeId::of::<()>(),
+            TypeId::of::<Array>(),
+            TypeId::of::<Map>(),
+        ]);
+        let types = vec![kind; 9]; // 8^9 = 134,217,728 combinations
+        let mut report = RhaiValidationReport::default();
+        let start = Instant::now();
+        ast.walk(&mut |path| {
+            if let Some(ASTNode::Stmt(Stmt::FnCall(call, position))) = path.last() {
+                environment
+                    .check_call(&mut report, call, None, *position, &types)
+                    .expect("many valid possibilities");
+            }
+            true
+        });
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(report.unverified_calls.len(), 1);
+        assert!(report.unverified_calls[0].reason.contains("组合过多"));
+    }
+
+    #[test]
+    fn other_contexts_and_overloads_remain_conservative() {
+        assert_eq!(
+            api_calls_unverified("let x=10; x.move_to(20)", "move_to"),
+            0
+        );
+        assert_eq!(
+            api_calls_unverified("let x=#{ f: Fn(\"type_of\") }; x.f(1)", "f"),
+            1
+        );
+        assert_eq!(
+            api_calls_unverified("let x=[10]; move_to(x[0],20)", "move_to"),
+            1
+        );
+        assert_eq!(
+            api_calls_unverified("fn value() {10} let x=value(); move_to(x,20)", "move_to"),
+            1
+        );
+        assert_eq!(
+            api_calls_unverified(
+                "let x=10; stop_with_message(\"ok\", #{mode:\"background\"}); move_to(x,20)",
+                "move_to"
+            ),
+            0
+        );
+        assert_eq!(
+            api_calls_unverified(
+                "let x=\"title\"; stop_with_message(x, \"body\")",
+                "stop_with_message"
+            ),
+            0
+        );
+        assert_eq!(
+            api_calls_unverified(
+                "let x=\"body\"; if window_exists(\"test\") {x=#{mode:\"foreground\"}} stop_with_message(\"ok\",x)",
+                "stop_with_message"
+            ),
+            0,
+            "both possible argument types have a matching overload"
+        );
+        assert_eq!(
+            api_calls_unverified(
+                "let x=\"body\"; if window_exists(\"test\") {x=true} stop_with_message(\"ok\",x)",
+                "stop_with_message"
+            ),
+            1,
+            "mixed compatible/incompatible branch must remain unverified"
+        );
+        assert!(inspect_rhai_source("let x=10; stop_with_message(\"ok\", true)").is_err());
+        assert!(inspect_rhai_source("let x=window_exists(\"test\"); move_to(x, true)").is_err());
+    }
 
     struct TestInput;
 
@@ -2186,8 +2965,12 @@ mod tests {
         assert!(inspect_rhai_source("fn foo(a, b) { a + b } foo(1)")
             .unwrap_err()
             .contains("用户函数"));
-        let dynamic_method = inspect_rhai_source("let x = 1; x.move_to(2, 3)")
-            .expect("dynamic receiver might be a map method");
+        assert!(inspect_rhai_source("let x = 1; x.move_to(2, 3)")
+            .unwrap_err()
+            .contains("参数个数"));
+        let dynamic_method =
+            inspect_rhai_source("let x = window_exists(\"test\"); x.move_to(2, 3)")
+                .expect("unknown receiver might be a map method");
         assert!(dynamic_method
             .unverified_calls
             .iter()
@@ -2206,12 +2989,12 @@ mod tests {
             "{:?}",
             inspect_rhai_source("let f = Fn(\"print\"); f(1)")
         );
-        let unresolved = inspect_rhai_source("let x = 1; move_to(x, 20)")
-            .expect("variable type remains dynamic");
-        assert!(unresolved
+        let resolved =
+            inspect_rhai_source("let x = 1; move_to(x, 20)").expect("local integer type is known");
+        assert!(!resolved
             .unverified_calls
             .iter()
-            .any(|call| call.name == "move_to" && call.line == Some(1)));
+            .any(|call| call.name == "move_to"));
         assert!(inspect_rhai_source(
             "let s = \"move_to(1,)\"; /* move_to(1,) */ move_to((1 + 1), 20)"
         )
